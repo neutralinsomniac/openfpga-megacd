@@ -736,10 +736,10 @@ reg vs_prev;
 reg [9:0] dbg_x, dbg_y;
 reg       dbg_de_line;
 
-// hex readout: II 44 P2 P1 P4 PG (INT2 acks/s, INT4 acks/s, pend duties, GRON duty)
+// hex readout: II 44 P2 P1 JJ (INT2 acks/s, INT4 acks/s, duties, live joypad byte)
 wire [31:0] dbg_hexval = {dbg_ack2_rate, dbg_ack4_rate,
                           1'b0, dbg_pend_duty[2], 1'b0, dbg_pend_duty[1],
-                          1'b0, dbg_pend_duty[4], 1'b0, dbg_gron_duty};
+                          joystick_0[7:0]};
 wire [3:0] dbg_dv = dbg_hexval[((3'd7 - dbg_x[6:4])*4) +: 4];
 reg [23:0] dbg_glyph;
 always @* case (dbg_dv)
