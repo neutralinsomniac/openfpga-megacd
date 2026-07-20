@@ -83,7 +83,9 @@ entity MCD is
 		GG_AVAILABLE   : out std_logic;
 		
 		DBG_S68K_A		: out std_logic_vector(23 downto 0);
-		DBG_S68K_IPL_N	: out std_logic_vector(2 downto 0)
+		DBG_S68K_IPL_N	: out std_logic_vector(2 downto 0);
+		DBG_INT_PEND	: out std_logic_vector(6 downto 1);
+		DBG_INT_ACK		: out std_logic_vector(6 downto 1)
 	);
 end MCD;
 
@@ -310,6 +312,9 @@ begin
 		
 		FD_DAT 			=> ASIC_FD_DAT,
 		FD_WR 			=> ASIC_FD_WR,
+
+		DBG_INT_PEND	=> DBG_INT_PEND,
+		DBG_INT_ACK		=> DBG_INT_ACK,
 		
 		LED_RED   		=> LED_RED,
 		LED_GREEN   	=> LED_GREEN

@@ -102,6 +102,9 @@ entity ASIC is
 		
 		FD_DAT			: out std_logic_vector(10 downto 0);
 		FD_WR				: out std_logic;
+
+		DBG_INT_PEND	: out std_logic_vector(6 downto 1);
+		DBG_INT_ACK		: out std_logic_vector(6 downto 1);
 		
 		LED_RED			: out std_logic;
 		LED_GREEN		: out std_logic
@@ -2584,6 +2587,8 @@ begin
 	S68K_RESET_N <= SRES;
 	S68K_VPA_N <= INT_VPA_N;
 	S68K_IPL_N <= not INT_IPL;
+	DBG_INT_PEND <= INT_PEND;
+	DBG_INT_ACK <= INT_ACK;
 	S68K_DTACK_N <= S68K_REG_DTACK_N and S68K_PRGRAM_DTACK_N and S68K_WORDRAM_DTACK_N and S68K_PCM_DTACK_N and S68K_BRAM_DTACK_N;
 	S68K_DO <= S68K_REG_DO when S68K_REG_DTACK_N = '0' else
 				  S68K_PRGRAM_DO when S68K_PRGRAM_DTACK_N = '0' else

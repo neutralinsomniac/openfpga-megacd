@@ -799,6 +799,19 @@ always @(posedge current_pix_clk) begin
             if (dbg_x[9:4] < 6'd8) begin
                 video_rgb_reg <= (dbg_rate > (23'd1 << (dbg_x[7:4]*2 + 8))) ? 24'hFFFF00 : 24'h404040;
             end
+        end else if (dbg_y < 10'd30) begin
+            // interrupt panel: blocks 1-6 = pend duty per level (green/yellow/red),
+            // block 7 = INT2 ack rate (green >=30/s), block 8 = INT4 ack rate
+            case (dbg_x[9:4])
+                6'd0, 6'd1, 6'd2, 6'd3, 6'd4, 6'd5:
+                    video_rgb_reg <= (dbg_pend_duty[dbg_x[7:4] + 1] >= 3'd6) ? 24'hFF0000 :
+                                     (dbg_pend_duty[dbg_x[7:4] + 1] >= 3'd1) ? 24'hFFFF00 : 24'h004000;
+                6'd6: video_rgb_reg <= (dbg_ack2_rate >= 8'd30) ? 24'h00FF00 :
+                                       (dbg_ack2_rate != 0)     ? 24'hFFFF00 : 24'hFF0000;
+                6'd7: video_rgb_reg <= (dbg_ack4_rate >= 8'd30) ? 24'h00FF00 :
+                                       (dbg_ack4_rate != 0)     ? 24'hFFFF00 : 24'hFF0000;
+                default: ;
+            endcase
         end
     end
 
@@ -1517,10 +1530,13 @@ MCD MCD
 	.GG_AVAILABLE(),
 
 	.DBG_S68K_A(dbg_s68k_a),
-	.DBG_S68K_IPL_N(dbg_s68k_ipl_n)
+	.DBG_S68K_IPL_N(dbg_s68k_ipl_n),
+	.DBG_INT_PEND(dbg_int_pend),
+	.DBG_INT_ACK(dbg_int_ack)
 );
 
 wire [2:0] dbg_s68k_ipl_n;
+wire [6:1] dbg_int_pend, dbg_int_ack;
 
 ///////////////////////////////////////////////
 // Bring-up debug indicators (top-left corner)
@@ -1551,18 +1567,31 @@ always @(posedge clk_sys) begin
 		end
 
 		// sub-CPU speedometer: address-bus changes per second, log scale
+		dbg_ack_d <= dbg_int_ack;
 		if (dbg_sec == 26'd53693174) begin
 			dbg_sec <= 0;
 			dbg_rate <= dbg_rate_cnt;
 			dbg_rate_cnt <= 0;
 			dbg_ipl_duty <= dbg_ipl_cnt[25:23];   // top 3 bits = duty/8
 			dbg_ipl_cnt <= 0;
+			for (di = 1; di < 7; di = di + 1) begin
+				dbg_pend_duty[di] <= dbg_pend_cnt[di][25:23];
+				dbg_pend_cnt[di] <= 0;
+			end
+			dbg_ack2_rate <= dbg_ack2_cnt;
+			dbg_ack2_cnt <= 0;
+			dbg_ack4_rate <= dbg_ack4_cnt;
+			dbg_ack4_cnt <= 0;
 		end else begin
 			dbg_sec <= dbg_sec + 1'b1;
 			if (dbg_s68k_a != dbg_s68k_a_d && ~&dbg_rate_cnt)
 				dbg_rate_cnt <= dbg_rate_cnt + 1'b1;
 			if (dbg_s68k_ipl_n != 3'b111)
 				dbg_ipl_cnt <= dbg_ipl_cnt + 1'b1;
+			for (di = 1; di < 7; di = di + 1)
+				if (dbg_int_pend[di]) dbg_pend_cnt[di] <= dbg_pend_cnt[di] + 1'b1;
+			if (dbg_int_ack[2] & ~dbg_ack_d[2] & ~&dbg_ack2_cnt) dbg_ack2_cnt <= dbg_ack2_cnt + 1'b1;
+			if (dbg_int_ack[4] & ~dbg_ack_d[4] & ~&dbg_ack4_cnt) dbg_ack4_cnt <= dbg_ack4_cnt + 1'b1;
 		end
 		if (cdd_send) dbg_cdd_seen <= 1;
 		if (WR0_RD | WR0_WR | WR1_RD | WR1_WR) dbg_wr_req <= 1;
@@ -1594,6 +1623,12 @@ reg [22:0] dbg_rate_cnt = 0;
 reg [22:0] dbg_rate = 0;         // sub address changes in the last second
 reg [25:0] dbg_ipl_cnt = 0;
 reg [2:0]  dbg_ipl_duty = 0;     // fraction of the second with an IRQ pending (/8)
+integer di;
+reg [25:0] dbg_pend_cnt [1:6];
+reg [2:0]  dbg_pend_duty [1:6];  // per-level pending duty (/8)
+reg [6:1]  dbg_ack_d = 0;
+reg [7:0]  dbg_ack2_cnt = 0, dbg_ack2_rate = 0;  // INT2 (frame) acks/sec
+reg [7:0]  dbg_ack4_cnt = 0, dbg_ack4_rate = 0;  // INT4 (CDD) acks/sec
 
 // CDD drive stub (M1): "no disc" responder; the real drive MPU lands in M2
 wire [39:0] cdd_stat, cdd_comm;
