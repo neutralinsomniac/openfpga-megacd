@@ -734,6 +734,7 @@ reg hs_prev;
 reg vs_prev;
 
 reg [9:0] dbg_x, dbg_y;
+reg       dbg_de_line;
 
 reg         field;
 wire        field_s;
@@ -777,24 +778,29 @@ always @(posedge current_pix_clk) begin
 
         // bring-up debug: 4 blocks top-left — sub-CPU alive, CDD command
         // seen, word-RAM requested, word-RAM completed (green=yes, red=no)
-        if (dbg_y < 10'd8) begin
-            case (dbg_x[9:3])
-                7'd0: video_rgb_reg <= dbg_sub_alive   ? 24'h00FF00 : 24'hFF0000;
-                7'd1: video_rgb_reg <= dbg_cdd_seen    ? 24'h00FF00 : 24'hFF0000;
-                7'd2: video_rgb_reg <= dbg_wr_req      ? 24'h00FF00 : 24'hFF0000;
-                7'd3: video_rgb_reg <= dbg_wr_done     ? 24'h00FF00 : 24'hFF0000;
-                7'd4: video_rgb_reg <= dbg_wr_stuck    ? 24'hFF0000 : 24'h00FF00;
-                7'd5: video_rgb_reg <= dbg_dtack_stuck ? 24'hFF0000 : 24'h00FF00;
+        if (dbg_y < 10'd10) begin
+            case (dbg_x[9:4])
+                6'd0: video_rgb_reg <= dbg_sub_alive   ? 24'h00FF00 : 24'hFF0000;
+                6'd1: video_rgb_reg <= dbg_cdd_seen    ? 24'h00FF00 : 24'hFF0000;
+                6'd2: video_rgb_reg <= dbg_wr_req      ? 24'h00FF00 : 24'hFF0000;
+                6'd3: video_rgb_reg <= dbg_wr_done     ? 24'h00FF00 : 24'hFF0000;
+                6'd4: video_rgb_reg <= dbg_wr_stuck    ? 24'hFF0000 : 24'h00FF00;
+                6'd5: video_rgb_reg <= dbg_dtack_stuck ? 24'hFF0000 : 24'h00FF00;
+                6'd6: video_rgb_reg <= ~st_done ? 24'h0000FF : st_pass ? 24'h00FF00 : 24'hFF0000;
                 default: ;
             endcase
         end
     end
 
+    // count ACTIVE lines only — dbg_y counted blanking lines before, which
+    // parked the overlay inside the vertical porch where it was never visible
     if (~hs_prev && hs_c) begin
         dbg_x <= 0;
-        dbg_y <= dbg_y + 1'b1;
+        if (dbg_de_line) dbg_y <= dbg_y + 1'b1;
+        dbg_de_line <= 0;
     end else if (video_de_reg) begin
         dbg_x <= dbg_x + 1'b1;
+        dbg_de_line <= 1;
     end
     if (~vs_prev && vs_c) dbg_y <= 0;
 
@@ -888,13 +894,16 @@ sdram sdram
 	.wrh1(~GEN_RAM_CE_N & ~GEN_WRH_N),
 	.busy1(GEN_MEM_BUSY),
 
-	// word RAM (runtime) / BIOS load (download only)
-	.addr2(bios_download ? {6'b011110, ioctl_addr[18:1]} : {7'b0110000, wr_owner, wr_addr}),
-	.din2(bios_download ? {ioctl_data[7:0], ioctl_data[15:8]} : wr_din),
+	// word RAM (runtime) / BIOS load (download) / self-test (boot)
+	.addr2(bios_download ? {6'b011110, ioctl_addr[18:1]} :
+	       st_active     ? {8'b01100000, 3'b000, st_idx} :
+	                       {7'b0110000, wr_owner, wr_addr}),
+	.din2(bios_download ? {ioctl_data[7:0], ioctl_data[15:8]} :
+	      st_active     ? st_pat : wr_din),
 	.dout2(sdwr_do),
-	.rd2(~bios_download & wr_rd_r),
-	.wrl2(bios_download ? ioctl_wait : wr_wr_r),
-	.wrh2(bios_download ? ioctl_wait : wr_wr_r),
+	.rd2(~bios_download & (st_active ? (st_req & ~st_we) : wr_rd_r)),
+	.wrl2(bios_download ? ioctl_wait : st_active ? (st_req & st_we) : wr_wr_r),
+	.wrh2(bios_download ? ioctl_wait : st_active ? (st_req & st_we) : wr_wr_r),
 	.busy2(sdld_busy),
 
 	.SDRAM_DQ(dram_dq),         // 16 bit bidirectional data bus
@@ -989,6 +998,63 @@ always @(posedge clk_sys) begin
 		wr_rd_r   <= 0;
 		wr_wr_r   <= 0;
 	end
+end
+
+///////////////////////////////////////////////
+// Boot-time SDRAM self-test over the word-RAM region (debug build).
+// Runs once after PLL lock while the core is still in host reset, long
+// before the BIOS is picked. Result shown in overlay block 7.
+///////////////////////////////////////////////
+
+localparam ST_N = 13'd4095;
+reg  [1:0]  st_state = 0;      // 0 wait, 1 write pass, 2 read pass, 3 done
+reg  [12:0] st_idx = 0;
+reg  [15:0] st_err = 0;
+reg         st_done = 0, st_pass = 0;
+reg         st_req = 0, st_we = 0;
+reg  [19:0] st_wait = 0;
+wire        st_active = (st_state == 2'd1) || (st_state == 2'd2);
+wire [15:0] st_pat = {3'b101, st_idx} ^ 16'h5A5A;
+
+always @(posedge clk_sys) begin
+	reg old_busy2;
+	old_busy2 <= sdld_busy;
+
+	case (st_state)
+		2'd0: if (pll_core_locked && ~bios_download) begin
+			if (&st_wait) begin
+				st_state <= 2'd1;
+				st_idx   <= 0;
+				st_req   <= 1;
+				st_we    <= 1;
+			end else begin
+				st_wait <= st_wait + 1'b1;
+			end
+		end
+		2'd1, 2'd2: begin
+			if (st_req) begin
+				if (old_busy2 & ~sdld_busy) begin
+					st_req <= 0;
+					if (st_state == 2'd2 && sdwr_do != st_pat) st_err <= st_err + 1'b1;
+				end
+			end else if (st_idx == ST_N) begin
+				if (st_state == 2'd1) begin
+					st_state <= 2'd2;
+					st_idx   <= 0;
+					st_we    <= 0;
+					st_req   <= 1;
+				end else begin
+					st_state <= 2'd3;
+					st_done  <= 1;
+					st_pass  <= (st_err == 0);
+				end
+			end else begin
+				st_idx <= st_idx + 1'b1;
+				st_req <= 1;
+			end
+		end
+		default: ;
+	endcase
 end
 
 reg lightgun_type = 0;
