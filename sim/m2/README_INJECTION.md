@@ -68,3 +68,16 @@ disc image feeds. To reproduce+iterate in sim/m2: inject the command that
 routes to $7302 (disasm the dispatcher for the read/CDCSTART code), confirm
 $616A/$730A spin, then fix the CDC empty-drive completion and verify the loop
 exits — all in the fast sim loop.
+
+## $77D8 is a ring-buffer check ($CE0FC) — the exact wait
+$77D8: lea $CE0FC,a4; wr_ptr=(a4); rd_ptr=$2(a4); compares (advanced wr vs rd,
+8-byte entries, $7F8 wrap) => empty/full test on a ring buffer at PRG $CE0FC.
+$77F4 is the matching ENQUEUE (stores an 8-byte record: word@+4, long@+8,
+word@+6, advances wr_ptr). So the drive loop $7302 waits for this queue to
+change state; it's filled by a drive/CDC interrupt handler. Empty drive =
+queue never fills the way the CD player expects = spin.
+FINAL FIX TARGET: find who enqueues to $CE0FC (the CDC/CDD data path) and
+ensure the empty-drive case drives the queue to a state that lets the loop
+exit (error/no-data), OR feed real CDC data (disc streaming). To locate the
+producer: search prgram.bin for `lea $CE0FC` / writes advancing wr_ptr in the
+CDD($610)/CDC($634) interrupt handlers.
