@@ -894,16 +894,13 @@ sdram sdram
 	.wrh1(~GEN_RAM_CE_N & ~GEN_WRH_N),
 	.busy1(GEN_MEM_BUSY),
 
-	// word RAM (runtime) / BIOS load (download) / self-test (boot)
-	.addr2(bios_download ? {6'b011110, ioctl_addr[18:1]} :
-	       st_active     ? {8'b01100000, 3'b000, st_idx} :
-	                       {7'b0110000, wr_owner, wr_addr}),
-	.din2(bios_download ? {ioctl_data[7:0], ioctl_data[15:8]} :
-	      st_active     ? st_pat : wr_din),
+	// word RAM (runtime + boot self-test via arbiter) / BIOS load (download)
+	.addr2(bios_download ? {6'b011110, ioctl_addr[18:1]} : {7'b0110000, wr_owner, wr_addr}),
+	.din2(bios_download ? {ioctl_data[7:0], ioctl_data[15:8]} : wr_din),
 	.dout2(sdwr_do),
-	.rd2(~bios_download & (st_active ? (st_req & ~st_we) : wr_rd_r)),
-	.wrl2(bios_download ? ioctl_wait : st_active ? (st_req & st_we) : wr_wr_r),
-	.wrh2(bios_download ? ioctl_wait : st_active ? (st_req & st_we) : wr_wr_r),
+	.rd2(~bios_download & wr_rd_r),
+	.wrl2(bios_download ? ioctl_wait : wr_wr_r),
+	.wrh2(bios_download ? ioctl_wait : wr_wr_r),
 	.busy2(sdld_busy),
 
 	.SDRAM_DQ(dram_dq),         // 16 bit bidirectional data bus
@@ -923,10 +920,20 @@ sdram sdram
 // Word RAM arbiter: 2 banks x 128KB in SDRAM @ 0x0C00000, shared port 2
 ///////////////////////////////////////////////
 
-wire [15:0] WR0_A, WR1_A, WR0_DO, WR1_DO;
-wire        WR0_RD, WR0_WR, WR1_RD, WR1_WR;
+wire [15:0] MWR0_A, MWR1_A, MWR0_DO, MWR1_DO;
+wire        MWR0_RD, MWR0_WR, MWR1_RD, MWR1_WR;
 reg  [15:0] WR0_DI, WR1_DI;
 reg         WR0_RDY = 1, WR1_RDY = 1;
+
+// arbiter inputs: MCD normally; the boot self-test drives them during reset
+wire [15:0] WR0_A  = st2_active ? {6'b0, st2_idx0} : MWR0_A;
+wire [15:0] WR1_A  = st2_active ? {6'b0, st2_idx1} : MWR1_A;
+wire [15:0] WR0_DO = st2_active ? st2_pat0 : MWR0_DO;
+wire [15:0] WR1_DO = st2_active ? st2_pat1 : MWR1_DO;
+wire        WR0_RD = st2_active ? st2_rd0 : MWR0_RD;
+wire        WR0_WR = st2_active ? st2_wr0 : MWR0_WR;
+wire        WR1_RD = st2_active ? st2_rd1 : MWR1_RD;
+wire        WR1_WR = st2_active ? st2_wr1 : MWR1_WR;
 
 wire [15:0] sdwr_do;
 reg         wr_owner;
@@ -954,7 +961,7 @@ always @(posedge clk_sys) begin
 	if (~WR1_RD) wr1_rd_hold <= 0;
 	if (~WR1_WR) wr1_wr_hold <= 0;
 
-	if (reset | bios_download) begin
+	if ((reset & ~st2_active) | bios_download) begin
 		wr_active <= 0;
 		WR0_RDY <= 1;
 		WR1_RDY <= 1;
@@ -1001,56 +1008,93 @@ always @(posedge clk_sys) begin
 end
 
 ///////////////////////////////////////////////
-// Boot-time SDRAM self-test over the word-RAM region (debug build).
-// Runs once after PLL lock while the core is still in host reset, long
-// before the BIOS is picked. Result shown in overlay block 7.
+// Boot-time word-RAM ARBITER self-test (debug build). Runs once after
+// PLL lock while the core is in host reset. Two independent engines do
+// concurrent RMW streams on both banks — the exact pattern the ASIC
+// generates — through the arbiter's RDY protocol. Block 7 shows the
+// result. (The v1 sequential port-level test already passed on HW.)
 ///////////////////////////////////////////////
 
-localparam ST_N = 13'd4095;
-reg  [1:0]  st_state = 0;      // 0 wait, 1 write pass, 2 read pass, 3 done
-reg  [12:0] st_idx = 0;
-reg  [15:0] st_err = 0;
-reg         st_done = 0, st_pass = 0;
-reg         st_req = 0, st_we = 0;
-reg  [19:0] st_wait = 0;
-wire        st_active = (st_state == 2'd1) || (st_state == 2'd2);
-wire [15:0] st_pat = {3'b101, st_idx} ^ 16'h5A5A;
+localparam ST2_N = 10'd1023;
+reg  [1:0] st2_ph = 0;          // 0 wait, 1 RMW pass, 2 verify pass, 3 done
+reg  [2:0] st2_s0 = 0, st2_s1 = 0;
+reg  [9:0] st2_idx0 = 0, st2_idx1 = 0;
+reg        st2_d0 = 0, st2_d1 = 0;   // bank finished current pass
+reg [15:0] st2_err = 0;
+reg        st2_rd0 = 0, st2_wr0 = 0, st2_rd1 = 0, st2_wr1 = 0;
+reg [19:0] st2_wait = 0;
+reg        st_done = 0, st_pass = 0;
+wire       st2_active = (st2_ph == 2'd1) || (st2_ph == 2'd2);
+wire [15:0] st2_pat0 = {6'b010101, st2_idx0} ^ 16'hC33C;
+wire [15:0] st2_pat1 = {6'b101010, st2_idx1} ^ 16'hC33C;
 
 always @(posedge clk_sys) begin
-	reg old_busy2;
-	old_busy2 <= sdld_busy;
-
-	case (st_state)
+	case (st2_ph)
 		2'd0: if (pll_core_locked && ~bios_download) begin
-			if (&st_wait) begin
-				st_state <= 2'd1;
-				st_idx   <= 0;
-				st_req   <= 1;
-				st_we    <= 1;
+			if (&st2_wait) begin
+				st2_ph <= 2'd1;
+				{st2_idx0, st2_idx1, st2_s0, st2_s1, st2_d0, st2_d1} <= 0;
 			end else begin
-				st_wait <= st_wait + 1'b1;
+				st2_wait <= st2_wait + 1'b1;
 			end
 		end
 		2'd1, 2'd2: begin
-			if (st_req) begin
-				if (old_busy2 & ~sdld_busy) begin
-					st_req <= 0;
-					if (st_state == 2'd2 && sdwr_do != st_pat) st_err <= st_err + 1'b1;
+			// bank 0 engine
+			if (!st2_d0) case (st2_s0)
+				3'd0: begin st2_rd0 <= 1; st2_s0 <= 3'd1; end
+				3'd1: if (~WR0_RDY) st2_s0 <= 3'd2;
+				3'd2: if (WR0_RDY) begin
+					st2_rd0 <= 0;
+					if (st2_ph == 2'd2) begin
+						if (WR0_DI != st2_pat0) st2_err <= st2_err + 1'b1;
+						st2_s0 <= 3'd5;
+					end else begin
+						st2_wr0 <= 1;      // RMW write-back with pattern
+						st2_s0 <= 3'd3;
+					end
 				end
-			end else if (st_idx == ST_N) begin
-				if (st_state == 2'd1) begin
-					st_state <= 2'd2;
-					st_idx   <= 0;
-					st_we    <= 0;
-					st_req   <= 1;
+				3'd3: if (~WR0_RDY) st2_s0 <= 3'd4;
+				3'd4: if (WR0_RDY) begin st2_wr0 <= 0; st2_s0 <= 3'd5; end
+				3'd5: begin
+					if (st2_idx0 == ST2_N) st2_d0 <= 1;
+					else st2_idx0 <= st2_idx0 + 1'b1;
+					st2_s0 <= 3'd0;
+				end
+				default: ;
+			endcase
+			// bank 1 engine (independent, concurrent)
+			if (!st2_d1) case (st2_s1)
+				3'd0: begin st2_rd1 <= 1; st2_s1 <= 3'd1; end
+				3'd1: if (~WR1_RDY) st2_s1 <= 3'd2;
+				3'd2: if (WR1_RDY) begin
+					st2_rd1 <= 0;
+					if (st2_ph == 2'd2) begin
+						if (WR1_DI != st2_pat1) st2_err <= st2_err + 1'b1;
+						st2_s1 <= 3'd5;
+					end else begin
+						st2_wr1 <= 1;
+						st2_s1 <= 3'd3;
+					end
+				end
+				3'd3: if (~WR1_RDY) st2_s1 <= 3'd4;
+				3'd4: if (WR1_RDY) begin st2_wr1 <= 0; st2_s1 <= 3'd5; end
+				3'd5: begin
+					if (st2_idx1 == ST2_N) st2_d1 <= 1;
+					else st2_idx1 <= st2_idx1 + 1'b1;
+					st2_s1 <= 3'd0;
+				end
+				default: ;
+			endcase
+
+			if (st2_d0 & st2_d1) begin
+				if (st2_ph == 2'd1) begin
+					st2_ph <= 2'd2;
+					{st2_idx0, st2_idx1, st2_s0, st2_s1, st2_d0, st2_d1} <= 0;
 				end else begin
-					st_state <= 2'd3;
-					st_done  <= 1;
-					st_pass  <= (st_err == 0);
+					st2_ph  <= 2'd3;
+					st_done <= 1;
+					st_pass <= (st2_err == 0);
 				end
-			end else begin
-				st_idx <= st_idx + 1'b1;
-				st_req <= 1;
 			end
 		end
 		default: ;
@@ -1385,7 +1429,8 @@ wire        MCD_RST_N;
 
 MCD MCD
 (
-	.RST_N(~(reset | bios_download)),
+	// keep gen/MCD/CART reset release aligned: reset_delay applied to all
+	.RST_N(~(reset | bios_download) && !reset_delay),
 	.CLK(clk_sys),
 	.ENABLE(1'b1),
 	.MCD_RST_N(MCD_RST_N),
@@ -1423,17 +1468,17 @@ MCD MCD
 	.BRAM_DO(MCD_BRAM_DO),
 	.BRAM_WE(MCD_BRAM_WE),
 
-	.WORDRAM0_A(WR0_A),
+	.WORDRAM0_A(MWR0_A),
 	.WORDRAM0_DI(WR0_DI),
-	.WORDRAM0_DO(WR0_DO),
-	.WORDRAM0_RD(WR0_RD),
-	.WORDRAM0_WR(WR0_WR),
+	.WORDRAM0_DO(MWR0_DO),
+	.WORDRAM0_RD(MWR0_RD),
+	.WORDRAM0_WR(MWR0_WR),
 	.WORDRAM0_RDY(WR0_RDY),
-	.WORDRAM1_A(WR1_A),
+	.WORDRAM1_A(MWR1_A),
 	.WORDRAM1_DI(WR1_DI),
-	.WORDRAM1_DO(WR1_DO),
-	.WORDRAM1_RD(WR1_RD),
-	.WORDRAM1_WR(WR1_WR),
+	.WORDRAM1_DO(MWR1_DO),
+	.WORDRAM1_RD(MWR1_RD),
+	.WORDRAM1_WR(MWR1_WR),
 	.WORDRAM1_RDY(WR1_RDY),
 
 	.CDD_STAT(cdd_stat),
@@ -1542,7 +1587,7 @@ wire        CART_ROM_CE_N, CART_RAM_CE_N;
 
 CART CART
 (
-	.RST_N(~reset),
+	.RST_N(~(reset | bios_download) && !reset_delay),
 	.CLK(clk_sys),
 	.ENABLE(1'b1),
 
