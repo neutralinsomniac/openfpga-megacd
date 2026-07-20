@@ -75,3 +75,15 @@ vblank IRQ that can't fire. NEXT: determine why IE0=0 —
 Public signals available: gen.mstate, gen.M68K_MBUS_DTACK_N,
 gen.M68K_CLKENp, gen.M68K_VINT, vdp.ie0, vdp.vint_tg68_pending,
 core_top.ce_pix, core_top.vblank_sys, dbg_m68k_a, dbg_s68k_a.
+
+## Refinement: $FF00FA is the address bus, not the STOP PC
+Work RAM at $FF00FA is all zeros, so dbg_m68k_a (= raw M68K_A address bus)
+is holding the last address driven before STOP, not the STOP instruction
+site. To pin the real cause, next session should: (a) capture the true PC
+at STOP (e.g. tap the fx68k PC / last-fetched-instruction, or watch AS_N
+falling edges and record the fetch address), and (b) trace VDP control-port
+writes to reg $01 — count them and check bit5. If the main never writes
+reg1 bit5, it's stalled before VDP-IRQ-enable (a different, earlier cause);
+if it writes but IE0 stays 0, the converted VDP control-port write path is
+the bug. sdram mem is now public (core_top.sdram.mem) for RAM dumps; note
+work RAM = SDRAM word $400000+(VA[15:1]).

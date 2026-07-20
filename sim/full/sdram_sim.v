@@ -20,7 +20,7 @@ module sdram #(parameter INIT="") (
             SDRAM_nWE,SDRAM_nRAS,SDRAM_nCAS,SDRAM_CLK,SDRAM_CKE} = 0;
 
     // 32Mword (64MB) address space, word-addressed
-    reg [15:0] mem [0:(1<<24)-1];
+    reg [15:0] mem [0:(1<<24)-1] /* verilator public_flat_rd */;
     // preload via +bios=<hexfile> ($readmemh with @word-address offset)
     reg [1023:0] biosf;
     initial if ($value$plusargs("bios=%s", biosf)) $readmemh(biosf, mem);

@@ -65,6 +65,11 @@ int main(int argc,char**argv){
         if((c%2000000)==0) printf("[%ld] main=%06X sub=%06X  VINT=%ld CE_PIX=%ld VBL=%ld\n",
                                   c, mpc, spc, vint_cnt, cepix_cnt, vbl_cnt);
     }
+    // dump work-RAM code around the STOP site $FF00F0.. (SDRAM word $400078..)
+    printf("work-RAM $FF00F0..$FF0120:\n");
+    for(uint32_t w=0x400078; w<0x400091; w++)
+        printf("%04X ", dut->rootp->core_top__DOT__sdram__DOT__mem[w] & 0xFFFF);
+    printf("\n");
     dut->final(); delete dut;
     printf("done\n");
     return 0;
