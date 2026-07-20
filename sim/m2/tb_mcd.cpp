@@ -103,9 +103,35 @@ int main(int argc, char** argv) {
     uint32_t last_pc=0xFFFFFFFF; int idlepc=0;
     int vclk=0;
 
+    // EXT-bus gate-array writer emulating the main CPU:
+    //  - once: SRES=1 (release the sub)
+    //  - every frame (~60Hz): pulse IFL2 (bit8) to fire the sub's INT2, the
+    //    heartbeat the main CPU normally sends and the sub waits on.
+    enum { EXT_IDLE, EXT_DRIVE } ext_st = EXT_IDLE;
+    long ext_wait=0; uint16_t ext_val=0; bool sres_done=false;
+    const long FRAME = 895000; // ~60Hz at 53.69MHz
+
     for (long c=0; c<maxc; c++) {
-        // release reset after a bit
         if (c==20) dut->RST_N=1;
+
+        // schedule a gate-array write
+        if (ext_st==EXT_IDLE) {
+            bool go=false;
+            if (c>=2000 && !sres_done) { ext_val=0x0001; go=true; sres_done=true; }
+            else if (sres_done && (c % FRAME)==0) { ext_val=0x0101; go=true; } // IFL2|SRES
+            if (go) {
+                dut->EXT_FDC_N=0; dut->EXT_ASEL_N=0; dut->EXT_RNW=0;
+                dut->EXT_LDS_N=0; dut->EXT_UDS_N=0; dut->EXT_VA=0;
+                dut->EXT_VDI=ext_val; dut->EXT_AS_N=0;
+                ext_st=EXT_DRIVE; ext_wait=0;
+            }
+        } else {
+            if (!dut->EXT_DTACK_N || ++ext_wait>200) {
+                dut->EXT_FDC_N=1; dut->EXT_ASEL_N=1; dut->EXT_RNW=1;
+                dut->EXT_LDS_N=1; dut->EXT_UDS_N=1; dut->EXT_AS_N=1;
+                ext_st=EXT_IDLE;
+            }
+        }
 
         // ---- CLK high edge ----
         dut->CLK=1; dut->eval();

@@ -2,3 +2,7 @@ obj_dir/
 mcd_yosys.v
 mcd_bb.v
 *.mem
+
+# golden data derived from the copyrighted BIOS — regenerate, do not commit
+prgram.bin
+*.sav
