@@ -641,6 +641,22 @@ always_comb begin
 	end
 end
 
+`ifdef MCD_TRIAL
+// Trial fit: token 8KB buffer — a CD variant moves saves off-chip, freeing 128 M10Ks
+dpram_dif #(13,8,12,16) sram
+(
+	.clock(MCLK),
+	.address_a(sram_addr[12:0]),
+	.data_a(sram_di),
+	.wren_a(sram_wren),
+	.q_a(sram_q),
+
+	.address_b(LOADING ? ram_rst_a[12:1] : BRAM_A[11:0]),
+	.data_b(LOADING ? (SRAM00_QUIRK ? 16'h0000 : 16'hFFFF) : BRAM_DI),
+	.wren_b(LOADING | BRAM_WE),
+	.q_b(BRAM_DO)
+);
+`else
 dpram_dif #(17,8,16,16) sram
 (
 	.clock(MCLK),
@@ -655,6 +671,7 @@ dpram_dif #(17,8,16,16) sram
 	.wren_b(LOADING | SVP_DRAM_WE | BRAM_WE),
 	.q_b(BRAM_DO)
 );
+`endif
 
 wire [7:0] sram_q;
 assign BRAM_CHANGE = sram_wren;
@@ -698,6 +715,16 @@ wire [15:0] SVP_DRAM_DI = BRAM_DO;
 reg SVP_CLKEN;
 always @(posedge MCLK) SVP_CLKEN <= ~reset & ~SVP_CLKEN;
 
+`ifdef MCD_TRIAL
+// Trial fit: SVP (Virtua Racing only) dropped to make room for the CD subsystem
+assign SVP_DO = '0;
+assign SVP_DTACK_N = 1'b0;
+assign SVP_DRAM_A = '0;
+assign SVP_DRAM_DO = '0;
+assign SVP_DRAM_WE = 1'b0;
+assign ROM_ADDR2 = '0;
+assign ROM_REQ2 = 1'b0;
+`else
 SVP svp
 (
 	.CLK(MCLK),
@@ -723,6 +750,7 @@ SVP svp
 	.DRAM_DO(SVP_DRAM_DO),
 	.DRAM_WE(SVP_DRAM_WE)
 );
+`endif
 
 
 //-----------------------------------------------------------------------

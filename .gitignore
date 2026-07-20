@@ -1,0 +1,25 @@
+# direnv cache (generated from .envrc / the flake)
+/.direnv/
+
+# Quartus artifacts if a flow is ever run from the repo root
+# (the normal build runs in src/fpga, which has its own .gitignore)
+/db/
+/incremental_db/
+/greybox_tmp/
+/hps_isw_handoff/
+/output_files/
+/*.rpt
+/*.summary
+/*.qmsg
+/*.smsg
+/*.qws
+/*.pin
+/*.sof
+/*.pof
+/PLLJ_PLLSPE_INFO.txt
+/c5_pin_model_dump.txt
+
+# OS / editor cruft
+.DS_Store
+*~
+*.sw?

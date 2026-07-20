@@ -791,3 +791,14 @@ set_global_assignment -name QIP_FILE core/mf_pllbase.qip
 set_global_assignment -name SIP_FILE core/mf_pllbase.sip
 set_global_assignment -name SLD_FILE db/stp1_auto_stripped.stp
 set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top
+# ---- MegaCD trial synthesis (resource measurement) ----
+set_global_assignment -name VERILOG_MACRO "MCD_TRIAL=1"
+set_global_assignment -name VHDL_FILE core/rtl/mcd/ASIC_PKG.vhd
+set_global_assignment -name VHDL_FILE core/rtl/mcd/CEGen.vhd
+set_global_assignment -name VHDL_FILE core/rtl/mcd/ASIC.vhd
+set_global_assignment -name VHDL_FILE core/rtl/mcd/MC68K.vhd
+set_global_assignment -name VHDL_FILE core/rtl/mcd/CDC.vhd
+set_global_assignment -name VERILOG_FILE core/rtl/mcd/CDDA_FIFO.v
+set_global_assignment -name VHDL_FILE core/rtl/mcd/CDDA.vhd
+set_global_assignment -name VHDL_FILE core/rtl/mcd/PCM.vhd
+set_global_assignment -name VHDL_FILE core/rtl/mcd/MCD.vhd

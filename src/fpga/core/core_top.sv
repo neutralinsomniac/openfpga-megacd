@@ -682,8 +682,9 @@ sound_i2s #(
     .clk_74a(clk_74a),
     .clk_audio(clk_sys),
     
-    .audio_l(AUDIO_L),
-    .audio_r(AUDIO_R),
+    // mcd_trial_fold is 0 in normal builds; XOR keeps the MCD_TRIAL instance alive
+    .audio_l(AUDIO_L ^ {15'b0, mcd_trial_fold}),
+    .audio_r(AUDIO_R ^ {15'b0, mcd_trial_fold}),
 
     .audio_mclk(audio_mclk),
     .audio_lrck(audio_lrck),
@@ -1257,5 +1258,103 @@ system system
 
             .locked   ( pll_core_locked    )
         );
-    
+
+///////////////////////////////////////////////
+// MegaCD trial synthesis (resource measurement only)
+///////////////////////////////////////////////
+
+`ifdef MCD_TRIAL
+// Instantiates the MiSTer MegaCD CD subsystem alongside the Genesis core to
+// measure its resource cost on the Pocket's 5CEBA4. Inputs are fed from live
+// signals and every output is XOR-folded into the audio LSB so nothing can be
+// optimized away. Not functional hardware.
+reg mcd_trial_ce;
+always @(posedge clk_sys) mcd_trial_ce <= ~mcd_trial_ce;
+
+wire [15:0] mcd_ext_vdo, mcd_prg_do, mcd_pcm_sl, mcd_pcm_sr, mcd_cdda_sl, mcd_cdda_sr;
+wire [17:0] mcd_prg_a;
+wire [13:1] mcd_bram_a;
+wire [7:0]  mcd_bram_do;
+wire [39:0] mcd_cdd_comm;
+wire [23:0] mcd_dbg_a;
+wire mcd_rst_n, mcd_ext_dtack_n, mcd_prg_wrl_n, mcd_prg_wrh_n, mcd_prg_oe_n, mcd_prg_rfs;
+wire mcd_rom_ce_n, mcd_bram_we, mcd_cdd_send, mcd_cdda_ready, mcd_led_r, mcd_led_g, mcd_gg_avail;
+
+MCD mcd_trial
+(
+    .CLK(clk_sys),
+    .RST_N(~reset),
+    .ENABLE(1'b1),
+    .MCD_RST_N(mcd_rst_n),
+    .PALSW(cont1_key[15]),
+
+    .EXT_VA(bridge_addr[17:1]),
+    .EXT_VDI(bridge_wr_data[15:0]),
+    .EXT_VDO(mcd_ext_vdo),
+    .EXT_AS_N(~bridge_wr),
+    .EXT_RNW(~bridge_rd),
+    .EXT_LDS_N(bridge_addr[18]),
+    .EXT_UDS_N(bridge_addr[19]),
+    .EXT_DTACK_N(mcd_ext_dtack_n),
+    .EXT_ASEL_N(bridge_addr[20]),
+    .EXT_VCLK_CE(mcd_trial_ce),
+    .EXT_RAS2_N(bridge_addr[21]),
+    .EXT_ROM_N(bridge_addr[22]),
+    .EXT_FDC_N(bridge_addr[23]),
+
+    .PRG_A(mcd_prg_a),
+    .PRG_DI(bridge_wr_data[31:16]),
+    .PRG_DO(mcd_prg_do),
+    .PRG_WRL_N(mcd_prg_wrl_n),
+    .PRG_WRH_N(mcd_prg_wrh_n),
+    .PRG_OE_N(mcd_prg_oe_n),
+    .PRG_RFS(mcd_prg_rfs),
+    .PRG_RDY(cont1_key[0]),
+
+    .ROM_DI({bridge_wr_data[7:0], cont1_key[7:0]}),
+    .ROM_CE_N(mcd_rom_ce_n),
+    .ROM_RDY(cont1_key[1]),
+
+    .BRAM_A(mcd_bram_a),
+    .BRAM_DI(cont1_key[7:0]),
+    .BRAM_DO(mcd_bram_do),
+    .BRAM_WE(mcd_bram_we),
+
+    .CDD_STAT({bridge_wr_data[19:0], bridge_addr[19:0]}),
+    .CDD_COMM(mcd_cdd_comm),
+    .CDD_SEND(mcd_cdd_send),
+    .CDD_REC(cont1_key[2]),
+    .CDD_DM(cont1_key[3]),
+
+    .CDC_DATA(bridge_wr_data[15:0]),
+    .CDC_DAT_WR(bridge_wr & bridge_addr[24]),
+    .CDC_SC_WR(bridge_wr & bridge_addr[25]),
+    .CDC_CDDA_WR(bridge_wr & bridge_addr[26]),
+    .CDDA_WR_READY(mcd_cdda_ready),
+
+    .PCM_SL(mcd_pcm_sl),
+    .PCM_SR(mcd_pcm_sr),
+    .CDDA_SL(mcd_cdda_sl),
+    .CDDA_SR(mcd_cdda_sr),
+
+    .LED_RED(mcd_led_r),
+    .LED_GREEN(mcd_led_g),
+
+    .GG_RESET(reset),
+    .GG_EN(cont1_key[4]),
+    .GG_CODE({cont1_key, bridge_addr, bridge_wr_data, bridge_addr, cont1_key, bridge_wr}),
+    .GG_AVAILABLE(mcd_gg_avail),
+
+    .DBG_S68K_A(mcd_dbg_a)
+);
+
+wire mcd_trial_fold = ^{mcd_ext_vdo, mcd_prg_do, mcd_pcm_sl, mcd_pcm_sr, mcd_cdda_sl, mcd_cdda_sr,
+                        mcd_prg_a, mcd_bram_a, mcd_bram_do, mcd_cdd_comm, mcd_dbg_a,
+                        mcd_rst_n, mcd_ext_dtack_n, mcd_prg_wrl_n, mcd_prg_wrh_n, mcd_prg_oe_n,
+                        mcd_prg_rfs, mcd_rom_ce_n, mcd_bram_we, mcd_cdd_send, mcd_cdda_ready,
+                        mcd_led_r, mcd_led_g, mcd_gg_avail};
+`else
+wire mcd_trial_fold = 1'b0;
+`endif
+
 endmodule
