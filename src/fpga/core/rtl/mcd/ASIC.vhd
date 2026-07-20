@@ -1751,7 +1751,6 @@ begin
 									WR0R.PM <= "00";
 									WR0R.EXEC <= '1';
 									WR0A <= WRA_S68K_ACCESS;
-									S68K_WORDRAM_DTACK_N <= '0';
 								elsif S68K_WORD_RAM_SEL = '1' and S68K_A(19 downto 18) = "10" and S68K_WORDRAM_DTACK_N = '1' then
 									WR0R.A <= S68K_A(17 downto 2);
 									WR0R.DO <= S68K_DI(11 downto 8) & S68K_DI(3 downto 0) & S68K_DI(11 downto 8) & S68K_DI(3 downto 0);
@@ -1763,7 +1762,6 @@ begin
 									WR0R.DOT_IMAGE <= "1" & S68K_A(1);
 									WR0R.EXEC <= '1';
 									WR0A <= WRA_S68K_ACCESS;
-									S68K_WORDRAM_DTACK_N <= '0';
 								end if;
 							end if;
 						else						--2M MODE
@@ -1802,7 +1800,6 @@ begin
 								WR0R.PM <= "00";
 								WR0R.EXEC <= '1';
 								WR0A <= WRA_S68K_ACCESS;
-								S68K_WORDRAM_DTACK_N <= '0';
 							end if;
 						end if;
 					
@@ -1823,7 +1820,12 @@ begin
 						if WR0S = WRS_END then
 							WR0R.EXEC <= '0';
 							S68K_WORDRAM_DO <= WORD_RAM_1M0_DI;
-								
+							-- Pocket port: DTACK at completion, not at accept.
+							-- Posted (accept-time) DTACK let the next sub bus
+							-- cycle sample the still-low DTACK while a slow
+							-- external write drained, silently dropping it.
+							S68K_WORDRAM_DTACK_N <= '0';
+
 							WR0A <= WRA_S68K_END;
 						end if;
 					
@@ -1898,7 +1900,6 @@ begin
 									WR1R.PM <= "00";
 									WR1R.EXEC <= '1';
 									WR1A <= WRA_S68K_ACCESS;
-									S68K_WORDRAM_DTACK_N <= '0';
 								elsif S68K_WORD_RAM_SEL = '1' and S68K_A(19 downto 18) = "10" and S68K_WORDRAM_DTACK_N = '1' then
 									WR1R.A <= S68K_A(17 downto 2);
 									WR1R.DO <= S68K_DI(11 downto 8) & S68K_DI(3 downto 0) & S68K_DI(11 downto 8) & S68K_DI(3 downto 0);
@@ -1910,7 +1911,6 @@ begin
 									WR1R.DOT_IMAGE <= "1" & S68K_A(1);
 									WR1R.EXEC <= '1';
 									WR1A <= WRA_S68K_ACCESS;
-									S68K_WORDRAM_DTACK_N <= '0';
 								end if;
 							end if;
 						else						--2M MODE
@@ -1949,7 +1949,6 @@ begin
 								WR1R.PM <= "00";
 								WR1R.EXEC <= '1';
 								WR1A <= WRA_S68K_ACCESS;
-								S68K_WORDRAM_DTACK_N <= '0';
 							end if;
 						end if;
 						
@@ -1970,7 +1969,9 @@ begin
 						if WR1S = WRS_END then
 							WR1R.EXEC <= '0';
 							S68K_WORDRAM_DO <= WORD_RAM_1M1_DI;
-								
+							-- Pocket port: DTACK at completion (see bank 0 note)
+							S68K_WORDRAM_DTACK_N <= '0';
+
 							WR1A <= WRA_S68K_END;
 						end if;
 					

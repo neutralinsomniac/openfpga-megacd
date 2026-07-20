@@ -1,0 +1,10 @@
+v 4
+file "/home/jeremy/src/openFPGA-Genesis/" "sim/tb_asic.vhd" "6cbe7978c528f7218a1f59f1703034e81e82a970" "20260720145856.523":
+  entity tb_asic at 14( 609) + 0 on 45;
+  architecture sim of tb_asic at 26( 847) + 0 on 46;
+file "/home/jeremy/src/openFPGA-Genesis/" "src/fpga/core/rtl/mcd/ASIC_PKG.vhd" "ad5712c68464a165a9b6d2b243f3f9253e88bbb6" "20260720144222.461":
+  package asic_pkg at 1( 0) + 0 on 15 body;
+  package body asic_pkg at 116( 2315) + 0 on 16;
+file "/home/jeremy/src/openFPGA-Genesis/" "src/fpga/core/rtl/mcd/ASIC.vhd" "cbdb755bc43637ba88ca0079edbe2f4258588e4a" "20260720145856.521":
+  entity asic at 1( 0) + 0 on 43;
+  architecture rtl of asic at 111( 3419) + 0 on 44;
