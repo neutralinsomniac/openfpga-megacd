@@ -61,8 +61,10 @@ always @(posedge clk) begin
         send_d <= cdd_send;
         wdog   <= wdog + 1'b1;
 
-        // empty tray: every state drains to NO_DISC after its latency
-        if (drv_status != STAT_NO_DISC) begin
+        // cdd.cpp Update(): ONLY STOP drains to NO_DISC after latency.
+        // Once a Read-TOC sets status=TOC(9) it persists — draining TOC->B
+        // mid-read reads as "disc ejected" and wedges the BIOS (v6 freeze).
+        if (drv_status == STAT_STOP) begin
             if (ms_tick == TICK_13MS) begin
                 ms_tick <= 0;
                 if (latency != 0) latency <= latency - 1'b1;
@@ -91,8 +93,7 @@ always @(posedge clk) begin
                 end
                 4'h2: begin                   // Read TOC, format in comm n3
                     if (drv_status == STAT_STOP) begin
-                        drv_status <= STAT_TOC;
-                        latency <= 4'd2;
+                        drv_status <= STAT_TOC; // persists; latency untouched
                         n0 <= STAT_TOC;
                     end else begin
                         n0 <= drv_status;
