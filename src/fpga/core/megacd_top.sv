@@ -1273,7 +1273,7 @@ assign joystick_0 = {
     cont1_key_s[0],                                        // up
     cont1_key_s[1],                                        // down
     cont1_key_s[2],                                        // left
-    cont1_key_s[3],                                        // right
+    cont1_key_s[3]                                        // right
 };
 
 assign joystick_1 = {
@@ -1288,7 +1288,7 @@ assign joystick_1 = {
     cont2_key_s[0],  // up
     cont2_key_s[1],  // down
     cont2_key_s[2],  // left
-    cont2_key_s[3],  // right
+    cont2_key_s[3]  // right
 };
 
 assign joystick_2 = {
@@ -1303,7 +1303,7 @@ assign joystick_2 = {
     cont3_key_s[0],  // up
     cont3_key_s[1],  // down
     cont3_key_s[2],  // left
-    cont3_key_s[3],  // right
+    cont3_key_s[3]  // right
 };
 
 assign joystick_3 = {
@@ -1318,7 +1318,7 @@ assign joystick_3 = {
     cont4_key_s[0],  // up
     cont4_key_s[1],  // down
     cont4_key_s[2],  // left
-    cont4_key_s[3],  // right
+    cont4_key_s[3]  // right
 };
 
 ///////////////////////////////////////////////

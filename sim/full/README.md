@@ -30,3 +30,21 @@ native SV/Verilog. See sim/m2/ for the working MCD-only sub-BIOS sim.
    multitap/teamplayer.sv, fourway/genesis_lpf/audio_iir.v, fx68k,
    jt12/*, jt89/*, CDDA_FIFO.v, sound_i2s, data_(un)loader, cofi,
    lightgun, sync_fifo, core_bridge_cmd, EEPROM_STM95, cheatcodes.
+
+## Verilator assembly status (near-complete)
+The ENTIRE core Verilates (all converted VHDL + native SV/V + jt12/jt89 +
+sim SDRAM/PLL/RAM/dcfifo) except ONE systematic issue:
+
+**Port-case mismatch.** yosys lowercases VHDL port names (VRAM_we ->
+vram_we), but gen.sv/megacd_top.sv instantiate the converted modules with
+the original mixed case. MCD's top ports survived uppercase (it was the -e
+top); VDP and T80pa did not. FIX: add thin Verilog wrapper modules
+`vdp`/`T80pa` (and verify CART) that expose the mixed-case port names the SV
+expects and wire them to the lowercase converted `vdp`/`t80pa` — OR
+post-process the converted .v to restore case from the VHDL entity decls.
+After that, iterate any remaining PINNOTFOUND/WIDTH runtime issues, then
+flesh out tb_full.cpp (preload SDRAM via sdram_sim $readmemh with BIOS at
+word $780000, drive clk_74a at clk_ram rate, hold reset_n, trace both PCs).
+
+Fixed so far: joystick trailing commas (megacd_top.sv), dcfifo params,
+dcfifo/sdram/pll/bram sim models.
