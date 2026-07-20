@@ -76,13 +76,16 @@ localparam NO_WRITE_BURST = 1'd1; // 0=write burst enabled, 1=only single access
 
 localparam MODE = { 3'b000, NO_WRITE_BURST, OP_MODE, CAS_LATENCY, ACCESS_TYPE, BURST_LENGTH}; 
 
-localparam STATE_IDLE  = 3'd0;             // state to check the requests
+// 4-bit states: with tRCD=3 and CL=3, STATE_READY = 8 which overflows the
+// original 3-bit arithmetic (wrapping onto STATE_IDLE and corrupting the
+// request handshake)
+localparam STATE_IDLE  = 4'd0;             // state to check the requests
 localparam STATE_START = STATE_IDLE+1'd1;  // state in which a new command is started
 localparam STATE_CONT  = STATE_START+RASCAS_DELAY;
 localparam STATE_READY = STATE_CONT+CAS_LATENCY+1'd1;
 localparam STATE_LAST  = STATE_READY;      // last state in cycle
 
-reg  [2:0] state;
+reg  [3:0] state;
 reg [22:1] a;
 reg [15:0] data;
 reg        we;
