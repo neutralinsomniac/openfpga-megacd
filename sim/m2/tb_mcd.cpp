@@ -103,25 +103,41 @@ int main(int argc, char** argv) {
     uint32_t last_pc=0xFFFFFFFF; int idlepc=0;
     int vclk=0;
 
-    // EXT-bus gate-array writer emulating the main CPU:
-    //  - once: SRES=1 (release the sub)
-    //  - every frame (~60Hz): pulse IFL2 (bit8) to fire the sub's INT2, the
-    //    heartbeat the main CPU normally sends and the sub waits on.
+    // EXT-bus gate-array writer (emulating the main CPU). A scripted queue of
+    // register writes: {reg_offset (word), value}. reg 0=$A12000, 7=$A1200E
+    // (comm flag), 8..15=$A12010.. (comm command CC0..7).
+    struct Wr { uint32_t at; int off; uint16_t val; };
+    std::vector<Wr> script = {
+        {2000, 0, 0x0001},   // SRES=1: release the sub
+    };
+    // main->sub command injection: write CC0..7 then raise the comm flag.
+    // Try a drive "read/play"-class command to push the sub into the busy path.
+    long INJ = 3500000;
+    for (int i=0;i<8;i++) script.push_back({INJ + i*400, 8+i, 0x0000});
+    script.push_back({INJ, 8, 0x0200});      // CC0 high byte = command 0x02
+    script.push_back({INJ+4000, 7, 0x0100}); // raise comm flag (main byte bit0)
+
+    size_t sp=0;
     enum { EXT_IDLE, EXT_DRIVE } ext_st = EXT_IDLE;
-    long ext_wait=0; uint16_t ext_val=0; bool sres_done=false;
-    const long FRAME = 895000; // ~60Hz at 53.69MHz
+    long ext_wait=0; uint16_t ext_val=0; int ext_off=0; bool sres_done=false;
+    const long FRAME = 895000;
+    bool seen_cmd=false, seen_616a=false;
 
     for (long c=0; c<maxc; c++) {
         if (c==20) dut->RST_N=1;
 
-        // schedule a gate-array write
         if (ext_st==EXT_IDLE) {
             bool go=false;
-            if (c>=2000 && !sres_done) { ext_val=0x0001; go=true; sres_done=true; }
-            else if (sres_done && (c % FRAME)==0) { ext_val=0x0101; go=true; } // IFL2|SRES
+            // scripted writes
+            if (sp<script.size() && (long)script[sp].at<=c) {
+                ext_off=script[sp].off; ext_val=script[sp].val; sp++; go=true;
+                if (ext_off==0 && ext_val==1) sres_done=true;
+            }
+            // periodic INT2 heartbeat (IFL2|SRES) once released
+            else if (sres_done && (c % FRAME)==0) { ext_off=0; ext_val=0x0101; go=true; }
             if (go) {
                 dut->EXT_FDC_N=0; dut->EXT_ASEL_N=0; dut->EXT_RNW=0;
-                dut->EXT_LDS_N=0; dut->EXT_UDS_N=0; dut->EXT_VA=0;
+                dut->EXT_LDS_N=0; dut->EXT_UDS_N=0; dut->EXT_VA=ext_off;
                 dut->EXT_VDI=ext_val; dut->EXT_AS_N=0;
                 ext_st=EXT_DRIVE; ext_wait=0;
             }
@@ -209,6 +225,8 @@ int main(int argc, char** argv) {
 
         // ---- trace sub-CPU PC (address bus) ----
         uint32_t pc = dut->DBG_S68K_A & 0xFFFFFF;
+        if (pc>=0x6178 && pc<=0x6190 && !seen_cmd){ seen_cmd=true; printf("[%ld] sub entered COMMAND HANDLER (pc=%06X)\n",c,pc); }
+        if (pc>=0x616A && pc<=0x6170 && !seen_616a){ seen_616a=true; printf("[%ld] sub reached BUSY-WAIT $616A (the hang site!)\n",c); }
         if (pc==last_pc){ if(++idlepc==200000){ printf("[%ld] sub STUCK at %06X ipl=%X pend=%02X gron=%d\n",
                              c,pc,dut->DBG_S68K_IPL_N,dut->DBG_INT_PEND,dut->DBG_GRON); idlepc=0; } }
         else { idlepc=0; last_pc=pc; }
