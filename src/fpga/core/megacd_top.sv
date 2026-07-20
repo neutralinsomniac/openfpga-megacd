@@ -779,10 +779,12 @@ always @(posedge current_pix_clk) begin
         // seen, word-RAM requested, word-RAM completed (green=yes, red=no)
         if (dbg_y < 10'd8) begin
             case (dbg_x[9:3])
-                7'd0: video_rgb_reg <= dbg_sub_alive ? 24'h00FF00 : 24'hFF0000;
-                7'd1: video_rgb_reg <= dbg_cdd_seen  ? 24'h00FF00 : 24'hFF0000;
-                7'd2: video_rgb_reg <= dbg_wr_req    ? 24'h00FF00 : 24'hFF0000;
-                7'd3: video_rgb_reg <= dbg_wr_done   ? 24'h00FF00 : 24'hFF0000;
+                7'd0: video_rgb_reg <= dbg_sub_alive   ? 24'h00FF00 : 24'hFF0000;
+                7'd1: video_rgb_reg <= dbg_cdd_seen    ? 24'h00FF00 : 24'hFF0000;
+                7'd2: video_rgb_reg <= dbg_wr_req      ? 24'h00FF00 : 24'hFF0000;
+                7'd3: video_rgb_reg <= dbg_wr_done     ? 24'h00FF00 : 24'hFF0000;
+                7'd4: video_rgb_reg <= dbg_wr_stuck    ? 24'hFF0000 : 24'h00FF00;
+                7'd5: video_rgb_reg <= dbg_dtack_stuck ? 24'hFF0000 : 24'h00FF00;
                 default: ;
             endcase
         end
@@ -1241,10 +1243,11 @@ gen gen
 	.EN_SPR(1'b1),
 
 	.J3BUT(1'b0),
-	.JOY_1(joystick_0[11:0]),
-	.JOY_2(joystick_1[11:0]),
-	.JOY_3(joystick_2[11:0]),
-	.JOY_4(joystick_3[11:0]),
+	// MiSTer gen.sv expects bit6=C/bit5=B; the Pocket builder packs bit6=B/bit5=C
+	.JOY_1({joystick_0[11:7], joystick_0[5], joystick_0[6], joystick_0[4:0]}),
+	.JOY_2({joystick_1[11:7], joystick_1[5], joystick_1[6], joystick_1[4:0]}),
+	.JOY_3({joystick_2[11:7], joystick_2[5], joystick_2[6], joystick_2[4:0]}),
+	.JOY_4({joystick_3[11:7], joystick_3[5], joystick_3[6], joystick_3[4:0]}),
 	.JOY_5(12'h000),
 	.MULTITAP(3'b000),
 
@@ -1426,8 +1429,27 @@ always @(posedge clk_sys) begin
 		if (WR0_RD | WR0_WR | WR1_RD | WR1_WR) dbg_wr_req <= 1;
 		if (~WR0_RDY | ~WR1_RDY) dbg_wr_started <= 1;
 		if (dbg_wr_started & WR0_RDY & WR1_RDY) dbg_wr_done <= 1;
+
+		// stuck detectors: latch red if a condition persists ~0.6s
+		if (WR0_RD | WR0_WR | WR1_RD | WR1_WR) begin
+			if (&dbg_wrstuck_cnt) dbg_wr_stuck <= 1;
+			else dbg_wrstuck_cnt <= dbg_wrstuck_cnt + 1'b1;
+		end else begin
+			dbg_wrstuck_cnt <= 0;
+		end
+		if (~MCD_DTACK_N) begin
+			if (&dbg_dtack_cnt) dbg_dtack_stuck <= 1;
+			else dbg_dtack_cnt <= dbg_dtack_cnt + 1'b1;
+		end else begin
+			dbg_dtack_cnt <= 0;
+		end
 	end
 end
+
+reg [24:0] dbg_wrstuck_cnt = 0;
+reg        dbg_wr_stuck = 0;     // a word-RAM request stayed pending ~0.6s
+reg [24:0] dbg_dtack_cnt = 0;
+reg        dbg_dtack_stuck = 0;  // main CPU wedged on an MCD access ~0.6s
 
 // CDD drive stub (M1): "no disc" responder; the real drive MPU lands in M2
 wire [39:0] cdd_stat, cdd_comm;
