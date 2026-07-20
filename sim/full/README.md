@@ -133,3 +133,14 @@ clear logic public; find why the FIFO stopped draining / DMAF_SET_REQ won't
 clear. Prime suspect: DMAF_SET_REQ clear path or the DT engine's FIFO-read
 gating in the converted VDP. Public probes now include vdp.dmac/slot_en/
 dt_vram_sel/fifo_empty/dmaf_set_req/in_dma/dma_fill.
+
+## SINGLE ROOT: VDP FIFO_EMPTY never asserts (DT engine not draining)
+Both blockers (fill can't leave FILL_START; DMAF_SET_REQ can't clear @line
+3238) gate on FIFO_EMPTY=1. It's stuck at 0 -> the VDP command/data FIFO
+never drains. The FIFO drains via the DTC (data-transfer controller) engine
+writing FIFO entries to VRAM during slots. Earlier VDP writes DID drain
+(VINT setup worked) so it's a state-dependent wedge — likely a deadlock or
+a converted-VDP bug in the DTC/FIFO-read path during DMA setup. NEXT: mark
+DTC state + FIFO read/write pointers (fifo_rd_pos/fifo_wr_pos/fifo_queue)
+public; find why DTC stopped draining the FIFO. This is the one signal to
+fix to advance the full-system boot past the SEGA-logo DMA.
