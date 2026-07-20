@@ -21,7 +21,9 @@ module sdram #(parameter INIT="") (
 
     // 32Mword (64MB) address space, word-addressed
     reg [15:0] mem [0:(1<<24)-1];
-    initial if (INIT!="") $readmemh(INIT, mem);
+    // preload via +bios=<hexfile> ($readmemh with @word-address offset)
+    reg [1023:0] biosf;
+    initial if ($value$plusargs("bios=%s", biosf)) $readmemh(biosf, mem);
 
     localparam LAT = 10;
     reg [3:0] b0=0,b1=0,b2=0;

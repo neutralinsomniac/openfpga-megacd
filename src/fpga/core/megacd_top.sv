@@ -1504,7 +1504,7 @@ gen gen
 	.DBG_MBUS_A()
 );
 
-wire [23:0] dbg_m68k_a;
+wire [23:0] dbg_m68k_a /* verilator public_flat_rd */;
 
 // Expansion-bus read-data / DTACK tie: exactly one slave answers per cycle
 assign GEN_VDI = !GEN_RAM_CE_N ? GEN_MEM_DO_R :
@@ -1629,7 +1629,7 @@ wire dbg_gron;
 // Bring-up debug indicators (top-left corner)
 ///////////////////////////////////////////////
 
-wire [23:0] dbg_s68k_a;
+wire [23:0] dbg_s68k_a /* verilator public_flat_rd */;
 reg  [23:0] dbg_s68k_a_d;
 reg  [9:0]  dbg_sub_cnt = 0;
 reg         dbg_sub_alive = 0;   // sub-CPU address bus is moving
