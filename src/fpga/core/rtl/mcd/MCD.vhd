@@ -82,7 +82,8 @@ entity MCD is
 		GG_CODE        : in std_logic_vector(128 downto 0);
 		GG_AVAILABLE   : out std_logic;
 		
-		DBG_S68K_A		: out std_logic_vector(23 downto 0)
+		DBG_S68K_A		: out std_logic_vector(23 downto 0);
+		DBG_S68K_IPL_N	: out std_logic_vector(2 downto 0)
 	);
 end MCD;
 
@@ -428,5 +429,6 @@ begin
 	);
 	
 	DBG_S68K_A <= S68K_A & "0";
+	DBG_S68K_IPL_N <= S68K_IPL_N;
 
 end rtl;

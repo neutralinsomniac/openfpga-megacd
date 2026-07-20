@@ -787,8 +787,18 @@ always @(posedge current_pix_clk) begin
                 6'd4: video_rgb_reg <= dbg_wr_stuck    ? 24'hFF0000 : 24'h00FF00;
                 6'd5: video_rgb_reg <= dbg_dtack_stuck ? 24'hFF0000 : 24'h00FF00;
                 6'd6: video_rgb_reg <= ~st_done ? 24'h0000FF : st_pass ? 24'h00FF00 : 24'hFF0000;
+                // IRQ-pending duty: green <25%, yellow <75%, red = storm
+                6'd7: video_rgb_reg <= (dbg_ipl_duty >= 3'd6) ? 24'hFF0000 :
+                                       (dbg_ipl_duty >= 3'd2) ? 24'hFFFF00 : 24'h00FF00;
                 default: ;
             endcase
+        end else if (dbg_y < 10'd20) begin
+            // sub-CPU speedometer, log scale: block k lit if rate > 2^(2k+8)
+            // (256, 1k, 4k, 16k, 65k, 262k, 1M, 4M changes/sec); healthy sub
+            // lights ~7-8 blocks, a ~200x-slow sub only ~4
+            if (dbg_x[9:4] < 6'd8) begin
+                video_rgb_reg <= (dbg_rate > (23'd1 << (dbg_x[7:4]*2 + 8))) ? 24'hFFFF00 : 24'h404040;
+            end
         end
     end
 
@@ -1506,8 +1516,11 @@ MCD MCD
 	.GG_CODE(129'd0),
 	.GG_AVAILABLE(),
 
-	.DBG_S68K_A(dbg_s68k_a)
+	.DBG_S68K_A(dbg_s68k_a),
+	.DBG_S68K_IPL_N(dbg_s68k_ipl_n)
 );
+
+wire [2:0] dbg_s68k_ipl_n;
 
 ///////////////////////////////////////////////
 // Bring-up debug indicators (top-left corner)
@@ -1536,6 +1549,21 @@ always @(posedge clk_sys) begin
 			if (&dbg_sub_cnt) dbg_sub_alive <= 1;
 			else dbg_sub_cnt <= dbg_sub_cnt + 1'b1;
 		end
+
+		// sub-CPU speedometer: address-bus changes per second, log scale
+		if (dbg_sec == 26'd53693174) begin
+			dbg_sec <= 0;
+			dbg_rate <= dbg_rate_cnt;
+			dbg_rate_cnt <= 0;
+			dbg_ipl_duty <= dbg_ipl_cnt[25:23];   // top 3 bits = duty/8
+			dbg_ipl_cnt <= 0;
+		end else begin
+			dbg_sec <= dbg_sec + 1'b1;
+			if (dbg_s68k_a != dbg_s68k_a_d && ~&dbg_rate_cnt)
+				dbg_rate_cnt <= dbg_rate_cnt + 1'b1;
+			if (dbg_s68k_ipl_n != 3'b111)
+				dbg_ipl_cnt <= dbg_ipl_cnt + 1'b1;
+		end
 		if (cdd_send) dbg_cdd_seen <= 1;
 		if (WR0_RD | WR0_WR | WR1_RD | WR1_WR) dbg_wr_req <= 1;
 		if (~WR0_RDY | ~WR1_RDY) dbg_wr_started <= 1;
@@ -1561,6 +1589,11 @@ reg [24:0] dbg_wrstuck_cnt = 0;
 reg        dbg_wr_stuck = 0;     // a word-RAM request stayed pending ~0.6s
 reg [24:0] dbg_dtack_cnt = 0;
 reg        dbg_dtack_stuck = 0;  // main CPU wedged on an MCD access ~0.6s
+reg [25:0] dbg_sec = 0;
+reg [22:0] dbg_rate_cnt = 0;
+reg [22:0] dbg_rate = 0;         // sub address changes in the last second
+reg [25:0] dbg_ipl_cnt = 0;
+reg [2:0]  dbg_ipl_duty = 0;     // fraction of the second with an IRQ pending (/8)
 
 // CDD drive stub (M1): "no disc" responder; the real drive MPU lands in M2
 wire [39:0] cdd_stat, cdd_comm;

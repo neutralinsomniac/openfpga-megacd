@@ -1,0 +1,2 @@
+sim/tb_asic.vhd:402:17:@238107900ps:(report note): scenario 4: GFX stamp engine (differential dump)
+sim/tb_asic.vhd:425:17:@468431700ps:(report note): GFX done, dumping image region
