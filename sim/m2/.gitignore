@@ -1,0 +1,4 @@
+obj_dir/
+mcd_yosys.v
+mcd_bb.v
+*.mem
