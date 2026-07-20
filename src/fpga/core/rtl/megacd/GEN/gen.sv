@@ -422,7 +422,12 @@ vdp vdp
 	.BR_N(VBUS_BR_N),
 	.BGACK_N(VBUS_BGACK_N),
 
-//	.VRAM_SPEED(1),
+	// VRAM_SPEED is a VHDL input with default '1'; leaving it unconnected
+	// reads '1' in Quartus but 0 in converted-Verilog sim, and 0 (full-speed
+	// VRAM) breaks the FIFO_PARTIAL protocol: DTC drains at queue=0/partial=1,
+	// FIFO_QUEUE underflows to 7 and FIFO_EMPTY never asserts -> fill DMA
+	// never starts. Drive it explicitly.
+	.VRAM_SPEED(1'b1),
 //	.VSCROLL_BUG(0),
 	.BORDER_EN(BORDER),
 	.CRAM_DOTS(CRAM_DOTS),

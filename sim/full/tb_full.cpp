@@ -81,6 +81,8 @@ int main(int argc,char**argv){
                                   r->core_top__DOT__gen__DOT__vdp__DOT__dma_copy);
         static long slot_edges=0; static int se_prev=0;
         { int se=r->core_top__DOT__gen__DOT__vdp__DOT__slot_en; if(se&&!se_prev)slot_edges++; se_prev=se; }
+        static long fe_edges=0; static int fe_prev=0;
+        { int fe=r->core_top__DOT__gen__DOT__vdp__DOT__fifo_en; if(fe&&!fe_prev)fe_edges++; fe_prev=fe; }
         if((c%2000000)==0){
             printf("      dmac=%d slot_en=%d dt_vram_sel=%d\n",
                    r->core_top__DOT__gen__DOT__vdp__DOT__dmac,
@@ -91,10 +93,16 @@ int main(int argc,char**argv){
                    r->core_top__DOT__gen__DOT__vdp__DOT__dmaf_set_req);
             printf("      dtc=%d fifo_queue=? (dtc: 0=IDLE 1=FIFO_RD 2=VRAM_WR1 3=VRAM_WR2 7=VRAM_RD1 8=VRAM_RD2)\n",
                    r->core_top__DOT__gen__DOT__vdp__DOT__dtc);
-            printf("      fifo_queue=%d fifo_partial=%d fifo_en=%d\n",
+            printf("      fifo_queue=%d fifo_partial=%d fifo_en_edges=%ld\n",
                    r->core_top__DOT__gen__DOT__vdp__DOT__fifo_queue,
                    r->core_top__DOT__gen__DOT__vdp__DOT__fifo_partial,
-                   r->core_top__DOT__gen__DOT__vdp__DOT__fifo_en);
+                   fe_edges);
+            int fd = r->core_top__DOT__gen__DOT__vdp__DOT__fifo_delay;
+            printf("      fifo_delay={%d,%d,%d,%d} rd_pos=%d wr_pos=%d refresh_flag=%d\n",
+                   fd&3,(fd>>2)&3,(fd>>4)&3,(fd>>6)&3,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__fifo_rd_pos,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__fifo_wr_pos,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__refresh_flag);
         }
     }
     // dump work-RAM code around the STOP site $FF00F0.. (SDRAM word $400078..)

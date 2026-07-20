@@ -5105,14 +5105,14 @@ module vdp(RST_N, CLK, SEL, A, RNW, DI, vram_ack, vram_q, vram32_ack, vram32_q, 
   wire [67:0] fifo_addr;
   wire [15:0] fifo_code;
   wire [63:0] fifo_data;
-  wire [7:0] fifo_delay;
+  wire [7:0] fifo_delay /* verilator public_flat_rd */;
   wire fifo_empty /* verilator public_flat_rd */;
   wire fifo_en /* verilator public_flat_rd */;
   wire fifo_full;
   wire fifo_partial /* verilator public_flat_rd */;
   wire [2:0] fifo_queue /* verilator public_flat_rd */;
-  wire [1:0] fifo_rd_pos;
-  wire [1:0] fifo_wr_pos;
+  wire [1:0] fifo_rd_pos /* verilator public_flat_rd */;
+  wire [1:0] fifo_wr_pos /* verilator public_flat_rd */;
   wire h40;
   wire [8:0] h_disp_start;
   wire [8:0] h_disp_width;
@@ -5226,7 +5226,7 @@ module vdp(RST_N, CLK, SEL, A, RNW, DI, vram_ack, vram_q, vram32_ack, vram32_q, 
   wire [8:0] pre_y;
   wire ram_req_progress;
   wire refresh_en;
-  wire refresh_flag;
+  wire refresh_flag /* verilator public_flat_rd */;
   wire refresh_slot;
   wire [255:0] \reg ;
   wire rs0;
