@@ -170,6 +170,13 @@ architecture rtl of ASIC is
 	signal WORD_RAM_1M1_WR 			: std_logic;
 	signal WORD_RAM_1M0_RD 			: std_logic;
 	signal WORD_RAM_1M1_RD 			: std_logic;
+	-- combinational address-mux outputs and per-transaction snapshots:
+	-- RET/MODE flips mid-transaction re-route the mux; with slow external
+	-- word RAM the RMW write-back must reuse the read's address
+	signal WORDRAM0_A_C 				: std_logic_vector(15 downto 0);
+	signal WORDRAM1_A_C 				: std_logic_vector(15 downto 0);
+	signal WORDRAM0_A_R 				: std_logic_vector(15 downto 0);
+	signal WORDRAM1_A_R 				: std_logic_vector(15 downto 0);
 	signal WR0S 						: WordRamState_t;
 	signal WR1S 						: WordRamState_t;
 	signal WR0R 						: WordRam_r;
@@ -1555,6 +1562,7 @@ begin
 					when WRS_IDLE =>
 						if WR0R.EXEC = '1' then
 							WORD_RAM_1M0_RD <= '1';
+							WORDRAM0_A_R <= WORDRAM0_A_C;	-- freeze address for the whole RMW
 							WR0S <= WRS_READ;
 						end if;
 
@@ -1632,6 +1640,7 @@ begin
 					when WRS_IDLE =>
 						if WR1R.EXEC = '1' then
 							WORD_RAM_1M1_RD <= '1';
+							WORDRAM1_A_R <= WORDRAM1_A_C;	-- freeze address for the whole RMW
 							WR1S <= WRS_READ;
 						end if;
 
@@ -2273,8 +2282,8 @@ begin
 	variable MWR_AD : std_logic_vector(16 downto 1);
 	begin
 		if MODE = '0' then						--2M mode
-			WORDRAM0_A <= WR0R.A;
-			WORDRAM1_A <= WR1R.A;
+			WORDRAM0_A_C <= WR0R.A;
+			WORDRAM1_A_C <= WR1R.A;
 		else											--1M mode
 			if RET1 = '0' then
 				MWR_AS := WR0R.A;
@@ -2299,11 +2308,11 @@ begin
 			end if;
 			
 			if RET1 = '0' then
-				WORDRAM0_A <= MWR_AD;
-				WORDRAM1_A <= WR1R.A;
+				WORDRAM0_A_C <= MWR_AD;
+				WORDRAM1_A_C <= WR1R.A;
 			else
-				WORDRAM0_A <= WR0R.A;
-				WORDRAM1_A <= MWR_AD;
+				WORDRAM0_A_C <= WR0R.A;
+				WORDRAM1_A_C <= MWR_AD;
 			end if;
 		end if;
 	end process;
@@ -2314,6 +2323,8 @@ begin
 	WORDRAM1_WR <= WORD_RAM_1M1_WR;
 	WORDRAM0_RD <= WORD_RAM_1M0_RD;
 	WORDRAM1_RD <= WORD_RAM_1M1_RD;
+	WORDRAM0_A <= WORDRAM0_A_R;
+	WORDRAM1_A <= WORDRAM1_A_R;
 	
 	
 	
