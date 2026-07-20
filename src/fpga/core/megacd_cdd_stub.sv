@@ -65,8 +65,11 @@ always @(posedge clk) begin
         send_d <= cdd_send;
         wdog   <= wdog + 1'b1;
 
-        // STOP -> NO_DISC after the drive "spins up" and finds no disc
-        if (drv_status == STAT_STOP) begin
+        // empty tray: every state drains to NO_DISC once the drive has
+        // "looked" — STOP after ~130ms, TOC (and anything else) after ~26ms.
+        // Without a TOC->NO_DISC exit the BIOS wedges at CHECKING DISC if a
+        // TOC command lands inside the STOP window (race seen on hardware).
+        if (drv_status != STAT_NO_DISC) begin
             if (ms_tick == TICK_13MS) begin
                 ms_tick <= 0;
                 if (latency != 0) latency <= latency - 1'b1;
@@ -92,6 +95,7 @@ always @(posedge clk) begin
                 4'h2: begin                   // Read TOC (only from STOP)
                     if (drv_status == STAT_STOP) begin
                         drv_status <= STAT_TOC;
+                        latency <= 4'd2;      // empty TOC read fails fast
                         n0 <= STAT_TOC;
                     end else begin
                         n0 <= drv_status;
