@@ -1727,8 +1727,8 @@ begin
 				end if;
 				case WR0A is
 					when WRA_IDLE =>
-						WR0R.DOT_IMAGE <= (others => '0');
 						if WR0S = WRS_IDLE then	-- block accepts while a posted write drains
+						WR0R.DOT_IMAGE <= (others => '0');
 						if MODE = '1' then	--1M MODE
 							if RET1 = '0' then 
 								if M68K_WORD_RAM_SEL = '1' and M68K_WORDRAM_DTACK_N = '1' then
@@ -1896,8 +1896,8 @@ begin
 				end if;
 				case WR1A is
 					when WRA_IDLE =>
-						WR1R.DOT_IMAGE <= (others => '0');
 						if WR1S = WRS_IDLE then	-- block accepts while a posted write drains
+						WR1R.DOT_IMAGE <= (others => '0');
 						if MODE = '1' then	--1M MODE
 							if RET1 = '1' then 
 								if M68K_WORD_RAM_SEL = '1' and M68K_WORDRAM_DTACK_N = '1' then

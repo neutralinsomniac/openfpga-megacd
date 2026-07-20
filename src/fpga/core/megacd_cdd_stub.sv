@@ -36,11 +36,11 @@ reg  [3:0] drv_status = STAT_STOP;
 reg  [3:0] n0, n1;
 wire [3:0] csum = ~(n0 + n1) & 4'hF;   // n2..n8 are always 0 in this stub
 
-// Emergency-only watchdog (~1s): unsolicited packets can land while the
-// BIOS is mid-way through reading the five status registers, tearing the
-// packet (checksum fail -> BIOS re-inits the drive, UI flaps). MiSTer
-// replies only to commands; we keep a slow restart path for a dead loop.
-localparam [25:0] WDOG = 26'd53693175;
+// Real drives exchange status/command packets on a fixed 75Hz beat, and
+// the BIOS paces its intro/UI choreography on those INT4s — throttling
+// status to command-replies-only made everything crawl. Keep the beat;
+// a command reply resets its phase.
+localparam [25:0] WDOG = 26'd715909;   // 13.3ms @ 53.693175MHz
 
 reg [25:0] wdog = 0;
 reg [12:0] delay = 0;      // ~150us command-to-reply latency
