@@ -1402,7 +1402,9 @@ gen gen
 	.EN_BGB(1'b1),
 	.EN_SPR(1'b1),
 
-	.J3BUT(1'b0),
+	// 3-button pad (MiSTer default): the model-2 BIOS mishandles 6-button
+	// probing in the CD player (cursor won't move)
+	.J3BUT(1'b1),
 	// MiSTer gen.sv expects bit6=C/bit5=B; the Pocket builder packs bit6=B/bit5=C
 	.JOY_1({joystick_0[11:7], joystick_0[5], joystick_0[6], joystick_0[4:0]}),
 	.JOY_2({joystick_1[11:7], joystick_1[5], joystick_1[6], joystick_1[4:0]}),
