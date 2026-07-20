@@ -41,8 +41,12 @@ int main(int argc,char**argv){
 
         uint32_t mpc = dut->rootp->core_top__DOT__dbg_m68k_a & 0xFFFFFF;
         uint32_t spc = dut->rootp->core_top__DOT__dbg_s68k_a & 0xFFFFFF;
-        if((c%2000000)==0)
-            printf("[%ld] main=%06X sub=%06X\n", c, mpc, spc);
+        static uint32_t mlo=0xFFFFFF, mhi=0; static long win=0;
+        if(mpc<mlo)mlo=mpc; if(mpc>mhi)mhi=mpc;
+        if((c%1000000)==0){
+            printf("[%ld] main=%06X sub=%06X  (main range last win: %06X..%06X)\n", c, mpc, spc, mlo,mhi);
+            mlo=0xFFFFFF; mhi=0;
+        }
     }
     dut->final(); delete dut;
     printf("done\n");

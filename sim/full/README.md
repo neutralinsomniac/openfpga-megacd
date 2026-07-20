@@ -48,3 +48,14 @@ word $780000, drive clk_74a at clk_ram rate, hold reset_n, trace both PCs).
 
 Fixed so far: joystick trailing commas (megacd_top.sv), dcfifo params,
 dcfifo/sdram/pll/bram sim models.
+
+## Boot status: main CPU stalls at $FF00FA
+Full system boots; main 68000 runs the real BIOS from work RAM but its
+address bus FREEZES at exactly $FF00FA (static, not a loop) ~= a bus access
+stalled waiting for DTACK, or a halt/missing-interrupt. Prime suspects:
+(1) behavioral sim SDRAM (sdram_sim.v) busy/RDY handshake on the work-RAM
+port (port 1) — verify it matches core/rtl/megacd/sdram.sv timing exactly;
+(2) missing VDP vblank interrupt to the main (check VDP CE_PIX/VBL and the
+main's VINT wiring in sim). Debug: mark the sim SDRAM mem + gen RAM_RDY/
+DTACK signals public, watch them at the stall; disassemble the copied-to-
+RAM routine at $FF00FA (work RAM = SDRAM word $400000 + (VA[15:1])).
