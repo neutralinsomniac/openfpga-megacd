@@ -630,7 +630,8 @@ localparam 	MBUS_IDLE         = 0,
 always @(posedge MCLK) begin
 	reg [8:0] refresh_timer;
 	reg rfs_pend;
-	
+	reg exp_dtack_armed;
+
 	if (reset) begin
 		M68K_MBUS_DTACK_N <= 1;
 		Z80_MBUS_DTACK_N  <= 1;
@@ -666,6 +667,7 @@ always @(posedge MCLK) begin
 		MBUS_IDLE:
 			begin
 				msrc <= MSRC_NONE;
+				exp_dtack_armed <= 0;
 				/*if (rfs_pend) begin
 					rfs_pend <= 0;
 					RFS <= 1;
@@ -821,11 +823,19 @@ always @(posedge MCLK) begin
 			end
 			
 		MBUS_ROM_READ:
-			if (!DTACK_N) begin
-				M68K_MBUS_DTACK_N <= ~(msrc == MSRC_M68K);
-				VDP_MBUS_DTACK_N <= ~(msrc == MSRC_VDP);
-				Z80_MBUS_DTACK_N <= ~(msrc == MSRC_Z80);
-				mstate <= MBUS_FINISH;
+			begin
+				// Pocket port: with slow (SDRAM) word RAM the expansion
+				// slave's DTACK release can lag into the next back-to-back
+				// cycle; a low DTACK at cycle entry is always stale. Wait
+				// until it has been seen released before accepting it.
+				if (DTACK_N) exp_dtack_armed <= 1;
+				if (exp_dtack_armed && !DTACK_N) begin
+					M68K_MBUS_DTACK_N <= ~(msrc == MSRC_M68K);
+					VDP_MBUS_DTACK_N <= ~(msrc == MSRC_VDP);
+					Z80_MBUS_DTACK_N <= ~(msrc == MSRC_Z80);
+					exp_dtack_armed <= 0;
+					mstate <= MBUS_FINISH;
+				end
 			end
 			
 		MBUS_VDP_READ:
@@ -843,11 +853,16 @@ always @(posedge MCLK) begin
 			end
 			
 		MBUS_FDC_READ:
-			if (!DTACK_N) begin
-				M68K_MBUS_DTACK_N <= ~(msrc == MSRC_M68K);
-				VDP_MBUS_DTACK_N <= ~(msrc == MSRC_VDP);
-				Z80_MBUS_DTACK_N <= ~(msrc == MSRC_Z80);
-				mstate <= MBUS_FINISH;
+			begin
+				// same stale-DTACK qualification as MBUS_ROM_READ
+				if (DTACK_N) exp_dtack_armed <= 1;
+				if (exp_dtack_armed && !DTACK_N) begin
+					M68K_MBUS_DTACK_N <= ~(msrc == MSRC_M68K);
+					VDP_MBUS_DTACK_N <= ~(msrc == MSRC_VDP);
+					Z80_MBUS_DTACK_N <= ~(msrc == MSRC_Z80);
+					exp_dtack_armed <= 0;
+					mstate <= MBUS_FINISH;
+				end
 			end
 			
 		MBUS_TIME_READ:
