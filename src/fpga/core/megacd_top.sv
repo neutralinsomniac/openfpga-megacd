@@ -743,9 +743,13 @@ wire [31:0] dbg_hexval = {dbg_ack2_rate, dbg_ack4_rate,
 wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
                          (dbg_y < 10'd54) ? {8'h00, dbg_m68k_smp} :
                          (dbg_y < 10'd66) ? {8'h00, dbg_s68k_smp} :
-                         (dbg_y < 10'd78) ? dbg_prg_data[127:96] :
-                         (dbg_y < 10'd90) ? dbg_prg_data[95:64] :
-                         (dbg_y < 10'd102) ? dbg_prg_data[63:32] :
+                         (dbg_y < 10'd78) ? dbg_prg_data[255:224] :
+                         (dbg_y < 10'd90) ? dbg_prg_data[223:192] :
+                         (dbg_y < 10'd102) ? dbg_prg_data[191:160] :
+                         (dbg_y < 10'd114) ? dbg_prg_data[159:128] :
+                         (dbg_y < 10'd126) ? dbg_prg_data[127:96] :
+                         (dbg_y < 10'd138) ? dbg_prg_data[95:64] :
+                         (dbg_y < 10'd150) ? dbg_prg_data[63:32] :
                                              dbg_prg_data[31:0];
 wire [3:0] dbg_dv = dbg_hexrow[((3'd7 - dbg_x[6:4])*4) +: 4];
 reg [23:0] dbg_glyph;
@@ -759,7 +763,11 @@ always @* case (dbg_dv)
 	4'hC: dbg_glyph = 24'h698896;  4'hD: dbg_glyph = 24'hE9999E;
 	4'hE: dbg_glyph = 24'hF8E88F;  default: dbg_glyph = 24'hF8E888;
 endcase
-wire [9:0] dbg_band = dbg_y - ((dbg_y >= 10'd102) ? 10'd102 :
+wire [9:0] dbg_band = dbg_y - ((dbg_y >= 10'd150) ? 10'd150 :
+                               (dbg_y >= 10'd138) ? 10'd138 :
+                               (dbg_y >= 10'd126) ? 10'd126 :
+                               (dbg_y >= 10'd114) ? 10'd114 :
+                               (dbg_y >= 10'd102) ? 10'd102 :
                                (dbg_y >= 10'd90) ? 10'd90 :
                                (dbg_y >= 10'd78) ? 10'd78 :
                                (dbg_y >= 10'd66) ? 10'd66 :
@@ -844,7 +852,7 @@ always @(posedge current_pix_clk) begin
                                        (dbg_ack4_rate != 0)     ? 24'hFFFF00 : 24'hFF0000;
                 default: ;
             endcase
-        end else if (dbg_y >= 10'd30 && dbg_y < 10'd114) begin
+        end else if (dbg_y >= 10'd30 && dbg_y < 10'd162) begin
             // numeric readout rows: stats / M68K addr sample / S68K addr sample
             if (dbg_x[9:4] < 6'd8) begin
                 if (~dbg_x[3])
@@ -1691,11 +1699,13 @@ reg [23:0] dbg_s68k_smp = 0;
 // spin loop) via SDRAM port 2, shown as two hex rows. Bursts only start
 // with the word-RAM arbiter idle, and grants are held off during them.
 reg        dbg_prg_active = 0;
-reg  [2:0] dbg_prg_idx = 0;
+reg  [3:0] dbg_prg_idx = 0;
 reg        dbg_prg_req = 0;
 reg        dbg_prg_go = 0;
-reg [127:0] dbg_prg_data = 0;
-wire [17:0] dbg_prg_addr = 18'h30B4 + dbg_prg_idx;
+reg [255:0] dbg_prg_data = 0;
+// two windows: PRG bytes $6168.. and $8330..
+wire [17:0] dbg_prg_addr = dbg_prg_idx[3] ? (18'h4198 + dbg_prg_idx[2:0])
+                                          : (18'h30B4 + dbg_prg_idx[2:0]);
 
 always @(posedge clk_sys) begin
 	reg old_busy3;
@@ -1708,10 +1718,10 @@ always @(posedge clk_sys) begin
 		dbg_prg_req <= 1;
 	end else if (dbg_prg_active) begin
 		if (dbg_prg_req && old_busy3 && !sdld_busy) begin
-			dbg_prg_data[{~dbg_prg_idx[2:0], 4'b0} +: 16] <= sdwr_do;
+			dbg_prg_data[{~dbg_prg_idx, 4'b0} +: 16] <= sdwr_do;
 			dbg_prg_req <= 0;
 		end else if (!dbg_prg_req) begin
-			if (dbg_prg_idx == 3'd7) dbg_prg_active <= 0;
+			if (dbg_prg_idx == 4'd15) dbg_prg_active <= 0;
 			else begin
 				dbg_prg_idx <= dbg_prg_idx + 1'b1;
 				dbg_prg_req <= 1;

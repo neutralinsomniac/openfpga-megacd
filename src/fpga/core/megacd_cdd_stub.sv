@@ -74,7 +74,7 @@ always @(posedge clk) begin
 
         if (cdd_send & ~send_d) begin
             case (cdd_comm[3:0])
-                4'h0: begin                   // IDLE: refresh current report
+                4'h0: if (latency <= 4'd3) begin  // IDLE: refresh current report
                     n0 <= drv_status;
                     case (n1)
                         4'h0: begin abs150; n8 <= 0; end
