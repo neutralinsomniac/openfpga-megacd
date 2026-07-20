@@ -730,8 +730,8 @@ wire [7:0] color_lut[16] = '{
 
 wire [3:0] r, g, b;
 wire vs, hs;
-wire ce_pix;
-wire hblank, vblank_sys;
+wire ce_pix /* verilator public_flat_rd */;
+wire hblank, vblank_sys /* verilator public_flat_rd */;
 
 reg video_de_reg;
 reg video_hs_reg;
@@ -962,7 +962,7 @@ assign MCD_PRG_BUSY = sdr_busy;
 assign MCD_PRG_DI   = sdr_do;
 
 wire [15:0] GEN_MEM_DO;
-wire        GEN_MEM_BUSY;
+wire        GEN_MEM_BUSY /* verilator public_flat_rd */;
 wire        sdld_busy;
 
 always @(posedge clk_sys) begin
@@ -1394,7 +1394,7 @@ wire        GEN_AS_N, GEN_DTACK_N, GEN_ASEL_N;
 wire        GEN_RAS2_N, EXT_ROM_N, EXT_FDC_N;
 wire        GEN_VCLK_CE, GEN_CE0_N;
 wire        GEN_WRL_N, GEN_WRH_N, GEN_OE_N;
-wire        GEN_ROM_CE_N, GEN_RAM_CE_N;
+wire        GEN_ROM_CE_N /* verilator public_flat_rd */, GEN_RAM_CE_N /* verilator public_flat_rd */;
 wire [15:0] GEN_AUDL, GEN_AUDR;
 wire        GEN_CE;
 

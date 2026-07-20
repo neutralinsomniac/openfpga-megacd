@@ -146,7 +146,7 @@ always @(posedge MCLK) if(M68K_CLKENn) reset <= ~RESET_N | LOADING;
 // CLOCK ENABLERS
 //--------------------------------------------------------------
 wire M68K_CLKEN = M68K_CLKENp;
-reg  M68K_CLKENp, M68K_CLKENn;
+reg  M68K_CLKENp /* verilator public_flat_rd */, M68K_CLKENn;
 reg  Z80_CLKENp, Z80_CLKENn;
 
 always @(negedge MCLK) begin
@@ -297,7 +297,7 @@ wire        VBUS_BGACK_N;
 
 wire        M68K_EXINT;
 wire        M68K_HINT;
-wire        M68K_VINT;
+wire        M68K_VINT /* verilator public_flat_rd */;
 wire        Z80_VINT;
 
 wire        vram_req;
@@ -579,7 +579,7 @@ multitap multitap
 //-----------------------------------------------------------------------
 // MBUS Handling
 //-----------------------------------------------------------------------
-reg         M68K_MBUS_DTACK_N;
+reg         M68K_MBUS_DTACK_N /* verilator public_flat_rd */;
 reg         Z80_MBUS_DTACK_N;
 reg         VDP_MBUS_DTACK_N;
 
@@ -603,7 +603,7 @@ reg         RAM_SEL;
 reg         FDC_SEL;
 reg         TIME_SEL;
 
-reg   [3:0] mstate;
+reg   [3:0] mstate /* verilator public_flat_rd */;
 reg   [1:0] msrc;
 
 localparam	MSRC_NONE = 0,

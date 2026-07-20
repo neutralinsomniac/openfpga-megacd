@@ -41,12 +41,29 @@ int main(int argc,char**argv){
 
         uint32_t mpc = dut->rootp->core_top__DOT__dbg_m68k_a & 0xFFFFFF;
         uint32_t spc = dut->rootp->core_top__DOT__dbg_s68k_a & 0xFFFFFF;
-        static uint32_t mlo=0xFFFFFF, mhi=0; static long win=0;
-        if(mpc<mlo)mlo=mpc; if(mpc>mhi)mhi=mpc;
-        if((c%1000000)==0){
-            printf("[%ld] main=%06X sub=%06X  (main range last win: %06X..%06X)\n", c, mpc, spc, mlo,mhi);
-            mlo=0xFFFFFF; mhi=0;
+        auto* r = dut->rootp;
+        static uint32_t last=0xFFFFFFFF; static long stuck=0;
+        static int vint_prev=0; static long vint_cnt=0, cepix_cnt=0, vbl_cnt=0;
+        static int cepix_prev=0, vbl_prev=0;
+        int vint = r->core_top__DOT__gen__DOT__M68K_VINT;
+        int cepix = r->core_top__DOT__ce_pix;
+        int vbl = r->core_top__DOT__vblank_sys;
+        if(vint && !vint_prev) vint_cnt++;
+        if(cepix && !cepix_prev) cepix_cnt++;
+        if(vbl && !vbl_prev) vbl_cnt++;
+        vint_prev=vint; cepix_prev=cepix; vbl_prev=vbl;
+        if(mpc==last) stuck++; else { stuck=0; last=mpc; }
+        if(stuck==500000){
+            printf("[%ld] main STUCK at %06X: mstate=%X dtack_n=%d "
+                   "VINT_now=%d VINT=%ld CE_PIX=%ld VBL=%ld IE0=%d PENDING=%d\n", c, mpc,
+                   r->core_top__DOT__gen__DOT__mstate,
+                   r->core_top__DOT__gen__DOT__M68K_MBUS_DTACK_N,
+                   vint, vint_cnt, cepix_cnt, vbl_cnt,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__ie0,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__vint_tg68_pending);
         }
+        if((c%2000000)==0) printf("[%ld] main=%06X sub=%06X  VINT=%ld CE_PIX=%ld VBL=%ld\n",
+                                  c, mpc, spc, vint_cnt, cepix_cnt, vbl_cnt);
     }
     dut->final(); delete dut;
     printf("done\n");

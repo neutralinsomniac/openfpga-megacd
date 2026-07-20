@@ -59,3 +59,19 @@ port (port 1) — verify it matches core/rtl/megacd/sdram.sv timing exactly;
 main's VINT wiring in sim). Debug: mark the sim SDRAM mem + gen RAM_RDY/
 DTACK signals public, watch them at the stall; disassemble the copied-to-
 RAM routine at $FF00FA (work RAM = SDRAM word $400000 + (VA[15:1])).
+
+## $FF00FA diagnosis (root cause narrowed)
+Main 68000 executes a STOP and waits for an interrupt (static PC, bus idle,
+mstate=IDLE, CPU still clocked). The VDP RUNS (CE_PIX climbs, VBL recurs
+each frame 1->2->3) but VINT never asserts because IE0 (VDP reg1 bit5,
+vblank-interrupt enable) stays 0. So the main STOPs forever waiting for a
+vblank IRQ that can't fire. NEXT: determine why IE0=0 —
+(a) trace whether the main ever writes VDP reg $01 with bit5 (mark the VDP
+    register-write path public; a yosys-conversion fidelity bug in the VDP
+    control-port write would explain register writes not landing), or
+(b) the main is waiting on a different interrupt/event before it would set
+    IE0 (disassemble the STOP site: main work RAM $FF00FA = SDRAM word
+    $400000+($00FA>>1); dump that SDRAM word range to disassemble).
+Public signals available: gen.mstate, gen.M68K_MBUS_DTACK_N,
+gen.M68K_CLKENp, gen.M68K_VINT, vdp.ie0, vdp.vint_tg68_pending,
+core_top.ce_pix, core_top.vblank_sys, dbg_m68k_a, dbg_s68k_a.

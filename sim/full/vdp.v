@@ -5143,7 +5143,7 @@ module vdp(RST_N, CLK, SEL, A, RNW, DI, vram_ack, vram_q, vram32_ack, vram32_q, 
   wire [3:0] hv_pixdiv;
   wire [8:0] hv_vcnt;
   wire [8:0] hv_vcnt_ext;
-  wire ie0;
+  wire ie0 /* verilator public_flat_rd */;
   wire ie1;
   wire ie2;
   wire in_dma;
@@ -5282,7 +5282,7 @@ module vdp(RST_N, CLK, SEL, A, RNW, DI, vram_ack, vram_q, vram32_ack, vram32_q, 
   wire vint_t80_ff;
   wire vint_t80_set;
   wire vint_tg68_ff;
-  wire vint_tg68_pending;
+  wire vint_tg68_pending /* verilator public_flat_rd */;
   wire vint_tg68_pending_set;
   wire [2:0] vmc32;
   wire [2:0] vmc32_next;
