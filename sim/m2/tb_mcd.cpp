@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
     long INJ = 3500000;
     for (int i=0;i<8;i++) script.push_back({INJ + i*400, 8+i, 0x0000});
     script.push_back({INJ, 8, 0x0200});      // CC0 high byte = command 0x02
-    script.push_back({INJ+4000, 7, 0x0100}); // raise comm flag (main byte bit0)
+    script.push_back({INJ+4000, 7, 0x0400}); // comm flag: CFM bit2 (EXT_VDI(10)) — the bit the sub polls at $61D0
 
     size_t sp=0;
     enum { EXT_IDLE, EXT_DRIVE } ext_st = EXT_IDLE;
@@ -225,8 +225,8 @@ int main(int argc, char** argv) {
 
         // ---- trace sub-CPU PC (address bus) ----
         uint32_t pc = dut->DBG_S68K_A & 0xFFFFFF;
-        if (pc>=0x6178 && pc<=0x6190 && !seen_cmd){ seen_cmd=true; printf("[%ld] sub entered COMMAND HANDLER (pc=%06X)\n",c,pc); }
-        if (pc>=0x616A && pc<=0x6170 && !seen_616a){ seen_616a=true; printf("[%ld] sub reached BUSY-WAIT $616A (the hang site!)\n",c); }
+        if (pc>=0x6178 && pc<=0x6190 && c>INJ && !seen_cmd){ seen_cmd=true; printf("[%ld] sub entered COMMAND HANDLER AFTER INJECTION (pc=%06X)\n",c,pc); }
+        if (pc>=0x616A && pc<=0x6170 && c>INJ && !seen_616a){ seen_616a=true; printf("[%ld] sub reached BUSY-WAIT $616A AFTER INJECTION (the hang!)\n",c); }
         if (pc==last_pc){ if(++idlepc==200000){ printf("[%ld] sub STUCK at %06X ipl=%X pend=%02X gron=%d\n",
                              c,pc,dut->DBG_S68K_IPL_N,dut->DBG_INT_PEND,dut->DBG_GRON); idlepc=0; } }
         else { idlepc=0; last_pc=pc; }
