@@ -120,3 +120,16 @@ pulsing (its enable/CE broke in the yosys/--latches conversion), or the
 converted VDP VRAM dpram access handshake (DT_VRAM_SEL) not completing.
 VRAM_SPEED is 0 in sim (gen.sv `.VRAM_SPEED(1)` is commented out) so the
 FILL_WR VRAM_SPEED/FIFO_EN gate is satisfied — not the cause.
+
+## Fill-DMA stuck at DMA_FILL_START — root: FIFO not draining
+Probed: dmac=2 (DMA_FILL_START), slot_en_edges=245K (SLOT_EN FINE, ruled
+out), but FIFO_EMPTY=0 and DMAF_SET_REQ=1 permanently. DMA_FILL_START
+advances only on `FIFO_EMPTY=1 and DTC=DTC_IDLE and DMAF_SET_REQ=0`. So the
+VDP command/data FIFO never drains and the fill-data request never clears.
+The DT (data-transfer) engine drains the FIFO to VRAM during slots; earlier
+VDP writes DID drain (VINT setup worked), so it's now wedged. NEXT: mark DTC
+(the data-transfer-controller state), FIFO_EMPTY inputs, and DMAF_SET_REQ's
+clear logic public; find why the FIFO stopped draining / DMAF_SET_REQ won't
+clear. Prime suspect: DMAF_SET_REQ clear path or the DT engine's FIFO-read
+gating in the converted VDP. Public probes now include vdp.dmac/slot_en/
+dt_vram_sel/fifo_empty/dmaf_set_req/in_dma/dma_fill.

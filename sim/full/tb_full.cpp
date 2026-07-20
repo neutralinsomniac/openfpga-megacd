@@ -79,6 +79,17 @@ int main(int argc,char**argv){
                                   r->core_top__DOT__gen__DOT__vdp__DOT__dma_fill,
                                   r->core_top__DOT__gen__DOT__vdp__DOT__dma_vbus,
                                   r->core_top__DOT__gen__DOT__vdp__DOT__dma_copy);
+        static long slot_edges=0; static int se_prev=0;
+        { int se=r->core_top__DOT__gen__DOT__vdp__DOT__slot_en; if(se&&!se_prev)slot_edges++; se_prev=se; }
+        if((c%2000000)==0){
+            printf("      dmac=%d slot_en=%d dt_vram_sel=%d\n",
+                   r->core_top__DOT__gen__DOT__vdp__DOT__dmac,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__slot_en,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__dt_vram_sel);
+            printf("      slot_en_edges=%ld fifo_empty=%d dmaf_set_req=%d\n", slot_edges,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__fifo_empty,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__dmaf_set_req);
+        }
     }
     // dump work-RAM code around the STOP site $FF00F0.. (SDRAM word $400078..)
     printf("work-RAM $FF00F0..$FF0120:\n");

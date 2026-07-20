@@ -5068,8 +5068,8 @@ module vdp(RST_N, CLK, SEL, A, RNW, DI, vram_ack, vram_q, vram32_ack, vram32_q, 
   wire [15:0] dma_source;
   wire dma_vbus /* verilator public_flat_rd */;
   wire [1:0] dma_vbus_timer;
-  wire [4:0] dmac;
-  wire dmaf_set_req;
+  wire [4:0] dmac /* verilator public_flat_rd */;
+  wire dmaf_set_req /* verilator public_flat_rd */;
   wire [15:0] dt_dmaf_data;
   wire [15:0] dt_dmav_data;
   wire [3:0] dt_rd_code;
@@ -5081,7 +5081,7 @@ module vdp(RST_N, CLK, SEL, A, RNW, DI, vram_ack, vram_q, vram32_ack, vram32_q, 
   wire [15:0] dt_vram_do;
   wire dt_vram_lds_n;
   wire dt_vram_rnw;
-  wire dt_vram_sel;
+  wire dt_vram_sel /* verilator public_flat_rd */;
   wire dt_vram_sel_d;
   wire dt_vram_uds_n;
   wire [16:0] dt_wr_addr;
@@ -5106,7 +5106,7 @@ module vdp(RST_N, CLK, SEL, A, RNW, DI, vram_ack, vram_q, vram32_ack, vram32_q, 
   wire [15:0] fifo_code;
   wire [63:0] fifo_data;
   wire [7:0] fifo_delay;
-  wire fifo_empty;
+  wire fifo_empty /* verilator public_flat_rd */;
   wire fifo_en;
   wire fifo_full;
   wire fifo_partial;
@@ -5235,7 +5235,7 @@ module vdp(RST_N, CLK, SEL, A, RNW, DI, vram_ack, vram_q, vram32_ack, vram32_q, 
   wire scol_clr;
   wire scol_set;
   wire shi;
-  wire slot_en;
+  wire slot_en /* verilator public_flat_rd */;
   wire sovr;
   wire sovr_clr;
   wire sovr_set;
