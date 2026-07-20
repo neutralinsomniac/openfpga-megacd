@@ -742,7 +742,11 @@ wire [31:0] dbg_hexval = {dbg_ack2_rate, dbg_ack4_rate,
                           joystick_0[7:0]};
 wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
                          (dbg_y < 10'd54) ? {8'h00, dbg_m68k_smp} :
-                                            {8'h00, dbg_s68k_smp};
+                         (dbg_y < 10'd66) ? {8'h00, dbg_s68k_smp} :
+                         (dbg_y < 10'd78) ? dbg_prg_data[127:96] :
+                         (dbg_y < 10'd90) ? dbg_prg_data[95:64] :
+                         (dbg_y < 10'd102) ? dbg_prg_data[63:32] :
+                                             dbg_prg_data[31:0];
 wire [3:0] dbg_dv = dbg_hexrow[((3'd7 - dbg_x[6:4])*4) +: 4];
 reg [23:0] dbg_glyph;
 always @* case (dbg_dv)
@@ -755,7 +759,12 @@ always @* case (dbg_dv)
 	4'hC: dbg_glyph = 24'h698896;  4'hD: dbg_glyph = 24'hE9999E;
 	4'hE: dbg_glyph = 24'hF8E88F;  default: dbg_glyph = 24'hF8E888;
 endcase
-wire [9:0] dbg_band = dbg_y - ((dbg_y >= 10'd54) ? 10'd54 : (dbg_y >= 10'd42) ? 10'd42 : 10'd30);
+wire [9:0] dbg_band = dbg_y - ((dbg_y >= 10'd102) ? 10'd102 :
+                               (dbg_y >= 10'd90) ? 10'd90 :
+                               (dbg_y >= 10'd78) ? 10'd78 :
+                               (dbg_y >= 10'd66) ? 10'd66 :
+                               (dbg_y >= 10'd54) ? 10'd54 :
+                               (dbg_y >= 10'd42) ? 10'd42 : 10'd30);
 wire [2:0] dbg_frow = dbg_band[3:1];
 wire [3:0] dbg_grow = dbg_glyph[((3'd5 - dbg_frow)*4) +: 4];
 
@@ -835,7 +844,7 @@ always @(posedge current_pix_clk) begin
                                        (dbg_ack4_rate != 0)     ? 24'hFFFF00 : 24'hFF0000;
                 default: ;
             endcase
-        end else if (dbg_y >= 10'd30 && dbg_y < 10'd66) begin
+        end else if (dbg_y >= 10'd30 && dbg_y < 10'd114) begin
             // numeric readout rows: stats / M68K addr sample / S68K addr sample
             if (dbg_x[9:4] < 6'd8) begin
                 if (~dbg_x[3])
@@ -948,11 +957,13 @@ sdram sdram
 	.wrh1(~GEN_RAM_CE_N & ~GEN_WRH_N),
 	.busy1(GEN_MEM_BUSY),
 
-	// word RAM (runtime + boot self-test via arbiter) / BIOS load (download)
-	.addr2(bios_download ? {6'b011110, ioctl_addr[18:1]} : {7'b0110000, wr_owner, wr_addr}),
+	// word RAM (runtime + boot self-test via arbiter) / BIOS load / PRG peek
+	.addr2(bios_download ? {6'b011110, ioctl_addr[18:1]} :
+	       dbg_prg_active ? {6'b100000, dbg_prg_addr} :
+	                        {7'b0110000, wr_owner, wr_addr}),
 	.din2(bios_download ? {ioctl_data[7:0], ioctl_data[15:8]} : wr_din),
 	.dout2(sdwr_do),
-	.rd2(~bios_download & wr_rd_r),
+	.rd2(~bios_download & (dbg_prg_active ? dbg_prg_req : wr_rd_r)),
 	.wrl2(bios_download ? ioctl_wait : wr_wr_r),
 	.wrh2(bios_download ? ioctl_wait : wr_wr_r),
 	.busy2(sdld_busy),
@@ -1025,7 +1036,7 @@ always @(posedge clk_sys) begin
 		wr0_wr_hold <= 0;
 		wr1_rd_hold <= 0;
 		wr1_wr_hold <= 0;
-	end else if (!wr_active) begin
+	end else if (!wr_active && !dbg_prg_active) begin
 		if (grant0_rd | grant0_wr) begin
 			wr_active <= 1;
 			wr_owner  <= 0;
@@ -1675,6 +1686,39 @@ reg [25:0] dbg_gron_cnt = 0;
 reg [2:0]  dbg_gron_duty = 0;    // GFX op in-flight duty (/8)
 reg [23:0] dbg_m68k_smp = 0;     // 1Hz address-bus samples (crude profiler)
 reg [23:0] dbg_s68k_smp = 0;
+
+// PRG-RAM peek: once per second read 8 words at PRG byte $6168 (the sub's
+// spin loop) via SDRAM port 2, shown as two hex rows. Bursts only start
+// with the word-RAM arbiter idle, and grants are held off during them.
+reg        dbg_prg_active = 0;
+reg  [2:0] dbg_prg_idx = 0;
+reg        dbg_prg_req = 0;
+reg        dbg_prg_go = 0;
+reg [127:0] dbg_prg_data = 0;
+wire [17:0] dbg_prg_addr = 18'h30B4 + dbg_prg_idx;
+
+always @(posedge clk_sys) begin
+	reg old_busy3;
+	old_busy3 <= sdld_busy;
+	if (dbg_sec == 26'd53693174) dbg_prg_go <= 1;
+	if (dbg_prg_go && !dbg_prg_active && !wr_active && !bios_download && st_done) begin
+		dbg_prg_active <= 1;
+		dbg_prg_go <= 0;
+		dbg_prg_idx <= 0;
+		dbg_prg_req <= 1;
+	end else if (dbg_prg_active) begin
+		if (dbg_prg_req && old_busy3 && !sdld_busy) begin
+			dbg_prg_data[{~dbg_prg_idx[2:0], 4'b0} +: 16] <= sdwr_do;
+			dbg_prg_req <= 0;
+		end else if (!dbg_prg_req) begin
+			if (dbg_prg_idx == 3'd7) dbg_prg_active <= 0;
+			else begin
+				dbg_prg_idx <= dbg_prg_idx + 1'b1;
+				dbg_prg_req <= 1;
+			end
+		end
+	end
+end
 
 // CDD drive stub (M1): "no disc" responder; the real drive MPU lands in M2
 wire [39:0] cdd_stat, cdd_comm;
