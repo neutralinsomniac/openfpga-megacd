@@ -94,3 +94,16 @@ earlier swap corrupted the main reset vector ($426 -> $2604) and the main
 ran into data and hung. Generate bios.hex as: @780000 then per word
 "%02x%02x" % (d[i], d[i+1]). With this, the main boots, runs the init loop
 (~$498), and jumps to work-RAM execution ($FF3714+). Boot now PROGRESSES.
+
+## Boot progress after byte-order fix
+Main now: init loop (~$498) -> work-RAM exec ($FF3714) -> VINT enabled and
+FIRING (vblank IRQ works) -> now waits at $AF0:
+  00AF0: move.w (a6),d3     ; a6=$C00004 VDP control/status
+  00AF2: btst #1,d3         ; bit1 = IN_DMA (DMA in progress)
+  00AF6: bne  $AF0          ; loop while DMA busy
+It set up + triggered a VDP DMA fill ($AE0-$AEC) and waits for IN_DMA to
+clear, but the converted VDP's IN_DMA never clears -> hang. NEXT: debug the
+VDP DMA state machine in the conversion (IN_DMA / DMA fill completion; check
+if the --latches conversion or a slot-timing signal broke DMA). Mark the
+VDP DMA-active + DMA-length signals public and watch them. Sub still in
+reset (main hasn't reached SRES release yet).
