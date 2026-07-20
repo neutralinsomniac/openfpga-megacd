@@ -8,7 +8,9 @@ package ASIC_PKG is
 	type WordRamState_t is (
 		WRS_IDLE,
 		WRS_READ,
+		WRS_READ_WAIT,
 		WRS_WRITE,
+		WRS_WRITE_WAIT,
 		WRS_END
 	);
 	

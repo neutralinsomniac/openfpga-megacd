@@ -84,14 +84,21 @@ entity ASIC is
 		CDD_REC			: in std_logic;
 		CDD_DM			: in std_logic;
 		
+		-- Pocket port: word RAM is external (SDRAM); RD/WR are level-held
+		-- requests, RDY follows the PRG_RDY protocol (1 idle, 0 while the
+		-- access is in flight, 1 when done / read data valid)
 		WORDRAM0_A   	: out std_logic_vector(15 downto 0);
 		WORDRAM0_DI		: in std_logic_vector(15 downto 0);
 		WORDRAM0_DO		: out std_logic_vector(15 downto 0);
+		WORDRAM0_RD		: out std_logic;
 		WORDRAM0_WR		: out std_logic;
+		WORDRAM0_RDY	: in std_logic := '1';
 		WORDRAM1_A   	: out std_logic_vector(15 downto 0);
 		WORDRAM1_DI		: in std_logic_vector(15 downto 0);
 		WORDRAM1_DO		: out std_logic_vector(15 downto 0);
+		WORDRAM1_RD		: out std_logic;
 		WORDRAM1_WR		: out std_logic;
+		WORDRAM1_RDY	: in std_logic := '1';
 		
 		FD_DAT			: out std_logic_vector(10 downto 0);
 		FD_WR				: out std_logic;
@@ -161,6 +168,8 @@ architecture rtl of ASIC is
 	signal WORD_RAM_1M1_DO 			: std_logic_vector(15 downto 0);
 	signal WORD_RAM_1M0_WR 			: std_logic;
 	signal WORD_RAM_1M1_WR 			: std_logic;
+	signal WORD_RAM_1M0_RD 			: std_logic;
+	signal WORD_RAM_1M1_RD 			: std_logic;
 	signal WR0S 						: WordRamState_t;
 	signal WR1S 						: WordRamState_t;
 	signal WR0R 						: WordRam_r;
@@ -1539,15 +1548,24 @@ begin
 			WR0S <= WRS_IDLE;
 			WORD_RAM_1M0_DI <= (others => '0');
 			WORD_RAM_1M0_WR <= '0';
+			WORD_RAM_1M0_RD <= '0';
 		elsif rising_edge(CLK) then
 			if EN = '1' then
 				case WR0S is
 					when WRS_IDLE =>
 						if WR0R.EXEC = '1' then
+							WORD_RAM_1M0_RD <= '1';
 							WR0S <= WRS_READ;
 						end if;
-						
+
 					when WRS_READ =>
+						-- external RAM: wait for the access to start
+						if WORDRAM0_RDY = '0' then
+							WR0S <= WRS_READ_WAIT;
+						end if;
+
+					when WRS_READ_WAIT =>
+						if WORDRAM0_RDY = '1' then
 						case WR0R.DOT_IMAGE is
 							when "11" =>   WORD_RAM_1M0_DI <= x"0" & WORDRAM0_DI( 7 downto  4) & x"0" & WORDRAM0_DI( 3 downto 0);
 							when "10" =>   WORD_RAM_1M0_DI <= x"0" & WORDRAM0_DI(15 downto 12) & x"0" & WORDRAM0_DI(11 downto 8);
@@ -1574,14 +1592,27 @@ begin
 						else
 							WORD_RAM_1M0_DO(15 downto 12) <= WORDRAM0_DI(15 downto 12);
 						end if;
-						WORD_RAM_1M0_WR <= '1';
-						
-						WR0S <= WRS_WRITE;
-					
+						WORD_RAM_1M0_RD <= '0';
+						if WR0R.RNW = "1111" then
+							-- pure read: skip the write-back to save SDRAM bandwidth
+							WR0S <= WRS_END;
+						else
+							WORD_RAM_1M0_WR <= '1';
+							WR0S <= WRS_WRITE;
+						end if;
+						end if;
+
 					when WRS_WRITE =>
-						WORD_RAM_1M0_WR <= '0';
-						WR0S <= WRS_END;
-					
+						if WORDRAM0_RDY = '0' then
+							WR0S <= WRS_WRITE_WAIT;
+						end if;
+
+					when WRS_WRITE_WAIT =>
+						if WORDRAM0_RDY = '1' then
+							WORD_RAM_1M0_WR <= '0';
+							WR0S <= WRS_END;
+						end if;
+
 					when WRS_END =>
 						if WR0R.EXEC = '0' then
 							WR0S <= WRS_IDLE;
@@ -1599,15 +1630,24 @@ begin
 			WR1S <= WRS_IDLE;
 			WORD_RAM_1M1_DI <= (others => '0');
 			WORD_RAM_1M1_WR <= '0';
+			WORD_RAM_1M1_RD <= '0';
 		elsif rising_edge(CLK) then
 			if EN = '1' then
 				case WR1S is
 					when WRS_IDLE =>
 						if WR1R.EXEC = '1' then
+							WORD_RAM_1M1_RD <= '1';
 							WR1S <= WRS_READ;
 						end if;
-					
+
 					when WRS_READ =>
+						-- external RAM: wait for the access to start
+						if WORDRAM1_RDY = '0' then
+							WR1S <= WRS_READ_WAIT;
+						end if;
+
+					when WRS_READ_WAIT =>
+						if WORDRAM1_RDY = '1' then
 						case WR1R.DOT_IMAGE is
 							when "11" =>   WORD_RAM_1M1_DI <= x"0" & WORDRAM1_DI( 7 downto  4) & x"0" & WORDRAM1_DI( 3 downto 0);
 							when "10" =>   WORD_RAM_1M1_DI <= x"0" & WORDRAM1_DI(15 downto 12) & x"0" & WORDRAM1_DI(11 downto 8);
@@ -1634,14 +1674,27 @@ begin
 						else
 							WORD_RAM_1M1_DO(15 downto 12) <= WORDRAM1_DI(15 downto 12);
 						end if;
-						WORD_RAM_1M1_WR <= '1';
-						
-						WR1S <= WRS_WRITE;
-					
+						WORD_RAM_1M1_RD <= '0';
+						if WR1R.RNW = "1111" then
+							-- pure read: skip the write-back to save SDRAM bandwidth
+							WR1S <= WRS_END;
+						else
+							WORD_RAM_1M1_WR <= '1';
+							WR1S <= WRS_WRITE;
+						end if;
+						end if;
+
 					when WRS_WRITE =>
-						WORD_RAM_1M1_WR <= '0';
-						WR1S <= WRS_END;
-					
+						if WORDRAM1_RDY = '0' then
+							WR1S <= WRS_WRITE_WAIT;
+						end if;
+
+					when WRS_WRITE_WAIT =>
+						if WORDRAM1_RDY = '1' then
+							WORD_RAM_1M1_WR <= '0';
+							WR1S <= WRS_END;
+						end if;
+
 					when WRS_END =>
 						if WR1R.EXEC = '0' then
 							WR1S <= WRS_IDLE;
@@ -2269,6 +2322,8 @@ begin
 	WORDRAM1_DO <= WORD_RAM_1M1_DO;
 	WORDRAM0_WR <= WORD_RAM_1M0_WR;
 	WORDRAM1_WR <= WORD_RAM_1M1_WR;
+	WORDRAM0_RD <= WORD_RAM_1M0_RD;
+	WORDRAM1_RD <= WORD_RAM_1M1_RD;
 	
 	
 	

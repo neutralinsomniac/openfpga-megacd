@@ -1,0 +1,24 @@
+{
+    "data": {
+        "magic": "APF_VER_1",
+        "data_slots": [
+            {
+                "id": 0,
+                "name": "BIOS",
+                "required": true,
+                "parameters": "0x109",
+                "extensions": ["bin"],
+                "address": "0x10000000"
+            },
+            {
+                "id": 10,
+                "name": "Save",
+                "required": false,
+                "nonvolatile": true,
+                "parameters": "0x84",
+                "extensions": ["sav"],
+                "address": "0x60000000"
+            }
+        ]
+    }
+}

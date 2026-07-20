@@ -42,6 +42,20 @@ entity MCD is
 		BRAM_DI			: in std_logic_vector(7 downto 0);
 		BRAM_DO			: out std_logic_vector(7 downto 0);
 		BRAM_WE			: out std_logic;
+
+		-- Pocket port: word RAM lives in external memory (see ASIC RDY protocol)
+		WORDRAM0_A		: out std_logic_vector(15 downto 0);
+		WORDRAM0_DI		: in std_logic_vector(15 downto 0);
+		WORDRAM0_DO		: out std_logic_vector(15 downto 0);
+		WORDRAM0_RD		: out std_logic;
+		WORDRAM0_WR		: out std_logic;
+		WORDRAM0_RDY	: in std_logic := '1';
+		WORDRAM1_A		: out std_logic_vector(15 downto 0);
+		WORDRAM1_DI		: in std_logic_vector(15 downto 0);
+		WORDRAM1_DO		: out std_logic_vector(15 downto 0);
+		WORDRAM1_RD		: out std_logic;
+		WORDRAM1_WR		: out std_logic;
+		WORDRAM1_RDY	: in std_logic := '1';
 		
 		CDD_STAT			: in std_logic_vector(39 downto 0);
 		CDD_COMM			: out std_logic_vector(39 downto 0);
@@ -89,15 +103,6 @@ architecture rtl of MCD is
 	signal S68K_RESET_N	: std_logic;
 	signal S68K_CE_F		: std_logic;
 	signal S68K_CE_R		: std_logic;
-	
-	signal WORDRAM0_A   	: std_logic_vector(15 downto 0);
-	signal WORDRAM0_DI	: std_logic_vector(15 downto 0);
-	signal WORDRAM0_DO	: std_logic_vector(15 downto 0);
-	signal WORDRAM0_WR	: std_logic;
-	signal WORDRAM1_A   	: std_logic_vector(15 downto 0);
-	signal WORDRAM1_DI	: std_logic_vector(15 downto 0);
-	signal WORDRAM1_DO	: std_logic_vector(15 downto 0);
-	signal WORDRAM1_WR	: std_logic;
 	
 	signal PCM_A			: std_logic_vector(12 downto 0);
 	signal PCM_DO			: std_logic_vector(7 downto 0);
@@ -292,11 +297,15 @@ begin
 		WORDRAM0_A   	=> WORDRAM0_A,
 		WORDRAM0_DI   	=> WORDRAM0_DI,
 		WORDRAM0_DO   	=> WORDRAM0_DO,
+		WORDRAM0_RD   	=> WORDRAM0_RD,
 		WORDRAM0_WR   	=> WORDRAM0_WR,
+		WORDRAM0_RDY  	=> WORDRAM0_RDY,
 		WORDRAM1_A    	=> WORDRAM1_A,
 		WORDRAM1_DI   	=> WORDRAM1_DI,
 		WORDRAM1_DO   	=> WORDRAM1_DO,
+		WORDRAM1_RD   	=> WORDRAM1_RD,
 		WORDRAM1_WR   	=> WORDRAM1_WR,
+		WORDRAM1_RDY  	=> WORDRAM1_RDY,
 		
 		FD_DAT 			=> ASIC_FD_DAT,
 		FD_WR 			=> ASIC_FD_WR,
@@ -312,29 +321,9 @@ begin
 	BRAM_WE <= not (CLWE_N or BRAM_N);
 	
 	
-	-- Pocket trial fit: word RAM shrunk from 64Kx16 per bank (2Mbit total, exceeds
-	-- the 5CEBA4's free BRAM); a real port must place word RAM in PSRAM/SDRAM
-	WORDRAM0 : entity work.spram
-	generic map(12,16)
-	port map(
-		clock		=> CLK,
-		address	=> WORDRAM0_A(11 downto 0),
-		data		=> WORDRAM0_DO,
-		wren		=> WORDRAM0_WR,
-		q			=> WORDRAM0_DI
-	);
+	-- Word RAM (2x128KB) is external on the Pocket: buses exported as ports.
 
-	WORDRAM1 : entity work.spram
-	generic map(12,16)
-	port map(
-		clock		=> CLK,
-		address	=> WORDRAM1_A(11 downto 0),
-		data		=> WORDRAM1_DO,
-		wren		=> WORDRAM1_WR,
-		q			=> WORDRAM1_DI
-	);
-	
-	
+
 	CDC : entity work.CDC
 	port map(
 		CLK   		=> CLK,
