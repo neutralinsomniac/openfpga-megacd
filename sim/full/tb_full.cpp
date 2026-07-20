@@ -42,6 +42,9 @@ int main(int argc,char**argv){
         uint32_t mpc = dut->rootp->core_top__DOT__dbg_m68k_a & 0xFFFFFF;
         uint32_t spc = dut->rootp->core_top__DOT__dbg_s68k_a & 0xFFFFFF;
         auto* r = dut->rootp;
+        // ring buffer of last distinct main address-bus values (execution trail)
+        static uint32_t trail[32]; static int ti=0; static uint32_t tlast=0xFFFFFFFF;
+        if(mpc!=tlast){ trail[ti&31]=mpc; ti++; tlast=mpc; }
         static uint32_t last=0xFFFFFFFF; static long stuck=0;
         static int vint_prev=0; static long vint_cnt=0, cepix_cnt=0, vbl_cnt=0;
         static int cepix_prev=0, vbl_prev=0;
@@ -61,6 +64,9 @@ int main(int argc,char**argv){
                    vint, vint_cnt, cepix_cnt, vbl_cnt,
                    r->core_top__DOT__gen__DOT__vdp__DOT__ie0,
                    r->core_top__DOT__gen__DOT__vdp__DOT__vint_tg68_pending);
+            printf("  exec trail (last distinct main addrs): ");
+            for(int k=0;k<32;k++){ int idx=(ti-32+k); if(idx>=0) printf("%06X ", trail[idx&31]); }
+            printf("\n");
         }
         if((c%2000000)==0) printf("[%ld] main=%06X sub=%06X  VINT=%ld CE_PIX=%ld VBL=%ld\n",
                                   c, mpc, spc, vint_cnt, cepix_cnt, vbl_cnt);

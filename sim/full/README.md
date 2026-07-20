@@ -87,3 +87,10 @@ reg1 bit5, it's stalled before VDP-IRQ-enable (a different, earlier cause);
 if it writes but IE0 stays 0, the converted VDP control-port write path is
 the bug. sdram mem is now public (core_top.sdram.mem) for RAM dumps; note
 work RAM = SDRAM word $400000+(VA[15:1]).
+
+## FIXED: BIOS byte order (2026-07-20)
+The BIOS must be loaded big-endian (NOT byte-swapped) into sim SDRAM. The
+earlier swap corrupted the main reset vector ($426 -> $2604) and the main
+ran into data and hung. Generate bios.hex as: @780000 then per word
+"%02x%02x" % (d[i], d[i+1]). With this, the main boots, runs the init loop
+(~$498), and jumps to work-RAM execution ($FF3714+). Boot now PROGRESSES.
