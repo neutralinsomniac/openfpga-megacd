@@ -517,9 +517,9 @@ always @(posedge clk_74a or negedge pll_core_locked) begin
 		datatable_wren <= 0;
 	end else begin
 		if (datatable_div > 4) begin
-			// Write save size half of the time (8KB internal backup RAM)
+			// DEBUG DUMP: advertise the save slot as 512KB = full PRG-RAM
 			datatable_wren <= 1;
-			datatable_data <= 32'd8192;
+			datatable_data <= 32'd524288;
 			// Data slot index 1, not id 1
 			datatable_addr <= 1 * 2 + 1;
 		end else begin
@@ -536,10 +536,14 @@ always @(posedge clk_74a or negedge pll_core_locked) begin
 	end
 end
 
+// DEBUG DUMP: 512KB save slot sourced from PRG-RAM via SDRAM port 2.
+// On exit the Pocket reads all 512KB and writes it to the .sav — a dump
+// of the decompressed sub-BIOS for the M2 co-sim.
+wire [18:0] dump_addr_out;
 data_unloader #(
 	.ADDRESS_MASK_UPPER_4(4'h6),
-	.ADDRESS_SIZE(17),
-	.READ_MEM_CLOCK_DELAY(7),
+	.ADDRESS_SIZE(19),
+	.READ_MEM_CLOCK_DELAY(48),
 	.INPUT_WORD_SIZE(2)
 ) save_data_unloader (
 	.clk_74a(clk_74a),
@@ -551,9 +555,35 @@ data_unloader #(
 	.bridge_rd_data(sd_read_data),
 
 	.read_en  (sd_rd),
-	.read_addr(sd_buff_addr_out),
+	.read_addr(dump_addr_out),
 	.read_data(sd_buff_din)
 );
+assign sd_buff_addr_out = {dump_addr_out[16:0]};
+
+// PRG-RAM dump reader: each save read triggers an SDRAM port-2 read of the
+// PRG word; result held until the unloader latches it (delay 48).
+reg [18:1] dump_word;
+reg        dump_active = 0;
+reg        dump_rd = 0;
+reg [15:0] dump_data = 0;
+reg        sd_rd_d = 0;
+always @(posedge clk_sys) begin
+	reg old_busy_d;
+	old_busy_d <= sdld_busy;
+	sd_rd_d <= sd_rd;
+	if (sd_rd & ~sd_rd_d) begin
+		dump_word   <= dump_addr_out[18:1];
+		dump_active <= 1;
+		dump_rd     <= 1;
+	end else if (dump_active) begin
+		if (dump_rd && old_busy_d && ~sdld_busy) begin
+			dump_data <= sdwr_do;
+			dump_rd   <= 0;
+			dump_active <= 0;
+		end
+	end
+end
+assign sd_buff_din = dump_data;
 
 data_loader #(
       .ADDRESS_MASK_UPPER_4(4'h6),
@@ -967,11 +997,12 @@ sdram sdram
 
 	// word RAM (runtime + boot self-test via arbiter) / BIOS load / PRG peek
 	.addr2(bios_download ? {6'b011110, ioctl_addr[18:1]} :
+	       dump_active    ? {6'b100000, dump_word} :
 	       dbg_prg_active ? {6'b100000, dbg_prg_addr} :
 	                        {7'b0110000, wr_owner, wr_addr}),
 	.din2(bios_download ? {ioctl_data[7:0], ioctl_data[15:8]} : wr_din),
 	.dout2(sdwr_do),
-	.rd2(~bios_download & (dbg_prg_active ? dbg_prg_req : wr_rd_r)),
+	.rd2(~bios_download & (dump_active ? dump_rd : dbg_prg_active ? dbg_prg_req : wr_rd_r)),
 	.wrl2(bios_download ? ioctl_wait : wr_wr_r),
 	.wrh2(bios_download ? ioctl_wait : wr_wr_r),
 	.busy2(sdld_busy),
@@ -1044,7 +1075,7 @@ always @(posedge clk_sys) begin
 		wr0_wr_hold <= 0;
 		wr1_rd_hold <= 0;
 		wr1_wr_hold <= 0;
-	end else if (!wr_active && !dbg_prg_active) begin
+	end else if (!wr_active && !dbg_prg_active && !dump_active) begin
 		if (grant0_rd | grant0_wr) begin
 			wr_active <= 1;
 			wr_owner  <= 0;
@@ -1802,7 +1833,7 @@ dpram_dif #(13,8,12,16) backup_ram
 	.wren_b(sd_wr),
 	.q_b(bram_sd_q)
 );
-assign sd_buff_din = bram_sd_q;
+// sd_buff_din is driven by the PRG-RAM dump reader (debug), not backup RAM
 
 // MCD PCM + CDDA pre-mix, fed into gen's mixer via EXT_SL/SR (EXT_EN=1)
 reg [15:0] mcd_l, mcd_r;
