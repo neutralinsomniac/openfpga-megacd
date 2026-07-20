@@ -27,3 +27,20 @@ The hang is the sub busy-waiting on $833F ($3(a6)) after a drive op whose
 completion IRQ never clears it. Likely a CDC read (CDC_DATA tied 0 in
 megacd_top => DTEN/WAIT never completes). Inject a "read"/"CDCSTART"-class
 command; watch CDC_DTEN_N/CDC_WAIT_N + the sub at $616A.
+
+## UPDATE: injection proven, command encoding is next
+- Comm-flag fix CONFIRMED: 0x0400 (CFM bit2) makes the sub enter handler $6178.
+- Swept CC0 high byte = codes 1..9 with flag toggles: sub processed (entered
+  $6178) but NONE reached the $616A/$833F busy-wait. So the command ENCODING
+  or handshake is off:
+  1. Command byte position: I used CC0 hi byte (cmd<<8). Disassemble the
+     dispatcher $619A->$62FA to find where the command code actually lives in
+     the 16-byte $FF8010 block and how it's decoded (likely a specific byte or
+     a jump-table index). Also check whether the CD-player uses a higher-level
+     BIOS-function protocol (CDBIOS/BURAM) rather than raw CDD codes.
+  2. Multi-command handshake: after each command, the sub acks by writing CFS
+     ($FF800F, its byte, e.g. bset #6 $800f @ $61CA / bchg #1 @ $61C0). For a
+     real sweep, WAIT for the CFS ack (read $A1200E low byte = CFS) then send
+     the next — don't just time-toggle the flag.
+  3. Target: the command that calls $6166/$6172 (set busy $833F) then loops at
+     $616A. Find which command routes there via the dispatcher.

@@ -114,8 +114,15 @@ int main(int argc, char** argv) {
     // Try a drive "read/play"-class command to push the sub into the busy path.
     long INJ = 3500000;
     for (int i=0;i<8;i++) script.push_back({INJ + i*400, 8+i, 0x0000});
-    script.push_back({INJ, 8, 0x0200});      // CC0 high byte = command 0x02
-    script.push_back({INJ+4000, 7, 0x0400}); // comm flag: CFM bit2 (EXT_VDI(10)) — the bit the sub polls at $61D0
+    // SWEEP: for each drive command code, set CC0 then toggle the comm flag
+    // (CFM bit2 = 0x0400) so the sub processes it; watch for the $616A hang.
+    long t = INJ;
+    for (int cmd=1; cmd<=9; cmd++){
+        script.push_back({t,      8, (uint16_t)(cmd<<8)}); // CC0 hi byte = cmd
+        script.push_back({t+2000, 7, 0x0400});             // raise flag
+        script.push_back({t+400000,7,0x0000});             // lower flag (ack window)
+        t += 800000;
+    }
 
     size_t sp=0;
     enum { EXT_IDLE, EXT_DRIVE } ext_st = EXT_IDLE;
