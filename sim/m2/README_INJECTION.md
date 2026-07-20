@@ -44,3 +44,27 @@ command; watch CDC_DTEN_N/CDC_WAIT_N + the sub at $616A.
      the next — don't just time-toggle the flag.
   3. Target: the command that calls $6166/$6172 (set busy $833F) then loops at
      $616A. Find which command routes there via the dispatcher.
+
+## CONFIRMED: freeze = drive-read retry loop spinning on absent CDC data
+The busy-set routine $6166 is called from 4 drive routines ($730A,$7B6A,
+$7C9C,$8130). Disasm of $7302-$7322:
+  0730A: bsr $6166   ; set busy $833F
+  0731A: bsr $79AA
+  0731E: bsr $77D8   ; check drive/CDC read result
+  07322: beq $730A   ; NOT READY -> loop back, retry forever
+=> The sub sets busy, tries a CDC/drive read ($77D8), and loops on beq when
+it's not ready. With CDC_DATA tied 0 in megacd_top (no sector data injected),
+$77D8 never succeeds -> infinite retry = THE FREEZE (matches the hardware
+hang: sub stuck at $616A/$833F busy, cursor dead). This is the CDC-read hang.
+
+## FIX PATH (the actual bug fix)
+The empty-drive CD player must not enter this read loop, OR $77D8 must
+fail-fast (return "no data / error") instead of retrying forever when the
+drive is empty. Options: (a) make the CDD/CDC report the empty-disc state so
+the CD player's read path returns an error rather than spinning; (b) provide
+the CDC DTEN/WAIT completion so $77D8 gets a definitive (empty) result. This
+connects to disc streaming (M2 proper): the CDC data path is what a mounted
+disc image feeds. To reproduce+iterate in sim/m2: inject the command that
+routes to $7302 (disasm the dispatcher for the read/CDCSTART code), confirm
+$616A/$730A spin, then fix the CDC empty-drive completion and verify the loop
+exits — all in the fast sim loop.
