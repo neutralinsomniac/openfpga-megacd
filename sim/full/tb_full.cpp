@@ -64,12 +64,21 @@ int main(int argc,char**argv){
                    vint, vint_cnt, cepix_cnt, vbl_cnt,
                    r->core_top__DOT__gen__DOT__vdp__DOT__ie0,
                    r->core_top__DOT__gen__DOT__vdp__DOT__vint_tg68_pending);
+            printf("  VDP DMA: in_dma=%d fill=%d vbus=%d copy=%d\n",
+                   r->core_top__DOT__gen__DOT__vdp__DOT__in_dma,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__dma_fill,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__dma_vbus,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__dma_copy);
             printf("  exec trail (last distinct main addrs): ");
             for(int k=0;k<32;k++){ int idx=(ti-32+k); if(idx>=0) printf("%06X ", trail[idx&31]); }
             printf("\n");
         }
-        if((c%2000000)==0) printf("[%ld] main=%06X sub=%06X  VINT=%ld CE_PIX=%ld VBL=%ld\n",
-                                  c, mpc, spc, vint_cnt, cepix_cnt, vbl_cnt);
+        if((c%2000000)==0) printf("[%ld] main=%06X sub=%06X VINT=%ld VBL=%ld  in_dma=%d fill=%d vbus=%d copy=%d\n",
+                                  c, mpc, spc, vint_cnt, vbl_cnt,
+                                  r->core_top__DOT__gen__DOT__vdp__DOT__in_dma,
+                                  r->core_top__DOT__gen__DOT__vdp__DOT__dma_fill,
+                                  r->core_top__DOT__gen__DOT__vdp__DOT__dma_vbus,
+                                  r->core_top__DOT__gen__DOT__vdp__DOT__dma_copy);
     }
     // dump work-RAM code around the STOP site $FF00F0.. (SDRAM word $400078..)
     printf("work-RAM $FF00F0..$FF0120:\n");

@@ -5062,11 +5062,11 @@ module vdp(RST_N, CLK, SEL, A, RNW, DI, vram_ack, vram_q, vram32_ack, vram32_q, 
   wire [15:0] dbg;
   wire de;
   wire dma;
-  wire dma_copy;
-  wire dma_fill;
+  wire dma_copy /* verilator public_flat_rd */;
+  wire dma_fill /* verilator public_flat_rd */;
   wire [15:0] dma_length;
   wire [15:0] dma_source;
-  wire dma_vbus;
+  wire dma_vbus /* verilator public_flat_rd */;
   wire [1:0] dma_vbus_timer;
   wire [4:0] dmac;
   wire dmaf_set_req;
@@ -5146,7 +5146,7 @@ module vdp(RST_N, CLK, SEL, A, RNW, DI, vram_ack, vram_q, vram32_ack, vram32_q, 
   wire ie0 /* verilator public_flat_rd */;
   wire ie1;
   wire ie2;
-  wire in_dma;
+  wire in_dma /* verilator public_flat_rd */;
   wire in_hbl;
   wire in_vbl;
   wire intack_d;

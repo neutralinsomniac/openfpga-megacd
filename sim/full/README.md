@@ -107,3 +107,16 @@ VDP DMA state machine in the conversion (IN_DMA / DMA fill completion; check
 if the --latches conversion or a slot-timing signal broke DMA). Mark the
 VDP DMA-active + DMA-length signals public and watch them. Sub still in
 reset (main hasn't reached SRES release yet).
+
+## VDP fill-DMA stuck (in_dma=1, dma_fill=1 permanently)
+Main boots fully and hangs at $AF0 polling VDP status bit1 because a VRAM
+FILL DMA never completes (confirmed: in_dma=1 fill=1 vbus=0 copy=0 forever).
+The fill state machine (vdp.vhd DMA_FILL_INIT/START/WR/WR2/NEXT/LOOP)
+advances only when SLOT_EN=1 (whole DMA dispatch gated by `if SLOT_EN='1'`
+~line 3037) and each VRAM write completes (DT_VRAM_SEL toggle handshake).
+NEXT: mark DMAC (the dma_t state enum), SLOT_EN, DT_VRAM_SEL/DT_VRAM_ACK
+public in vdp.v; find the exact stuck sub-state. Suspects: SLOT_EN not
+pulsing (its enable/CE broke in the yosys/--latches conversion), or the
+converted VDP VRAM dpram access handshake (DT_VRAM_SEL) not completing.
+VRAM_SPEED is 0 in sim (gen.sv `.VRAM_SPEED(1)` is commented out) so the
+FILL_WR VRAM_SPEED/FIFO_EN gate is satisfied — not the cause.
