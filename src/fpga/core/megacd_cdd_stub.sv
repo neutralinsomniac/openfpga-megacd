@@ -1,9 +1,15 @@
-// CDD (CD-drive microcontroller) stand-in for an empty drive, modeled on
-// MiSTer Main's megacdd.cpp with no disc loaded. Fixed 75Hz status beat
-// (immediate replies chain with the BIOS INT4 handler into a kHz storm);
-// commands update state only. Full 9-nibble payloads with a checksum over
-// n0..n8 — the BIOS validates TOC replies and spins on its busy flag if
-// they are malformed (found via live PRG-RAM disassembly of the wait loop).
+// CDD (CD-drive microcontroller) stand-in for an empty drive. Fixed 75Hz
+// status beat (immediate replies chain with the BIOS INT4 handler into a
+// kHz storm); commands update state only. Full 9-nibble payloads with a
+// checksum over n0..n8.
+//
+// No-disc model (GPGX cdd.c, verified in sim/m2 cosim): status drains
+// STOP->NO_DISC(B) once and STAYS there. ReadTOC must NOT switch to TOC(9)
+// or fabricate TOC entries — a fake TOC makes the BIOS front end believe a
+// disc is present and command play (player mode 8), which parks the sub in
+// the $7302 subcode-wait retry loop = the CD-player freeze. With status B
+// and zeroed TOC payloads the sub BIOS boots clean and reports NO_DISC in
+// its CDBSTAT block for the front end to display.
 //
 // Packet: nibbles n0..n9; n0 = status in bits [3:0]; n9 = ~(sum n0..n8)&F.
 module megacd_cdd_stub
@@ -19,7 +25,6 @@ module megacd_cdd_stub
 );
 
 localparam [3:0] STAT_STOP    = 4'h0;
-localparam [3:0] STAT_TOC     = 4'h9;
 localparam [3:0] STAT_NO_DISC = 4'hB;
 
 localparam [25:0] BEAT = 26'd715909;      // 13.3ms @ 53.693175MHz
@@ -36,10 +41,6 @@ reg [25:0] wdog = 0;
 reg        send_d = 0;
 reg  [3:0] rec_cnt = 0;
 
-// empty-disc MSF for lba 150 = 00:02:00
-task abs150; begin
-    n2 <= 0; n3 <= 0; n4 <= 0; n5 <= 4'd2; n6 <= 0; n7 <= 0;
-end endtask
 task zeros; begin
     n2 <= 0; n3 <= 0; n4 <= 0; n5 <= 0; n6 <= 0; n7 <= 0; n8 <= 0;
 end endtask
@@ -61,9 +62,8 @@ always @(posedge clk) begin
         send_d <= cdd_send;
         wdog   <= wdog + 1'b1;
 
-        // cdd.cpp Update(): ONLY STOP drains to NO_DISC after latency.
-        // Once a Read-TOC sets status=TOC(9) it persists — draining TOC->B
-        // mid-read reads as "disc ejected" and wedges the BIOS (v6 freeze).
+        // STOP drains to NO_DISC after the spin-up-detect latency and the
+        // status then stays at B for good (no TOC state exists to eject from).
         if (drv_status == STAT_STOP) begin
             if (ms_tick == TICK_13MS) begin
                 ms_tick <= 0;
@@ -76,40 +76,15 @@ always @(posedge clk) begin
 
         if (cdd_send & ~send_d) begin
             case (cdd_comm[3:0])
-                4'h0: if (latency <= 4'd3) begin  // IDLE: refresh current report
-                    n0 <= drv_status;
-                    case (n1)
-                        4'h0: begin abs150; n8 <= 0; end
-                        4'h1: zeros;
-                        4'h2: begin n2 <= 4'hA; n3 <= 4'hA; n4 <= 0; n5 <= 0;
-                                    n6 <= 0; n7 <= 0; n8 <= 0; end
-                        default: ;
-                    endcase
-                end
-                4'h1: begin                   // STOP
-                    drv_status <= STAT_STOP;
+                4'h1: begin                   // STOP: empty drive -> NO_DISC
+                    drv_status <= STAT_NO_DISC;
                     latency <= 4'd0;
-                    n0 <= STAT_STOP; n1 <= 0; zeros;
+                    n0 <= STAT_NO_DISC; n1 <= 0; zeros;
                 end
-                4'h2: begin                   // Read TOC, format in comm n3
-                    if (drv_status == STAT_STOP) begin
-                        drv_status <= STAT_TOC; // persists; latency untouched
-                        n0 <= STAT_TOC;
-                    end else begin
-                        n0 <= drv_status;
-                    end
+                4'h2: begin                   // Read TOC: status only, no data
+                    n0 <= drv_status;
                     n1 <= cdd_comm[15:12];
-                    case (cdd_comm[15:12])
-                        4'h0: begin abs150; n8 <= 0; end                  // abs position
-                        4'h1: zeros;                                       // rel position
-                        4'h2: begin n2 <= 4'hA; n3 <= 4'hA; n4 <= 0;       // track: lead-out
-                                    n5 <= 0; n6 <= 0; n7 <= 0; n8 <= 0; end
-                        4'h3: begin abs150; n8 <= 0; end                  // disc length
-                        4'h4: begin n2 <= 0; n3 <= 4'd1; n4 <= 0; n5 <= 0; // first=01 last=00
-                                    n6 <= 0; n7 <= 0; n8 <= 0; end
-                        4'h5: begin abs150; n8 <= cdd_comm[23:20]; end     // track start
-                        default: zeros;
-                    endcase
+                    zeros;
                 end
                 default: begin
                     n0 <= drv_status;

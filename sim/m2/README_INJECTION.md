@@ -76,8 +76,41 @@ $77F4 is the matching ENQUEUE (stores an 8-byte record: word@+4, long@+8,
 word@+6, advances wr_ptr). So the drive loop $7302 waits for this queue to
 change state; it's filled by a drive/CDC interrupt handler. Empty drive =
 queue never fills the way the CD player expects = spin.
-FINAL FIX TARGET: find who enqueues to $CE0FC (the CDC/CDD data path) and
-ensure the empty-drive case drives the queue to a state that lets the loop
-exit (error/no-data), OR feed real CDC data (disc streaming). To locate the
-producer: search prgram.bin for `lea $CE0FC` / writes advancing wr_ptr in the
-CDD($610)/CDC($634) interrupt handlers.
+
+## CORRECTIONS (2026-07-20 session 2) — full mechanism decoded + FIXED
+Superseding parts of the above; all verified live in the cosim.
+
+1. $77D8 semantics were backwards: it advances wr by 8 up to 4 times and
+   dbeq-exits EQ when rd==wr+8k, i.e. EQ = ring NEARLY FULL. $7322 beq is
+   flow control (wait for the CONSUMER), not a wait-for-data. The ring lives
+   in WORD RAM ($CE0FC; the $612C/$72D0 clears cover $C0000-$DFFFF) and is
+   consumed by the MAIN CPU's player UI. Not the freeze.
+2. The real freeze wait is the OTHER back-edge: $733C jsr $5F22 (=_CDBIOS)
+   fn $92 with a0=$BC0(a6); carry set = no data -> $734A bcs $730A. The
+   drive loop is pumping subcode/Q-style records the empty drive never
+   produces. (Fn IDs line up with the documented CDBIOS set: $81 CDBSTAT in
+   $62C6, $89 CDCSTOP in $7AD2, $8D CDCACK in $7A5E.)
+3. Main->sub command protocol ($6296/$71E6/$6142): CC2 word ($FF8014) =
+   action code — 1 = set player mode from CC3 word ($FF8016), 2 = set replay
+   flag $BFC; CC0:CC1 long latched to $2E(a6) (track/pos) gated by $43 bit7.
+   Player modes (main-loop table $6118, INT2 table $609A): 4, 8 = drive-read
+   loop $7302, $C, $10. Injecting CC2=1/CC3=8 + CFM bit2 toggle reproduces
+   the freeze deterministically (iters climb 1/INT2, no exit).
+4. Handshake gotcha: the sub RE-EXECUTES whatever sits in $FF8010.. on every
+   INT2 pass through $619A. Re-running action 1 sets the abort flag $833E
+   ($6142 st.b) which $6150 turns into a $7350 loop exit. The real main
+   clears the comm regs after the ack — the tb now does the same.
+
+## THE FIX (applied to sim Cdd + megacd_cdd_stub.sv)
+Root cause of the hardware freeze: the CDD stub fabricated a TOC (ReadTOC ->
+status 9 + plausible entries), so the BIOS front end believed a disc was
+present and commanded play (mode 8) -> sub parked in the $7302 subcode wait.
+Fix (GPGX cdd.c no-disc model): status drains STOP->NO_DISC(B) once and
+STAYS B; STOP cmd -> B; ReadTOC returns current status + zero payload and
+never flips to 9. Verified in cosim: sub BIOS boots clean (no wedge — the
+old "v6 freeze" only applied to draining 9->B MID-read, i.e. fake-eject),
+CDBSTAT block ends with drive status $0B, and forced mode 8 still spins
+(correct: the front end must simply never send it when status=B).
+NEXT: verify front-end behavior (NO DISC on screen, cursor alive) in the
+full-system sim (VDP FIFO-drain conversion bug there still pending) or on
+hardware with a rebuilt bitstream.

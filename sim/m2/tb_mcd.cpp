@@ -58,23 +58,15 @@ struct Cdd {
         uint64_t s=0; for(int i=0;i<9;i++) s |= (uint64_t)(n[i]&0xF) << (i*4);
         s |= (uint64_t)cs << 36; return s;
     }
+    // Empty drive, GPGX cdd.c no-disc model: status drains STOP->NO_DISC(B)
+    // and STAYS there. ReadTOC must NOT flip to TOC(9) or fabricate TOC
+    // entries — a fake TOC makes the front end believe a disc is present and
+    // command play (mode 8) -> the $7302 subcode-wait freeze.
     void command(uint64_t comm) {
         int c0 = comm & 0xF, fmt = (comm>>12)&0xF;
-        if (c0==0) { n[0]=status; }
-        else if (c0==1) { status=0; latency=0; n[0]=0; }
-        else if (c0==2) {
-            if (status==0) status=9;
-            n[0]=status; n[1]=fmt;
-            memset(n+2,0,7);
-            switch(fmt){
-                case 0: n[5]=2; break;                 // abs 00:02:00
-                case 1: break;                          // rel 0
-                case 2: n[2]=0xA; n[3]=0xA; break;      // lead-out
-                case 3: n[5]=2; break;                  // disc length
-                case 4: n[3]=1; break;                  // first=01 last=00
-                case 5: n[5]=2; n[8]=(comm>>20)&0xF; break;
-            }
-        } else { n[0]=status; }
+        if (c0==1) { latency=0; status=0xB; n[0]=status; memset(n+1,0,8); } // STOP
+        else if (c0==2) { n[0]=status; n[1]=fmt; memset(n+2,0,7); }        // ReadTOC: no data
+        else { n[0]=status; }
     }
 };
 static Cdd cdd;
@@ -260,6 +252,9 @@ int main(int argc, char** argv) {
                    c, pc, dut->DBG_S68K_IPL_N, dut->DBG_INT_PEND, dut->DBG_INT_ACK,
                    dut->DBG_GRON, cdd.status, loop_iters, q_checks);
     }
+    printf("end: mode=%04X abort=%02X busy=%02X state44=%04X drvstat58=%02X %02X\n",
+           (prg[0x833C]<<8)|prg[0x833D], prg[0x833E], prg[0x833F],
+           (prg[0x8380]<<8)|prg[0x8381], prg[0x8394], prg[0x8395]);
     dut->final(); delete dut;
     return 0;
 }
