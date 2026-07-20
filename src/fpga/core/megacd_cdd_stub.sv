@@ -36,11 +36,13 @@ reg  [3:0] drv_status = STAT_STOP;
 reg  [3:0] n0, n1;
 wire [3:0] csum = ~(n0 + n1) & 4'hF;   // n2..n8 are always 0 in this stub
 
-// ~100ms watchdog: if the BIOS<->CDD interrupt loop stalls, re-send the
-// current status to fire INT4 again (real drives stream at 75Hz anyway)
-localparam [22:0] WDOG = 23'd5369317;
+// Emergency-only watchdog (~1s): unsolicited packets can land while the
+// BIOS is mid-way through reading the five status registers, tearing the
+// packet (checksum fail -> BIOS re-inits the drive, UI flaps). MiSTer
+// replies only to commands; we keep a slow restart path for a dead loop.
+localparam [25:0] WDOG = 26'd53693175;
 
-reg [22:0] wdog = 0;
+reg [25:0] wdog = 0;
 reg [12:0] delay = 0;      // ~150us command-to-reply latency
 reg        pending = 0;
 reg        send_d = 0;
@@ -82,15 +84,13 @@ always @(posedge clk) begin
         if (cdd_send & ~send_d) begin
             // command nibble c0 in bits [3:0], TOC format c3 in bits [15:12]
             case (cdd_comm[3:0])
-                4'h0: begin                   // IDLE: report current status
+                4'h0: begin                   // IDLE: current status, keep format
                     n0 <= drv_status;
-                    n1 <= 4'h0;
                 end
-                4'h1: begin                   // STOP
+                4'h1: begin                   // STOP: empty tray drains fast
                     drv_status <= STAT_STOP;
-                    latency <= 4'd1;
+                    latency <= 4'd0;
                     n0 <= STAT_STOP;
-                    n1 <= 4'h0;
                 end
                 4'h2: begin                   // Read TOC (only from STOP)
                     if (drv_status == STAT_STOP) begin
@@ -100,11 +100,10 @@ always @(posedge clk) begin
                     end else begin
                         n0 <= drv_status;
                     end
-                    n1 <= cdd_comm[15:12];
+                    n1 <= cdd_comm[15:12];    // remember requested format
                 end
                 default: begin
                     n0 <= drv_status;
-                    n1 <= 4'h0;
                 end
             endcase
             pending <= 1;

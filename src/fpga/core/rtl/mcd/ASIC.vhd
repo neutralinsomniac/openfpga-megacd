@@ -1722,9 +1722,13 @@ begin
 			WR1A <= WRA_IDLE;
 		elsif rising_edge(CLK) then
 			if EN = '1' then
+				if WR0S = WRS_END and WR0R.EXEC = '1' then
+					WR0R.EXEC <= '0';
+				end if;
 				case WR0A is
 					when WRA_IDLE =>
 						WR0R.DOT_IMAGE <= (others => '0');
+						if WR0S = WRS_IDLE then	-- block accepts while a posted write drains
 						if MODE = '1' then	--1M MODE
 							if RET1 = '0' then 
 								if M68K_WORD_RAM_SEL = '1' and M68K_WORDRAM_DTACK_N = '1' then
@@ -1750,7 +1754,12 @@ begin
 									WR0R.RNW <= (S68K_RNW or S68K_UDS_N) & (S68K_RNW or S68K_UDS_N) & (S68K_RNW or S68K_LDS_N) & (S68K_RNW or S68K_LDS_N);
 									WR0R.PM <= "00";
 									WR0R.EXEC <= '1';
-									WR0A <= WRA_S68K_ACCESS;
+									if S68K_RNW = '0' then	-- posted write: DTACK now, drain in background
+										S68K_WORDRAM_DTACK_N <= '0';
+										WR0A <= WRA_S68K_END;
+									else
+										WR0A <= WRA_S68K_ACCESS;
+									end if;
 								elsif S68K_WORD_RAM_SEL = '1' and S68K_A(19 downto 18) = "10" and S68K_WORDRAM_DTACK_N = '1' then
 									WR0R.A <= S68K_A(17 downto 2);
 									WR0R.DO <= S68K_DI(11 downto 8) & S68K_DI(3 downto 0) & S68K_DI(11 downto 8) & S68K_DI(3 downto 0);
@@ -1761,7 +1770,12 @@ begin
 									WR0R.PM <= PM;
 									WR0R.DOT_IMAGE <= "1" & S68K_A(1);
 									WR0R.EXEC <= '1';
-									WR0A <= WRA_S68K_ACCESS;
+									if S68K_RNW = '0' then	-- posted write: DTACK now, drain in background
+										S68K_WORDRAM_DTACK_N <= '0';
+										WR0A <= WRA_S68K_END;
+									else
+										WR0A <= WRA_S68K_ACCESS;
+									end if;
 								end if;
 							end if;
 						else						--2M MODE
@@ -1799,10 +1813,16 @@ begin
 								WR0R.RNW <= (S68K_RNW or S68K_UDS_N) & (S68K_RNW or S68K_UDS_N) & (S68K_RNW or S68K_LDS_N) & (S68K_RNW or S68K_LDS_N);
 								WR0R.PM <= "00";
 								WR0R.EXEC <= '1';
-								WR0A <= WRA_S68K_ACCESS;
+								if S68K_RNW = '0' then	-- posted write: DTACK now, drain in background
+									S68K_WORDRAM_DTACK_N <= '0';
+									WR0A <= WRA_S68K_END;
+								else
+									WR0A <= WRA_S68K_ACCESS;
+								end if;
 							end if;
 						end if;
 					
+					end if;
 					when WRA_M68K_ACCESS =>
 						if WR0S = WRS_END then
 							WR0R.EXEC <= '0';
@@ -1871,9 +1891,13 @@ begin
 					when others => null;
 				end case;
 				
+				if WR1S = WRS_END and WR1R.EXEC = '1' then
+					WR1R.EXEC <= '0';
+				end if;
 				case WR1A is
 					when WRA_IDLE =>
 						WR1R.DOT_IMAGE <= (others => '0');
+						if WR1S = WRS_IDLE then	-- block accepts while a posted write drains
 						if MODE = '1' then	--1M MODE
 							if RET1 = '1' then 
 								if M68K_WORD_RAM_SEL = '1' and M68K_WORDRAM_DTACK_N = '1' then
@@ -1899,7 +1923,12 @@ begin
 									WR1R.RNW <= (S68K_RNW or S68K_UDS_N) & (S68K_RNW or S68K_UDS_N) & (S68K_RNW or S68K_LDS_N) & (S68K_RNW or S68K_LDS_N);
 									WR1R.PM <= "00";
 									WR1R.EXEC <= '1';
-									WR1A <= WRA_S68K_ACCESS;
+									if S68K_RNW = '0' then	-- posted write: DTACK now, drain in background
+										S68K_WORDRAM_DTACK_N <= '0';
+										WR1A <= WRA_S68K_END;
+									else
+										WR1A <= WRA_S68K_ACCESS;
+									end if;
 								elsif S68K_WORD_RAM_SEL = '1' and S68K_A(19 downto 18) = "10" and S68K_WORDRAM_DTACK_N = '1' then
 									WR1R.A <= S68K_A(17 downto 2);
 									WR1R.DO <= S68K_DI(11 downto 8) & S68K_DI(3 downto 0) & S68K_DI(11 downto 8) & S68K_DI(3 downto 0);
@@ -1910,7 +1939,12 @@ begin
 									WR1R.PM <= PM;
 									WR1R.DOT_IMAGE <= "1" & S68K_A(1);
 									WR1R.EXEC <= '1';
-									WR1A <= WRA_S68K_ACCESS;
+									if S68K_RNW = '0' then	-- posted write: DTACK now, drain in background
+										S68K_WORDRAM_DTACK_N <= '0';
+										WR1A <= WRA_S68K_END;
+									else
+										WR1A <= WRA_S68K_ACCESS;
+									end if;
 								end if;
 							end if;
 						else						--2M MODE
@@ -1948,10 +1982,16 @@ begin
 								WR1R.RNW <= (S68K_RNW or S68K_UDS_N) & (S68K_RNW or S68K_UDS_N) & (S68K_RNW or S68K_LDS_N) & (S68K_RNW or S68K_LDS_N);
 								WR1R.PM <= "00";
 								WR1R.EXEC <= '1';
-								WR1A <= WRA_S68K_ACCESS;
+								if S68K_RNW = '0' then	-- posted write: DTACK now, drain in background
+									S68K_WORDRAM_DTACK_N <= '0';
+									WR1A <= WRA_S68K_END;
+								else
+									WR1A <= WRA_S68K_ACCESS;
+								end if;
 							end if;
 						end if;
 						
+					end if;
 					when WRA_M68K_ACCESS =>
 						if WR1S = WRS_END then
 							WR1R.EXEC <= '0';
