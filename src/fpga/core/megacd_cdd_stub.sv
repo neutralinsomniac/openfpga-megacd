@@ -21,8 +21,16 @@ module megacd_cdd_stub
     output reg        cdd_dm
 );
 
-localparam [3:0] STAT_STOP = 4'h0;
-localparam [3:0] STAT_TOC  = 4'h9;
+localparam [3:0] STAT_STOP    = 4'h0;
+localparam [3:0] STAT_TOC     = 4'h9;
+localparam [3:0] STAT_NO_DISC = 4'hB;
+
+// mirror of megacdd.cpp Update(): while STOP with no disc mounted, count
+// down ~10 poll ticks (~130ms) then report NO_DISC; the BIOS then shows
+// its menu instead of waiting on a TOC read that will never finish
+localparam [19:0] TICK_13MS = 20'd698010;
+reg [19:0] ms_tick = 0;
+reg  [3:0] latency = 4'd10;
 
 reg  [3:0] drv_status = STAT_STOP;
 reg  [3:0] n0, n1;
@@ -51,9 +59,22 @@ always @(posedge clk) begin
         pending  <= 0;
         rec_cnt  <= 0;
         send_d   <= 0;
+        ms_tick  <= 0;
+        latency  <= 4'd10;
     end else begin
         send_d <= cdd_send;
         wdog   <= wdog + 1'b1;
+
+        // STOP -> NO_DISC after the drive "spins up" and finds no disc
+        if (drv_status == STAT_STOP) begin
+            if (ms_tick == TICK_13MS) begin
+                ms_tick <= 0;
+                if (latency != 0) latency <= latency - 1'b1;
+                else drv_status <= STAT_NO_DISC;
+            end else begin
+                ms_tick <= ms_tick + 1'b1;
+            end
+        end
 
         if (cdd_send & ~send_d) begin
             // command nibble c0 in bits [3:0], TOC format c3 in bits [15:12]
@@ -64,12 +85,17 @@ always @(posedge clk) begin
                 end
                 4'h1: begin                   // STOP
                     drv_status <= STAT_STOP;
+                    latency <= 4'd1;
                     n0 <= STAT_STOP;
                     n1 <= 4'h0;
                 end
-                4'h2: begin                   // Read TOC: echo format, go TOC
-                    drv_status <= STAT_TOC;
-                    n0 <= STAT_TOC;
+                4'h2: begin                   // Read TOC (only from STOP)
+                    if (drv_status == STAT_STOP) begin
+                        drv_status <= STAT_TOC;
+                        n0 <= STAT_TOC;
+                    end else begin
+                        n0 <= drv_status;
+                    end
                     n1 <= cdd_comm[15:12];
                 end
                 default: begin

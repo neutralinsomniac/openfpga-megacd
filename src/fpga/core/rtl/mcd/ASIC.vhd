@@ -1593,13 +1593,8 @@ begin
 							WORD_RAM_1M0_DO(15 downto 12) <= WORDRAM0_DI(15 downto 12);
 						end if;
 						WORD_RAM_1M0_RD <= '0';
-						if WR0R.RNW = "1111" then
-							-- pure read: skip the write-back to save SDRAM bandwidth
-							WR0S <= WRS_END;
-						else
-							WORD_RAM_1M0_WR <= '1';
-							WR0S <= WRS_WRITE;
-						end if;
+						WORD_RAM_1M0_WR <= '1';
+						WR0S <= WRS_WRITE;
 						end if;
 
 					when WRS_WRITE =>
@@ -1675,13 +1670,8 @@ begin
 							WORD_RAM_1M1_DO(15 downto 12) <= WORDRAM1_DI(15 downto 12);
 						end if;
 						WORD_RAM_1M1_RD <= '0';
-						if WR1R.RNW = "1111" then
-							-- pure read: skip the write-back to save SDRAM bandwidth
-							WR1S <= WRS_END;
-						else
-							WORD_RAM_1M1_WR <= '1';
-							WR1S <= WRS_WRITE;
-						end if;
+						WORD_RAM_1M1_WR <= '1';
+						WR1S <= WRS_WRITE;
 						end if;
 
 					when WRS_WRITE =>
