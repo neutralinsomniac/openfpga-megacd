@@ -736,6 +736,25 @@ reg vs_prev;
 reg [9:0] dbg_x, dbg_y;
 reg       dbg_de_line;
 
+// hex readout: II 44 P2 P1 P4 PG (INT2 acks/s, INT4 acks/s, pend duties, GRON duty)
+wire [31:0] dbg_hexval = {dbg_ack2_rate, dbg_ack4_rate,
+                          1'b0, dbg_pend_duty[2], 1'b0, dbg_pend_duty[1],
+                          1'b0, dbg_pend_duty[4], 1'b0, dbg_gron_duty};
+wire [3:0] dbg_dv = dbg_hexval[((3'd7 - dbg_x[6:4])*4) +: 4];
+reg [23:0] dbg_glyph;
+always @* case (dbg_dv)
+	4'h0: dbg_glyph = 24'h699996;  4'h1: dbg_glyph = 24'h262227;
+	4'h2: dbg_glyph = 24'h69168F;  4'h3: dbg_glyph = 24'hE1611E;
+	4'h4: dbg_glyph = 24'h99F111;  4'h5: dbg_glyph = 24'hF8E11E;
+	4'h6: dbg_glyph = 24'h68E996;  4'h7: dbg_glyph = 24'hF12244;
+	4'h8: dbg_glyph = 24'h696996;  4'h9: dbg_glyph = 24'h699716;
+	4'hA: dbg_glyph = 24'h699F99;  4'hB: dbg_glyph = 24'hE9E99E;
+	4'hC: dbg_glyph = 24'h698896;  4'hD: dbg_glyph = 24'hE9999E;
+	4'hE: dbg_glyph = 24'hF8E88F;  default: dbg_glyph = 24'hF8E888;
+endcase
+wire [2:0] dbg_frow = (dbg_y - 10'd30) >> 1;
+wire [3:0] dbg_grow = dbg_glyph[((3'd5 - dbg_frow)*4) +: 4];
+
 reg         field;
 wire        field_s;
 
@@ -812,6 +831,14 @@ always @(posedge current_pix_clk) begin
                                        (dbg_ack4_rate != 0)     ? 24'hFFFF00 : 24'hFF0000;
                 default: ;
             endcase
+        end else if (dbg_y >= 10'd30 && dbg_y < 10'd42) begin
+            // numeric readout row
+            if (dbg_x[9:4] < 6'd8) begin
+                if (~dbg_x[3])
+                    video_rgb_reg <= dbg_grow[2'd3 - dbg_x[2:1]] ? 24'hFFFFFF : 24'h000000;
+                else
+                    video_rgb_reg <= 24'h000000;
+            end
         end
     end
 
@@ -1532,11 +1559,13 @@ MCD MCD
 	.DBG_S68K_A(dbg_s68k_a),
 	.DBG_S68K_IPL_N(dbg_s68k_ipl_n),
 	.DBG_INT_PEND(dbg_int_pend),
-	.DBG_INT_ACK(dbg_int_ack)
+	.DBG_INT_ACK(dbg_int_ack),
+	.DBG_GRON(dbg_gron)
 );
 
 wire [2:0] dbg_s68k_ipl_n;
 wire [6:1] dbg_int_pend, dbg_int_ack;
+wire dbg_gron;
 
 ///////////////////////////////////////////////
 // Bring-up debug indicators (top-left corner)
@@ -1582,6 +1611,8 @@ always @(posedge clk_sys) begin
 			dbg_ack2_cnt <= 0;
 			dbg_ack4_rate <= dbg_ack4_cnt;
 			dbg_ack4_cnt <= 0;
+			dbg_gron_duty <= dbg_gron_cnt[25:23];
+			dbg_gron_cnt <= 0;
 		end else begin
 			dbg_sec <= dbg_sec + 1'b1;
 			if (dbg_s68k_a != dbg_s68k_a_d && ~&dbg_rate_cnt)
@@ -1592,6 +1623,7 @@ always @(posedge clk_sys) begin
 				if (dbg_int_pend[di]) dbg_pend_cnt[di] <= dbg_pend_cnt[di] + 1'b1;
 			if (dbg_int_ack[2] & ~dbg_ack_d[2] & ~&dbg_ack2_cnt) dbg_ack2_cnt <= dbg_ack2_cnt + 1'b1;
 			if (dbg_int_ack[4] & ~dbg_ack_d[4] & ~&dbg_ack4_cnt) dbg_ack4_cnt <= dbg_ack4_cnt + 1'b1;
+			if (dbg_gron) dbg_gron_cnt <= dbg_gron_cnt + 1'b1;
 		end
 		if (cdd_send) dbg_cdd_seen <= 1;
 		if (WR0_RD | WR0_WR | WR1_RD | WR1_WR) dbg_wr_req <= 1;
@@ -1629,6 +1661,8 @@ reg [2:0]  dbg_pend_duty [1:6];  // per-level pending duty (/8)
 reg [6:1]  dbg_ack_d = 0;
 reg [7:0]  dbg_ack2_cnt = 0, dbg_ack2_rate = 0;  // INT2 (frame) acks/sec
 reg [7:0]  dbg_ack4_cnt = 0, dbg_ack4_rate = 0;  // INT4 (CDD) acks/sec
+reg [25:0] dbg_gron_cnt = 0;
+reg [2:0]  dbg_gron_duty = 0;    // GFX op in-flight duty (/8)
 
 // CDD drive stub (M1): "no disc" responder; the real drive MPU lands in M2
 wire [39:0] cdd_stat, cdd_comm;
