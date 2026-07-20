@@ -111,24 +111,27 @@ int main(int argc, char** argv) {
         {2000, 0, 0x0001},   // SRES=1: release the sub
     };
     // main->sub command injection: write CC0..7 then raise the comm flag.
-    // Try a drive "read/play"-class command to push the sub into the busy path.
+    // Decoded protocol ($6296/$71E6/$6142 disasm): CC2 word = action code
+    // (1 = set mode via $6142, param in CC3; 2 = set replay flag $BFC),
+    // CC0:CC1 long = track/position arg latched to $2E(a6). Mode 8 makes the
+    // sub main loop ($610A, table $6118) jump to $7302 = drive-read retry
+    // loop -> the freeze. CC0 hi-byte codes (old sweep) were the wrong slot.
     long INJ = 3500000;
     for (int i=0;i<8;i++) script.push_back({INJ + i*400, 8+i, 0x0000});
-    // SWEEP: for each drive command code, set CC0 then toggle the comm flag
-    // (CFM bit2 = 0x0400) so the sub processes it; watch for the $616A hang.
-    long t = INJ;
-    for (int cmd=1; cmd<=9; cmd++){
-        script.push_back({t,      8, (uint16_t)(cmd<<8)}); // CC0 hi byte = cmd
-        script.push_back({t+2000, 7, 0x0400});             // raise flag
-        script.push_back({t+400000,7,0x0000});             // lower flag (ack window)
-        t += 800000;
-    }
+    long t = INJ + 10000;
+    script.push_back({t,       8, 0x0001});  // CC0 = track 1 arg
+    script.push_back({t+400,  10, 0x0001});  // CC2 = action 1: set mode
+    script.push_back({t+800,  11, 0x0008});  // CC3 = mode 8: drive-read loop
+    script.push_back({t+2000,  7, 0x0400});  // raise CFM bit2
+    script.push_back({t+1200000,7,0x0000});  // lower after >1 INT2 frame
 
     size_t sp=0;
     enum { EXT_IDLE, EXT_DRIVE } ext_st = EXT_IDLE;
     long ext_wait=0; uint16_t ext_val=0; int ext_off=0; bool sres_done=false;
     const long FRAME = 895000;
     bool seen_cmd=false, seen_616a=false;
+    bool seen_726e=false, seen_7302=false, seen_7350=false;
+    long loop_iters=0, q_checks=0;
 
     for (long c=0; c<maxc; c++) {
         if (c==20) dut->RST_N=1;
@@ -232,16 +235,30 @@ int main(int argc, char** argv) {
 
         // ---- trace sub-CPU PC (address bus) ----
         uint32_t pc = dut->DBG_S68K_A & 0xFFFFFF;
-        if (pc>=0x6178 && pc<=0x6190 && c>INJ && !seen_cmd){ seen_cmd=true; printf("[%ld] sub entered COMMAND HANDLER AFTER INJECTION (pc=%06X)\n",c,pc); }
+        if (pc>=0x6178 && pc<=0x6190 && c>INJ && !seen_cmd){ seen_cmd=true; printf("[%ld] sub entered COMMAND HANDLER AFTER INJECTION (pc=%06X)\n",c,pc);
+            // real main clears the comm command regs after the sub acks;
+            // stale CC2 would re-fire the action each INT2 and set the abort
+            // flag $833E -> premature $7350 loop exit. Clear before next INT2.
+            script.push_back({(uint32_t)(c+100000), 8, 0x0000});
+            script.push_back({(uint32_t)(c+100400),10, 0x0000});
+            script.push_back({(uint32_t)(c+100800),11, 0x0000});
+        }
         if (pc>=0x616A && pc<=0x6170 && c>INJ && !seen_616a){ seen_616a=true; printf("[%ld] sub reached BUSY-WAIT $616A AFTER INJECTION (the hang!)\n",c); }
+        if (pc>=0x726E && pc<=0x7300 && c>INJ && !seen_726e){ seen_726e=true; printf("[%ld] sub in READ-LOOP INIT $726E (mode 8 accepted)\n",c); }
+        if (pc==0x7302 && c>INJ && !seen_7302){ seen_7302=true; printf("[%ld] sub ENTERED DRIVE-READ LOOP $7302 (freeze reproduced?)\n",c); }
+        static uint32_t prev_pc2=0;
+        if (pc==0x730A && prev_pc2!=0x730A && c>INJ) loop_iters++;
+        if (pc==0x77D8 && prev_pc2!=0x77D8 && c>INJ) q_checks++;
+        prev_pc2=pc;
+        if (pc==0x7350 && c>INJ && !seen_7350){ seen_7350=true; printf("[%ld] sub EXITED loop via $7350\n",c); }
         if (pc==last_pc){ if(++idlepc==200000){ printf("[%ld] sub STUCK at %06X ipl=%X pend=%02X gron=%d\n",
                              c,pc,dut->DBG_S68K_IPL_N,dut->DBG_INT_PEND,dut->DBG_GRON); idlepc=0; } }
         else { idlepc=0; last_pc=pc; }
 
         if ((c % 500000)==0)
-            printf("[%ld] pc=%06X ipl=%X pend=%02X ack=%02X gron=%d cdd_st=%X\n",
+            printf("[%ld] pc=%06X ipl=%X pend=%02X ack=%02X gron=%d cdd_st=%X iters=%ld qchk=%ld\n",
                    c, pc, dut->DBG_S68K_IPL_N, dut->DBG_INT_PEND, dut->DBG_INT_ACK,
-                   dut->DBG_GRON, cdd.status);
+                   dut->DBG_GRON, cdd.status, loop_iters, q_checks);
     }
     dut->final(); delete dut;
     return 0;
