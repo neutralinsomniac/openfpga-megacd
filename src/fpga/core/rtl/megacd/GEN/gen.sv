@@ -380,7 +380,7 @@ wire HL;
 
 vdp vdp
 (
-	.RST_n(~reset),
+	.RST_N(~reset),
 	.CLK(MCLK),
 
 	.SEL(VDP_SEL),
@@ -388,21 +388,21 @@ vdp vdp
 	.RNW(MBUS_RNW),
 	.DI(MBUS_DO),
 	.DO(VDP_DO),
-	.DTACK_n(VDP_DTACK_N),
+	.DTACK_N(VDP_DTACK_N),
 
-	.VRAM_req(vram_req),
-	.VRAM_ack(vram_ack),
-	.VRAM_we(vram_we),
-	.VRAM_u_n(vram_u_n),
-	.VRAM_l_n(vram_l_n),
-	.VRAM_a(vram_a),
-	.VRAM_d(vram_d),
-	.VRAM_q(vram_a[1] ? vram_q2 : vram_q1),
+	.vram_req(vram_req),
+	.vram_ack(vram_ack),
+	.vram_we(vram_we),
+	.vram_u_n(vram_u_n),
+	.vram_l_n(vram_l_n),
+	.vram_a(vram_a),
+	.vram_d(vram_d),
+	.vram_q(vram_a[1] ? vram_q2 : vram_q1),
 
-	.VRAM32_req(vram32_req),
-	.VRAM32_ack(vram32_ack),
-	.VRAM32_a(vram32_a),
-	.VRAM32_q(vram32_q),
+	.vram32_req(vram32_req),
+	.vram32_ack(vram32_ack),
+	.vram32_a(vram32_a),
+	.vram32_q(vram32_q),
 	
 	.EXINT(M68K_EXINT),
 	.HL(HL),
@@ -413,10 +413,10 @@ vdp vdp
 
 	.VINT_T80(Z80_VINT),
 
-	.VBUS_addr(VBUS_A),
-	.VBUS_data(MBUS_DI),
-	.VBUS_sel(VBUS_SEL),
-	.VBUS_dtack_n(VDP_MBUS_DTACK_N),
+	.VBUS_ADDR(VBUS_A),
+	.VBUS_DATA(MBUS_DI),
+	.VBUS_SEL(VBUS_SEL),
+	.VBUS_DTACK_N(VDP_MBUS_DTACK_N),
 
 	.BG_N(M68K_BG_N),
 	.BR_N(VBUS_BR_N),
