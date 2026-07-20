@@ -81,6 +81,11 @@ always @(posedge clk) begin
             end
         end
 
+        // Commands update drive state immediately; the status packet is
+        // transmitted ONLY on the fixed 75Hz beat, like a real drive. An
+        // immediate reply lets the BIOS's INT4 handler chain commands into
+        // a kHz interrupt storm that starves the sub-CPU (measured 0xFF
+        // acks/sec on hardware; choreography/drums/UI all crawled).
         if (cdd_send & ~send_d) begin
             // command nibble c0 in bits [3:0], TOC format c3 in bits [15:12]
             case (cdd_comm[3:0])
@@ -106,21 +111,9 @@ always @(posedge clk) begin
                     n0 <= drv_status;
                 end
             endcase
-            pending <= 1;
-            delay   <= 13'd8000;
         end
 
-        if (pending) begin
-            if (delay != 0) begin
-                delay <= delay - 1'b1;
-            end else begin
-                cdd_stat <= {csum, 20'h0, 8'h0, n1, n0};
-                cdd_rec  <= 1;
-                rec_cnt  <= 4'd8;
-                pending  <= 0;
-                wdog     <= 0;
-            end
-        end else if (wdog == WDOG) begin
+        if (wdog == WDOG) begin
             cdd_stat <= {csum, 20'h0, 8'h0, n1, n0};
             cdd_rec  <= 1;
             rec_cnt  <= 4'd8;
