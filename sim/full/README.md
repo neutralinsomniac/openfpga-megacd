@@ -144,3 +144,27 @@ a converted-VDP bug in the DTC/FIFO-read path during DMA setup. NEXT: mark
 DTC state + FIFO read/write pointers (fifo_rd_pos/fifo_wr_pos/fifo_queue)
 public; find why DTC stopped draining the FIFO. This is the one signal to
 fix to advance the full-system boot past the SEGA-logo DMA.
+
+## FULLY TRACED: VDP FIFO won't drain (converted-VDP fidelity bug)
+Chain: main boots -> waits VDP DMA-busy -> fill stuck DMA_FILL_START ->
+needs FIFO_EMPTY -> FIFO never empty. Probed at hang: DTC=IDLE(0),
+fifo_queue=4 (FULL), fifo_partial=1 (stuck), fifo_en=0, SLOT_EN pulsing.
+Drain (DTC_IDLE->FIFO_RD @vdp.vhd:3053) needs FIFO_DELAY(rd_pos)=0;
+FIFO_DELAY decrements on SLOT_EN (2913-2916) which pulses, yet drain never
+fires and FIFO_PARTIAL (cleared only on FIFO_EN, 3049) is stuck. => the
+yosys --latches SYNTHESIS of the VDP mis-handled the FIFO_DELAY array
+per-element decrement and/or FIFO_PARTIAL/FIFO_EN timing (lossy gate-level
+conversion; VDP needed --latches = a red flag).
+
+FIX DIRECTIONS (next session):
+1. BEST: simulate the VDP as real VHDL instead of yosys-synthesized gates —
+   e.g. cocotb+GHDL for the VHDL modules co-sim'd with Verilator for the
+   SV/Verilog, or a VHDL-capable simulator for the whole thing. Avoids all
+   conversion-fidelity bugs (this won't be the last).
+2. FASTER: mark FIFO_DELAY(0..3)/FIFO_EN public, confirm the exact stuck
+   element, and patch the converted vdp.v (or re-convert VDP with tweaked
+   yosys flags / a behavioral pre-pass) so the array decrement + partial
+   clear work.
+The MCD-only co-sim (sim/m2, no VDP) is unaffected and remains the fast
+path for the actual CDD/CDC drive debugging if the full-system VDP proves
+too costly to make faithful.

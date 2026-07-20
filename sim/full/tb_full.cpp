@@ -89,6 +89,12 @@ int main(int argc,char**argv){
             printf("      slot_en_edges=%ld fifo_empty=%d dmaf_set_req=%d\n", slot_edges,
                    r->core_top__DOT__gen__DOT__vdp__DOT__fifo_empty,
                    r->core_top__DOT__gen__DOT__vdp__DOT__dmaf_set_req);
+            printf("      dtc=%d fifo_queue=? (dtc: 0=IDLE 1=FIFO_RD 2=VRAM_WR1 3=VRAM_WR2 7=VRAM_RD1 8=VRAM_RD2)\n",
+                   r->core_top__DOT__gen__DOT__vdp__DOT__dtc);
+            printf("      fifo_queue=%d fifo_partial=%d fifo_en=%d\n",
+                   r->core_top__DOT__gen__DOT__vdp__DOT__fifo_queue,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__fifo_partial,
+                   r->core_top__DOT__gen__DOT__vdp__DOT__fifo_en);
         }
     }
     // dump work-RAM code around the STOP site $FF00F0.. (SDRAM word $400078..)
