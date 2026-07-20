@@ -733,6 +733,8 @@ assign video_skip = 0;
 reg hs_prev;
 reg vs_prev;
 
+reg [9:0] dbg_x, dbg_y;
+
 reg         field;
 wire        field_s;
 
@@ -772,7 +774,27 @@ always @(posedge current_pix_clk) begin
         video_rgb_reg[23:16] <= (lg_target && lightgun_enabled && show_crosshair) ? {8{lg_target[0]}} : red;
         video_rgb_reg[15:8]  <= (lg_target && lightgun_enabled && show_crosshair) ? {8{lg_target[1]}} : green;
         video_rgb_reg[7:0]   <= (lg_target && lightgun_enabled && show_crosshair) ? {8{lg_target[2]}} : blue;
+
+        // bring-up debug: 4 blocks top-left — sub-CPU alive, CDD command
+        // seen, word-RAM requested, word-RAM completed (green=yes, red=no)
+        if (dbg_y < 10'd8) begin
+            case (dbg_x[9:3])
+                7'd0: video_rgb_reg <= dbg_sub_alive ? 24'h00FF00 : 24'hFF0000;
+                7'd1: video_rgb_reg <= dbg_cdd_seen  ? 24'h00FF00 : 24'hFF0000;
+                7'd2: video_rgb_reg <= dbg_wr_req    ? 24'h00FF00 : 24'hFF0000;
+                7'd3: video_rgb_reg <= dbg_wr_done   ? 24'h00FF00 : 24'hFF0000;
+                default: ;
+            endcase
+        end
     end
+
+    if (~hs_prev && hs_c) begin
+        dbg_x <= 0;
+        dbg_y <= dbg_y + 1'b1;
+    end else if (video_de_reg) begin
+        dbg_x <= dbg_x + 1'b1;
+    end
+    if (~vs_prev && vs_c) dbg_y <= 0;
 
     video_hs_reg <= ~hs_prev && hs_c;
     video_vs_reg <= ~vs_prev && vs_c;
@@ -1370,8 +1392,42 @@ MCD MCD
 	.GG_CODE(129'd0),
 	.GG_AVAILABLE(),
 
-	.DBG_S68K_A()
+	.DBG_S68K_A(dbg_s68k_a)
 );
+
+///////////////////////////////////////////////
+// Bring-up debug indicators (top-left corner)
+///////////////////////////////////////////////
+
+wire [23:0] dbg_s68k_a;
+reg  [23:0] dbg_s68k_a_d;
+reg  [9:0]  dbg_sub_cnt = 0;
+reg         dbg_sub_alive = 0;   // sub-CPU address bus is moving
+reg         dbg_cdd_seen = 0;    // BIOS raised HOCK and sent a CDD command
+reg         dbg_wr_req = 0;      // a word RAM access was requested
+reg         dbg_wr_started = 0;
+reg         dbg_wr_done = 0;     // a word RAM access completed
+
+always @(posedge clk_sys) begin
+	dbg_s68k_a_d <= dbg_s68k_a;
+	if (reset) begin
+		dbg_sub_cnt <= 0;
+		dbg_sub_alive <= 0;
+		dbg_cdd_seen <= 0;
+		dbg_wr_req <= 0;
+		dbg_wr_started <= 0;
+		dbg_wr_done <= 0;
+	end else begin
+		if (dbg_s68k_a != dbg_s68k_a_d) begin
+			if (&dbg_sub_cnt) dbg_sub_alive <= 1;
+			else dbg_sub_cnt <= dbg_sub_cnt + 1'b1;
+		end
+		if (cdd_send) dbg_cdd_seen <= 1;
+		if (WR0_RD | WR0_WR | WR1_RD | WR1_WR) dbg_wr_req <= 1;
+		if (~WR0_RDY | ~WR1_RDY) dbg_wr_started <= 1;
+		if (dbg_wr_started & WR0_RDY & WR1_RDY) dbg_wr_done <= 1;
+	end
+end
 
 // CDD drive stub (M1): "no disc" responder; the real drive MPU lands in M2
 wire [39:0] cdd_stat, cdd_comm;
