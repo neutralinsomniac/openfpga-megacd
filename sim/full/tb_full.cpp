@@ -56,6 +56,11 @@ int main(int argc,char**argv){
         if(vbl && !vbl_prev) vbl_cnt++;
         vint_prev=vint; cepix_prev=cepix; vbl_prev=vbl;
         if(mpc==last) stuck++; else { stuck=0; last=mpc; }
+        static bool sub_started=false;
+        if(!sub_started && spc!=0){ sub_started=true; printf("[%ld] SUB RELEASED: first sub addr=%06X\n",c,spc); }
+        static uint32_t sub_last=0; static long sub_stuck=0;
+        if(spc==sub_last) sub_stuck++; else { sub_stuck=0; sub_last=spc; }
+        if(sub_stuck==2000000){ printf("[%ld] sub parked at %06X (main=%06X)\n",c,spc,mpc); }
         if(stuck==500000){
             printf("[%ld] main STUCK at %06X: mstate=%X dtack_n=%d "
                    "VINT_now=%d VINT=%ld CE_PIX=%ld VBL=%ld IE0=%d PENDING=%d\n", c, mpc,

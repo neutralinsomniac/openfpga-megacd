@@ -168,3 +168,20 @@ FIX DIRECTIONS (next session):
 The MCD-only co-sim (sim/m2, no VDP) is unaffected and remains the fast
 path for the actual CDD/CDC drive debugging if the full-system VDP proves
 too costly to make faithful.
+
+## RESOLVED (2026-07-20 session 2): not a conversion bug — VRAM_SPEED
+New probes (fifo_delay/fifo_rd_pos/fifo_wr_pos public, fifo_en edge count)
+showed a LIVELOCK, not a static wedge: fifo_en pulses fine, fifo_delay all
+zero, DTC cycling, but FIFO_QUEUE ran 4,5,6,7 with wr_pos static = queue
+UNDERFLOW (0-1=7). Cause: VRAM_SPEED is a VHDL input port with default '1';
+gen.sv left it unconnected -> Quartus uses the default, but the converted
+Verilog reads 0. With VRAM_SPEED=0 the DTC_IDLE drain gate (vdp.vhd:3052)
+bypasses the FIFO_PARTIAL guard, so after a 16-bit VRAM-write drain that
+empties the queue it drains once more at queue=0/partial=1 (FIFO_EMPTY
+still 0 via partial) -> underflow -> FIFO_EMPTY never asserts -> fill DMA
+never starts. Fix: gen.sv now drives .VRAM_SPEED(1'b1) explicitly.
+Full sim now completes the SEGA-logo fill DMA; main runs the BIOS freely.
+Lesson for all converted VHDL: EVERY input port with a VHDL default must be
+explicitly connected in the SV instantiations, or sim and Quartus diverge.
+NEXT: long boot run — watch SRES release, sub BIOS boot, CDD stub comm
+(no-disc model), and the CD-player screen NOT freezing (cursor alive).
