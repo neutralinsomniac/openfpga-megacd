@@ -26,7 +26,7 @@ static std::vector<uint8_t> wram0(128*1024,0);  // word RAM bank 0
 static std::vector<uint8_t> wram1(128*1024,0);  // word RAM bank 1
 static std::vector<uint8_t> bram(8*1024, 0);    // backup RAM
 
-static const int MEM_LAT = 12; // SDRAM-ish latency, cycles
+static int MEM_LAT = 12; // SDRAM-ish latency, cycles (--memlat)
 
 // generic latency handshake state
 struct MemPort {
@@ -75,14 +75,21 @@ int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
     const char* prgf=nullptr; const char* romf=nullptr;
     long maxc = 5000000; bool trace_pc = true;
+    long cddphase=0, int2phase=0; int memlat=12; bool inject=true;
     for (int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--prg")&&i+1<argc) prgf=argv[++i];
         else if(!strcmp(argv[i],"--rom")&&i+1<argc) romf=argv[++i];
         else if(!strcmp(argv[i],"--cycles")&&i+1<argc) maxc=atol(argv[++i]);
+        else if(!strcmp(argv[i],"--cddphase")&&i+1<argc) cddphase=atol(argv[++i]);
+        else if(!strcmp(argv[i],"--int2phase")&&i+1<argc) int2phase=atol(argv[++i]);
+        else if(!strcmp(argv[i],"--memlat")&&i+1<argc) memlat=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--noinject")) inject=false;
     }
     if (romf){ FILE*f=fopen(romf,"rb"); if(f){fread(rom.data(),1,rom.size(),f);fclose(f);printf("loaded ROM %s\n",romf);} }
     if (prgf){ FILE*f=fopen(prgf,"rb"); if(f){fread(prg.data(),1,prg.size(),f);fclose(f);printf("loaded PRG %s\n",prgf);} }
 
+    MEM_LAT = memlat;
+    cdd.beat = (int)cddphase;
     dut = new VMCD;
     dut->CLK=0; dut->RST_N=0; dut->ENABLE=1; dut->PALSW=0;
     dut->PRG_RDY=1; dut->ROM_RDY=1; dut->WORDRAM0_RDY=1; dut->WORDRAM1_RDY=1;
@@ -109,13 +116,15 @@ int main(int argc, char** argv) {
     // sub main loop ($610A, table $6118) jump to $7302 = drive-read retry
     // loop -> the freeze. CC0 hi-byte codes (old sweep) were the wrong slot.
     long INJ = 3500000;
-    for (int i=0;i<8;i++) script.push_back({INJ + i*400, 8+i, 0x0000});
-    long t = INJ + 10000;
-    script.push_back({t,       8, 0x0001});  // CC0 = track 1 arg
-    script.push_back({t+400,  10, 0x0001});  // CC2 = action 1: set mode
-    script.push_back({t+800,  11, 0x0008});  // CC3 = mode 8: drive-read loop
-    script.push_back({t+2000,  7, 0x0400});  // raise CFM bit2
-    script.push_back({t+1200000,7,0x0000});  // lower after >1 INT2 frame
+    if (inject) {
+        for (int i=0;i<8;i++) script.push_back({INJ + i*400, 8+i, 0x0000});
+        long t = INJ + 10000;
+        script.push_back({t,       8, 0x0001});  // CC0 = track 1 arg
+        script.push_back({t+400,  10, 0x0001});  // CC2 = action 1: set mode
+        script.push_back({t+800,  11, 0x0008});  // CC3 = mode 8: drive-read loop
+        script.push_back({t+2000,  7, 0x0400});  // raise CFM bit2
+        script.push_back({t+1200000,7,0x0000});  // lower after >1 INT2 frame
+    }
 
     size_t sp=0;
     enum { EXT_IDLE, EXT_DRIVE } ext_st = EXT_IDLE;
@@ -124,6 +133,7 @@ int main(int argc, char** argv) {
     bool seen_cmd=false, seen_616a=false;
     bool seen_726e=false, seen_7302=false, seen_7350=false;
     long loop_iters=0, q_checks=0;
+    long busyres=0, wedge_at=0; bool wedged=false;
 
     for (long c=0; c<maxc; c++) {
         if (c==20) dut->RST_N=1;
@@ -136,7 +146,7 @@ int main(int argc, char** argv) {
                 if (ext_off==0 && ext_val==1) sres_done=true;
             }
             // periodic INT2 heartbeat (IFL2|SRES) once released
-            else if (sres_done && (c % FRAME)==0) { ext_off=0; ext_val=0x0101; go=true; }
+            else if (sres_done && ((c+int2phase) % FRAME)==0) { ext_off=0; ext_val=0x0101; go=true; }
             if (go) {
                 dut->EXT_FDC_N=0; dut->EXT_ASEL_N=0; dut->EXT_RNW=0;
                 dut->EXT_LDS_N=0; dut->EXT_UDS_N=0; dut->EXT_VA=ext_off;
@@ -243,6 +253,13 @@ int main(int argc, char** argv) {
         if (pc==0x77D8 && prev_pc2!=0x77D8 && c>INJ) q_checks++;
         prev_pc2=pc;
         if (pc==0x7350 && c>INJ && !seen_7350){ seen_7350=true; printf("[%ld] sub EXITED loop via $7350\n",c); }
+        // wedge detector: bus parked in the $616A busy-wait / $833F flag
+        // region continuously for >1.5 INT2 frames = the hardware freeze
+        bool inwait = (pc>=0x6168 && pc<=0x6172) || (pc>=0x833C && pc<=0x8340);
+        if (inwait) busyres++; else busyres=0;
+        if (busyres==1342500 && !wedged){ wedged=true; wedge_at=c;
+            printf("[%ld] WEDGE: sub parked in busy-wait (busy=%02X mode=%04X)\n",
+                   c, prg[0x833F], (prg[0x833C]<<8)|prg[0x833D]); }
         if (pc==last_pc){ if(++idlepc==200000){ printf("[%ld] sub STUCK at %06X ipl=%X pend=%02X gron=%d\n",
                              c,pc,dut->DBG_S68K_IPL_N,dut->DBG_INT_PEND,dut->DBG_GRON); idlepc=0; } }
         else { idlepc=0; last_pc=pc; }
@@ -252,6 +269,8 @@ int main(int argc, char** argv) {
                    c, pc, dut->DBG_S68K_IPL_N, dut->DBG_INT_PEND, dut->DBG_INT_ACK,
                    dut->DBG_GRON, cdd.status, loop_iters, q_checks);
     }
+    printf("RESULT cddphase=%ld int2phase=%ld memlat=%d wedge=%d wedge_at=%ld\n",
+           cddphase, int2phase, memlat, wedged?1:0, wedge_at);
     printf("end: mode=%04X abort=%02X busy=%02X state44=%04X drvstat58=%02X %02X\n",
            (prg[0x833C]<<8)|prg[0x833D], prg[0x833E], prg[0x833F],
            (prg[0x8380]<<8)|prg[0x8381], prg[0x8394], prg[0x8395]);

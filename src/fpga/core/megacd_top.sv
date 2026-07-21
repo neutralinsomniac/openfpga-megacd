@@ -564,6 +564,7 @@ assign sd_buff_addr_out = {dump_addr_out[16:0]};
 // PRG word; result held until the unloader latches it (delay 48).
 reg [18:1] dump_word;
 reg        dump_active = 0;
+reg        dump_pend = 0;
 reg        dump_rd = 0;
 reg [15:0] dump_data = 0;
 reg        sd_rd_d = 0;
@@ -571,8 +572,16 @@ always @(posedge clk_sys) begin
 	reg old_busy_d;
 	old_busy_d <= sdld_busy;
 	sd_rd_d <= sd_rd;
+	// never hijack the shared SDRAM port mid-transaction: queue the dump
+	// request and start it only when the word-RAM arbiter and the debug
+	// sampler are idle (they in turn hold off while dump_active)
 	if (sd_rd & ~sd_rd_d) begin
-		dump_word   <= dump_addr_out[18:1];
+		dump_word <= dump_addr_out[18:1];
+		dump_pend <= 1;
+	end
+	if (dump_pend && !dump_active && !wr_active && !dbg_prg_active
+	    && !(grant0_rd | grant0_wr | grant1_rd | grant1_wr)) begin
+		dump_pend   <= 0;
 		dump_active <= 1;
 		dump_rd     <= 1;
 	end else if (dump_active) begin
@@ -1745,7 +1754,13 @@ always @(posedge clk_sys) begin
 	reg old_busy3;
 	old_busy3 <= sdld_busy;
 	if (dbg_sec == 26'd53693174) dbg_prg_go <= 1;
-	if (dbg_prg_go && !dbg_prg_active && !wr_active && !bios_download && st_done) begin
+	// defer to any pending word-RAM grant: both this block and the arbiter
+	// fire on the same clk edge, so without this guard both can claim the
+	// shared SDRAM port in the same cycle — the mux then serves the debug
+	// address while the arbiter falsely completes the word-RAM access with
+	// the sampler's data (corrupted RMW read / silently dropped write)
+	if (dbg_prg_go && !dbg_prg_active && !wr_active && !bios_download && st_done
+	    && !(grant0_rd | grant0_wr | grant1_rd | grant1_wr)) begin
 		dbg_prg_active <= 1;
 		dbg_prg_go <= 0;
 		dbg_prg_idx <= 0;
