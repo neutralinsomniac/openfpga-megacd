@@ -42,9 +42,9 @@ int main(int argc,char**argv){
         // screen; d-pad RIGHT (bit3) twice later -> cursor must move.
         {
             uint16_t k=0;
-            if(c>=470000000 && c<490000000) k |= 1u<<15;   // START
-            if(c>=1500000000 && c<1512000000) k |= 1u<<3;  // RIGHT
-            if(c>=1800000000 && c<1812000000) k |= 1u<<3;  // RIGHT again
+            if(c>=750000000 && c<775000000) k |= 1u<<15;   // START (title up ~frame 200)
+            if(c>=1300000000 && c<1315000000) k |= 1u<<3;  // RIGHT on player screen
+            if(c>=1600000000 && c<1615000000) k |= 1u<<3;  // RIGHT again
             dut->cont1_key = k;
         }
         dut->eval(); t++;
@@ -60,9 +60,9 @@ int main(int argc,char**argv){
                 int vb=dut->rootp->core_top__DOT__vblank_sys;
                 int hb=dut->rootp->core_top__DOT__hblank;
                 if(vb && !vb_prev){
-                    bool press_win = (c>=470000000 && c<520000000) ||
-                                     (c>=1500000000 && c<1545000000) ||
-                                     (c>=1800000000 && c<1845000000);
+                    bool press_win = (c>=750000000 && c<830000000) ||
+                                     (c>=1300000000 && c<1360000000) ||
+                                     (c>=1600000000 && c<1660000000);
                     static long fevery = getenv("FRAME_EVERY")?atol(getenv("FRAME_EVERY")):100;
                     if(frame>0 && maxx>0 && ((frame%fevery)==0 || press_win)){
                         char fn[64]; snprintf(fn,sizeof fn,"frames/f%05ld.ppm",frame);
@@ -92,7 +92,14 @@ int main(int argc,char**argv){
         auto* r = dut->rootp;
         // ring buffer of last distinct main address-bus values (execution trail)
         static uint32_t trail[32]; static int ti=0; static uint32_t tlast=0xFFFFFFFF;
-        if(mpc!=tlast){ trail[ti&31]=mpc; ti++; tlast=mpc; }
+        if(mpc!=tlast){ trail[ti&31]=mpc; ti++; tlast=mpc;
+            static bool exc_seen=false;
+            if(!exc_seen && c>1000000 && mpc>=0x000008 && mpc<=0x0000FF){ exc_seen=true;
+                printf("[%ld] MAIN EXCEPTION VECTOR FETCH (%06X)! trail: ",c,mpc);
+                for(int k=0;k<32;k++){ int idx=(ti-32+k); if(idx>=0) printf("%06X ", trail[idx&31]); }
+                printf("\n");
+            }
+        }
         static uint32_t last=0xFFFFFFFF; static long stuck=0;
         static int vint_prev=0; static long vint_cnt=0, cepix_cnt=0, vbl_cnt=0;
         static int cepix_prev=0, vbl_prev=0;
@@ -109,6 +116,22 @@ int main(int argc,char**argv){
         static uint32_t sub_last=0; static long sub_stuck=0;
         if(spc==sub_last) sub_stuck++; else { sub_stuck=0; sub_last=spc; }
         if(sub_stuck==2000000){ printf("[%ld] sub parked at %06X (main=%06X)\n",c,spc,mpc); }
+        // word-RAM arbiter wedge watch (hardware red block = dbg_wr_stuck)
+        static int wrstuck_prev=0;
+        int wrstuck = r->core_top__DOT__dbg_wr_stuck;
+        if(wrstuck && !wrstuck_prev){
+            printf("[%ld] *** WR_STUCK LATCHED: req(rd0,wr0,rd1,wr1)=%d%d%d%d "
+                   "rdy(0,1)=%d%d act=%d hold(r0,w0,r1,w1)=%d%d%d%d dtack_stuck=%d main=%06X sub=%06X\n",
+                   c,
+                   r->core_top__DOT__WR0_RD, r->core_top__DOT__WR0_WR,
+                   r->core_top__DOT__WR1_RD, r->core_top__DOT__WR1_WR,
+                   r->core_top__DOT__WR0_RDY, r->core_top__DOT__WR1_RDY,
+                   r->core_top__DOT__wr_active,
+                   r->core_top__DOT__wr0_rd_hold, r->core_top__DOT__wr0_wr_hold,
+                   r->core_top__DOT__wr1_rd_hold, r->core_top__DOT__wr1_wr_hold,
+                   r->core_top__DOT__dbg_dtack_stuck, mpc, spc);
+        }
+        wrstuck_prev=wrstuck;
         if(stuck==500000){
             printf("[%ld] main STUCK at %06X: mstate=%X dtack_n=%d "
                    "VINT_now=%d VINT=%ld CE_PIX=%ld VBL=%ld IE0=%d PENDING=%d\n", c, mpc,
@@ -125,6 +148,21 @@ int main(int argc,char**argv){
             printf("  exec trail (last distinct main addrs): ");
             for(int k=0;k<32;k++){ int idx=(ti-32+k); if(idx>=0) printf("%06X ", trail[idx&31]); }
             printf("\n");
+        }
+        static long tw0=-1, tw1=-1;
+        { static bool twinit=false;
+          if(!twinit){ twinit=true; const char* e=getenv("TRACEWIN");
+            if(e){ sscanf(e,"%ld,%ld",&tw0,&tw1); } } }
+        if(tw0>=0 && c>=tw0 && c<tw1 && (c%2)==0){
+            printf("TW %ld m=%06X st=%X dt=%d ce(ram,rom)=%d%d oe=%d wr=%d%d p1(a,o,rb,ob)=%d%d%d%d busy1=%d dout=%04X\n",
+                c, mpc, r->core_top__DOT__gen__DOT__mstate,
+                r->core_top__DOT__gen__DOT__M68K_MBUS_DTACK_N,
+                r->core_top__DOT__GEN_RAM_CE_N, r->core_top__DOT__GEN_ROM_CE_N,
+                r->core_top__DOT__GEN_OE_N,
+                r->core_top__DOT__GEN_WRL_N, r->core_top__DOT__GEN_WRH_N,
+                r->core_top__DOT__p1_act, r->core_top__DOT__p1_owner,
+                r->core_top__DOT__p1_ram_busy, r->core_top__DOT__p1_rom_busy,
+                r->core_top__DOT__GEN_MEM_BUSY, r->core_top__DOT__p1_dout);
         }
         if((c%2000000)==0) printf("[%ld] main=%06X sub=%06X VINT=%ld VBL=%ld  in_dma=%d fill=%d vbus=%d copy=%d\n",
                                   c, mpc, spc, vint_cnt, vbl_cnt,
@@ -158,10 +196,15 @@ int main(int argc,char**argv){
                    r->core_top__DOT__gen__DOT__vdp__DOT__refresh_flag);
         }
     }
-    // dump work-RAM code around the STOP site $FF00F0.. (SDRAM word $400078..)
+#ifdef REALSD
+    printf("work-RAM $FF00F0..$FF0120 (chip model):\n");
+    for(uint32_t w=0x400078; w<0x400091; w++)
+        printf("%04X ", dut->rootp->core_top__DOT__sdram__DOT__chip__DOT__mem[w] & 0xFFFF);
+#else
     printf("work-RAM $FF00F0..$FF0120:\n");
     for(uint32_t w=0x400078; w<0x400091; w++)
         printf("%04X ", dut->rootp->core_top__DOT__sdram__DOT__mem[w] & 0xFFFF);
+#endif
     printf("\n");
     dut->final(); delete dut;
     printf("done\n");

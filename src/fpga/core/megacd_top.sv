@@ -972,6 +972,68 @@ assign MCD_PRG_DI   = sdr_do;
 
 wire [15:0] GEN_MEM_DO;
 wire        GEN_MEM_BUSY /* verilator public_flat_rd */;
+
+// ---- SDRAM port-1 front-end ----------------------------------------------
+// Port 1 is shared by two independent state machines: gen's work-RAM path
+// (RAM_CE) and the MCD ASIC's CD-BIOS ROM window (ROM_CE). Both used the raw
+// shared busy1 as their RDY, and rd1 was the OR of both CE decodes. Proven
+// failure modes under concurrent load (real-SDRAM cosim, sdlog trace):
+// (1) a machine starting while the other's access was still draining took
+//     that busy as its own start and latched foreign dout as its data —
+//     random main-CPU corruption (BIOS boot crash into the address-error
+//     vector once word-RAM traffic delays the drain);
+// (2) a back-to-back user switch with no gap on rd1 left the controller's
+//     old_rd edge latch stale, making the second request invisible — a
+//     permanent wedge (the hardware dbg_wr/dtack stuck class).
+// The front-end serializes the users: one latched request at a time, clean
+// gaps on the request lines, a private RDY per user, data latched at
+// completion.
+reg         p1_act /* verilator public_flat_rd */ = 0, p1_started = 0, p1_owner /* verilator public_flat_rd */ = 0; // 0=gen-RAM 1=MCD-ROM
+reg         p1_ram_hold = 0, p1_rom_hold = 0;
+reg         p1_ram_busy /* verilator public_flat_rd */ = 0, p1_rom_busy /* verilator public_flat_rd */ = 0;
+reg         p1_rd = 0, p1_wrl = 0, p1_wrh = 0;
+reg  [24:1] p1_addr;
+reg  [15:0] p1_din;
+reg  [15:0] p1_dout /* verilator public_flat_rd */;
+
+wire p1_ram_acc = ~GEN_RAM_CE_N & (~GEN_OE_N | ~GEN_WRL_N | ~GEN_WRH_N);
+wire p1_rom_acc = ~GEN_ROM_CE_N & ~GEN_OE_N;
+
+always @(posedge clk_sys) begin
+	reg old_b1;
+	old_b1 <= GEN_MEM_BUSY;
+	if (~p1_ram_acc) p1_ram_hold <= 0;
+	if (~p1_rom_acc) p1_rom_hold <= 0;
+	if (reset | bios_download) begin
+		p1_act <= 0; p1_started <= 0;
+		p1_rd <= 0; p1_wrl <= 0; p1_wrh <= 0;
+		p1_ram_busy <= 0; p1_rom_busy <= 0;
+		p1_ram_hold <= 0; p1_rom_hold <= 0;
+	end else if (!p1_act) begin
+		if (p1_ram_acc & ~p1_ram_hold) begin
+			p1_act  <= 1; p1_started <= 0; p1_owner <= 0;
+			p1_addr <= {9'b010000000, GEN_VA[15:1]};
+			p1_din  <= GEN_VDO;
+			p1_rd   <= ~GEN_OE_N;
+			p1_wrl  <= ~GEN_WRL_N;
+			p1_wrh  <= ~GEN_WRH_N;
+			p1_ram_busy <= 1;
+		end else if (p1_rom_acc & ~p1_rom_hold) begin
+			p1_act  <= 1; p1_started <= 0; p1_owner <= 1;
+			p1_addr <= {8'b01111000, GEN_VA[16:1]};
+			p1_rd   <= 1; p1_wrl <= 0; p1_wrh <= 0;
+			p1_rom_busy <= 1;
+		end
+	end else begin
+		if (GEN_MEM_BUSY) p1_started <= 1;
+		if (p1_started & old_b1 & ~GEN_MEM_BUSY) begin
+			p1_dout <= GEN_MEM_DO;
+			if (!p1_owner) begin p1_ram_busy <= 0; p1_ram_hold <= 1; end
+			else          begin p1_rom_busy <= 0; p1_rom_hold <= 1; end
+			p1_act <= 0; p1_rd <= 0; p1_wrl <= 0; p1_wrh <= 0;
+		end
+	end
+end
 wire        sdld_busy;
 
 always @(posedge clk_sys) begin
@@ -995,13 +1057,13 @@ sdram sdram
 	.wrh0(~MCD_PRG_WRH_N),
 	.busy0(sdr_busy),
 
-	// Genesis work RAM + CD BIOS window
-	.addr1(!GEN_RAM_CE_N ? {9'b010000000, GEN_VA[15:1]} : {8'b01111000, GEN_VA[16:1]}),
-	.din1(GEN_VDO),
+	// Genesis work RAM + CD BIOS window (serialized by the port-1 front-end)
+	.addr1(p1_addr),
+	.din1(p1_din),
 	.dout1(GEN_MEM_DO),
-	.rd1((~GEN_RAM_CE_N | ~GEN_ROM_CE_N) & ~GEN_OE_N),
-	.wrl1(~GEN_RAM_CE_N & ~GEN_WRL_N),
-	.wrh1(~GEN_RAM_CE_N & ~GEN_WRH_N),
+	.rd1(p1_rd),
+	.wrl1(p1_wrl),
+	.wrh1(p1_wrh),
 	.busy1(GEN_MEM_BUSY),
 
 	// word RAM (runtime + boot self-test via arbiter) / BIOS load / PRG peek
@@ -1036,29 +1098,29 @@ sdram sdram
 wire [15:0] MWR0_A, MWR1_A, MWR0_DO, MWR1_DO;
 wire        MWR0_RD, MWR0_WR, MWR1_RD, MWR1_WR;
 reg  [15:0] WR0_DI, WR1_DI;
-reg         WR0_RDY = 1, WR1_RDY = 1;
+reg         WR0_RDY /* verilator public_flat_rd */ = 1, WR1_RDY /* verilator public_flat_rd */ = 1;
 
 // arbiter inputs: MCD normally; the boot self-test drives them during reset
 wire [15:0] WR0_A  = st2_active ? {6'b0, st2_idx0} : MWR0_A;
 wire [15:0] WR1_A  = st2_active ? {6'b0, st2_idx1} : MWR1_A;
 wire [15:0] WR0_DO = st2_active ? st2_pat0 : MWR0_DO;
 wire [15:0] WR1_DO = st2_active ? st2_pat1 : MWR1_DO;
-wire        WR0_RD = st2_active ? st2_rd0 : MWR0_RD;
-wire        WR0_WR = st2_active ? st2_wr0 : MWR0_WR;
-wire        WR1_RD = st2_active ? st2_rd1 : MWR1_RD;
-wire        WR1_WR = st2_active ? st2_wr1 : MWR1_WR;
+wire        WR0_RD /* verilator public_flat_rd */ = st2_active ? st2_rd0 : MWR0_RD;
+wire        WR0_WR /* verilator public_flat_rd */ = st2_active ? st2_wr0 : MWR0_WR;
+wire        WR1_RD /* verilator public_flat_rd */ = st2_active ? st2_rd1 : MWR1_RD;
+wire        WR1_WR /* verilator public_flat_rd */ = st2_active ? st2_wr1 : MWR1_WR;
 
 wire [15:0] sdwr_do;
 reg         wr_owner;
-reg         wr_active = 0;
+reg         wr_active /* verilator public_flat_rd */ = 0;
 reg         wr_rd_r = 0, wr_wr_r = 0;
 reg  [15:0] wr_addr;
 reg  [15:0] wr_din;
 // per-direction re-grant guards: a completed access holds off a new grant
 // until its request line drops (RMW flips RD->WR on one edge, so the two
 // directions must be tracked independently)
-reg         wr0_rd_hold = 0, wr0_wr_hold = 0;
-reg         wr1_rd_hold = 0, wr1_wr_hold = 0;
+reg         wr0_rd_hold /* verilator public_flat_rd */ = 0, wr0_wr_hold /* verilator public_flat_rd */ = 0;
+reg         wr1_rd_hold /* verilator public_flat_rd */ = 0, wr1_wr_hold /* verilator public_flat_rd */ = 0;
 
 wire grant0_rd = WR0_RD & ~wr0_rd_hold;
 wire grant0_wr = WR0_WR & ~wr0_wr_hold;
@@ -1402,7 +1464,7 @@ wire        GEN_RNW, GEN_LDS_N, GEN_UDS_N;
 wire        GEN_AS_N, GEN_DTACK_N, GEN_ASEL_N;
 wire        GEN_RAS2_N, EXT_ROM_N, EXT_FDC_N;
 wire        GEN_VCLK_CE, GEN_CE0_N;
-wire        GEN_WRL_N, GEN_WRH_N, GEN_OE_N;
+wire        GEN_WRL_N /* verilator public_flat_rd */, GEN_WRH_N /* verilator public_flat_rd */, GEN_OE_N /* verilator public_flat_rd */;
 wire        GEN_ROM_CE_N /* verilator public_flat_rd */, GEN_RAM_CE_N /* verilator public_flat_rd */;
 wire [15:0] GEN_AUDL, GEN_AUDR;
 wire        GEN_CE;
@@ -1500,7 +1562,7 @@ gen gen
 	.OBJ_LIMIT_HIGH(cs_obj_limit_high_enable),
 
 	.RAM_CE_N(GEN_RAM_CE_N),
-	.RAM_RDY(~GEN_MEM_BUSY),
+	.RAM_RDY(~p1_ram_busy),
 	.RFS(),
 	.RFS_RDY(1'b1),
 
@@ -1521,11 +1583,13 @@ assign GEN_VDI = !GEN_RAM_CE_N ? GEN_MEM_DO_R :
                  MCD_DO;
 assign GEN_DTACK_N = MCD_DTACK_N & CART_DTACK_N;
 
+// latch gen's read data only on gen-owned completions (a ROM-window
+// completion must not clobber it — same aliasing family as the RDY fix)
 reg [15:0] GEN_MEM_DO_R;
 always @(posedge clk_sys) begin
 	reg old_bsy;
-	old_bsy <= GEN_MEM_BUSY;
-	if(old_bsy & ~GEN_MEM_BUSY) GEN_MEM_DO_R <= GEN_MEM_DO;
+	old_bsy <= p1_ram_busy;
+	if(old_bsy & ~p1_ram_busy) GEN_MEM_DO_R <= p1_dout;
 end
 
 ///////////////////////////////////////////////
@@ -1576,9 +1640,9 @@ MCD MCD
 	.PRG_RFS(),
 	.PRG_RDY(~MCD_PRG_BUSY),
 
-	.ROM_DI(GEN_MEM_DO),
+	.ROM_DI(p1_dout),
 	.ROM_CE_N(GEN_ROM_CE_N),
-	.ROM_RDY(~GEN_MEM_BUSY),
+	.ROM_RDY(~p1_rom_busy),
 
 	.BRAM_A(MCD_BRAM_ADDR),
 	.BRAM_DI(MCD_BRAM_DI),
@@ -1716,9 +1780,9 @@ always @(posedge clk_sys) begin
 end
 
 reg [24:0] dbg_wrstuck_cnt = 0;
-reg        dbg_wr_stuck = 0;     // a word-RAM request stayed pending ~0.6s
+reg        dbg_wr_stuck /* verilator public_flat_rd */ = 0;     // a word-RAM request stayed pending ~0.6s
 reg [24:0] dbg_dtack_cnt = 0;
-reg        dbg_dtack_stuck = 0;  // main CPU wedged on an MCD access ~0.6s
+reg        dbg_dtack_stuck /* verilator public_flat_rd */ = 0;  // main CPU wedged on an MCD access ~0.6s
 reg [25:0] dbg_sec = 0;
 reg [22:0] dbg_rate_cnt = 0;
 reg [22:0] dbg_rate = 0;         // sub address changes in the last second

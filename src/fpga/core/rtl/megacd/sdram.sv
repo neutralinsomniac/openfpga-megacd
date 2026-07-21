@@ -97,11 +97,15 @@ reg  [2:0] ram_req = 0;
 wire [2:0] wr = {wrl2|wrh2,wrl1|wrh1,wrl0|wrh0};
 wire [2:0] rd = {rd2,rd1,rd0};
 
-reg [15:0] dout;
+// per-port read-data latches: a single shared dout register let any later
+// port's completion clobber a value before its requester consumed it
+// (requesters sample 1-2 clocks after busy falls) — random corruption
+// under concurrent load. Latch each port's data at its own completion.
+reg [15:0] dout0_r, dout1_r, dout2_r;
 
-assign dout0 = dout;
-assign dout1 = dout;
-assign dout2 = dout;
+assign dout0 = dout0_r;
+assign dout1 = dout1_r;
+assign dout2 = dout2_r;
 
 localparam [9:0] RFS_CNT = 766;
 
@@ -159,7 +163,9 @@ always @(posedge clk) begin
 	end
 
 	if(state == STATE_READY && ram_req) begin
-		dout <= SDRAM_DQ;
+		if(ram_req[0]) dout0_r <= SDRAM_DQ;
+		if(ram_req[1]) dout1_r <= SDRAM_DQ;
+		if(ram_req[2]) dout2_r <= SDRAM_DQ;
 		active <= 0;
 		ram_req <= 0;
 	end

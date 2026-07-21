@@ -20,12 +20,27 @@ NATIVE="
 JT="$(ls $R/rtl/jt12/*.v $R/rtl/jt12/mixer/*.v $R/rtl/jt12/dac/*.v $R/rtl/jt12/adpcm/*.v $R/rtl/jt89/*.v 2>/dev/null)"
 APF="$R/../apf/common.v mf_datatable_sim.v"
 CONV="vdp.v t80.v cart.v mcd.v"
-SIM="sdram_sim.v pll_sim.v bram_prims.v ram_models.v dcfifo_sim.v"
+# REALSD=1: use the real rtl/megacd/sdram.sv controller (renamed sdram_ctrl,
+# altddio stripped) + behavioral SDRAM chip, instead of the idealized model
+if [ "${REALSD:-0}" = "1" ]; then
+  tr -d '\r' < $R/rtl/megacd/sdram.sv | \
+  sed -e 's/^module sdram$/module sdram_ctrl/' \
+      -e '/^altddio_out/,/^);$/d' \
+      -e 's/\tinout  reg \[15:0\] SDRAM_DQ,.*/\toutput reg [15:0] SDRAM_DQ, input [15:0] SDRAM_DQ_IN, output reg SDRAM_DQ_OE,/' \
+      -e "s/SDRAM_DQ <= 'Z;/SDRAM_DQ_OE <= 0;/" \
+      -e 's/dout0_r <= SDRAM_DQ;/dout0_r <= SDRAM_DQ_IN;/' \
+      -e 's/dout1_r <= SDRAM_DQ;/dout1_r <= SDRAM_DQ_IN;/' \
+      -e 's/dout2_r <= SDRAM_DQ;/dout2_r <= SDRAM_DQ_IN;/' > sdram_ctrl_gen.v
+  SDMOD="sdram_real.v sdram_ctrl_gen.v"
+else
+  SDMOD="sdram_sim.v"
+fi
+SIM="$SDMOD pll_sim.v bram_prims.v ram_models.v dcfifo_sim.v"
 
 cp $R/rtl/FX68K/microrom.mem $R/rtl/FX68K/nanorom.mem . 2>/dev/null || true
 
 nix shell nixpkgs#verilator -c verilator --cc --exe --build -j 8 \
-  -O3 -CFLAGS "-O2 -march=native" \
+  -O3 -CFLAGS "-O2 -march=native ${REALSD:+-DREALSD}" \
   --top-module core_top --no-assert-case \
   -Wno-fatal --no-timing -Wno-BLKANDNBLK -Wno-WIDTH -Wno-CASEINCOMPLETE \
   -Wno-UNOPTFLAT -Wno-MULTIDRIVEN -Wno-LATCH -Wno-COMBDLY -Wno-CASEOVERLAP -Wno-PROCASSWIRE -Wno-IMPLICIT -Wno-BLKSEQ -Wno-SYMRSVDWORD \
