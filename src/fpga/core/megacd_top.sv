@@ -968,6 +968,7 @@ cofi coffee (
 wire        sdr_busy;
 wire [15:0] sdr_do;
 assign MCD_PRG_BUSY = sdr_busy;
+wire dbg_prg_busy /* verilator public_flat_rd */ = sdr_busy;
 assign MCD_PRG_DI   = sdr_do;
 
 wire [15:0] GEN_MEM_DO;
@@ -1627,7 +1628,7 @@ wire [15:0] MCD_PCM_SL, MCD_PCM_SR, MCD_CDDA_SL, MCD_CDDA_SR;
 wire        MCD_CDDA_WR_READY;
 wire [17:0] MCD_PRG_ADDR;
 wire [15:0] MCD_PRG_DO, MCD_PRG_DI;
-wire        MCD_PRG_OE_N, MCD_PRG_WRL_N, MCD_PRG_WRH_N, MCD_PRG_BUSY;
+wire        MCD_PRG_OE_N /* verilator public_flat_rd */, MCD_PRG_WRL_N, MCD_PRG_WRH_N, MCD_PRG_BUSY;
 wire [13:1] MCD_BRAM_ADDR;
 wire  [7:0] MCD_BRAM_DO, MCD_BRAM_DI;
 wire        MCD_BRAM_WE;

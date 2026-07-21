@@ -76,23 +76,42 @@ localparam NO_WRITE_BURST = 1'd1; // 0=write burst enabled, 1=only single access
 
 localparam MODE = { 3'b000, NO_WRITE_BURST, OP_MODE, CAS_LATENCY, ACCESS_TYPE, BURST_LENGTH}; 
 
-// 4-bit states: with tRCD=3 and CL=3, STATE_READY = 8 which overflows the
-// original 3-bit arithmetic (wrapping onto STATE_IDLE and corrupting the
-// request handshake)
-localparam STATE_IDLE  = 4'd0;             // state to check the requests
-localparam STATE_START = STATE_IDLE+1'd1;  // state in which a new command is started
-localparam STATE_CONT  = STATE_START+RASCAS_DELAY;
-localparam STATE_READY = STATE_CONT+CAS_LATENCY+1'd1;
-localparam STATE_LAST  = STATE_READY;      // last state in cycle
+// Open-row (page-mode) access engine. The original controller issued
+// ACTIVATE + auto-precharge around every single access (~9 cycles flat);
+// boot profiling showed the MCD word-RAM/GFX path paying ~150 clk_sys per
+// word and the sub-CPU ~50 per fetch, throttling the BIOS boot animations
+// to a ~7fps render rate. Rows now stay open per bank and row hits issue
+// CAS only; refresh precharges all banks first. Timing @107MHz: tRCD=3,
+// CL=3, tRP=3, tRFC via DLY_REF.
+localparam [3:0] DLY_RP  = 4'd2;  // PRECHARGE -> ACTIVATE
+localparam [3:0] DLY_RCD = 4'd2;  // ACTIVATE -> CAS
+localparam [3:0] DLY_CL  = 4'd3;  // CAS -> data latch
+localparam [3:0] DLY_REF = 4'd8;  // AUTO_REFRESH recovery (tRFC)
+
+localparam [2:0] FSM_IDLE = 3'd0;
+localparam [2:0] FSM_PRE  = 3'd1;
+localparam [2:0] FSM_ACT  = 3'd2;
+localparam [2:0] FSM_CAS  = 3'd3;
+localparam [2:0] FSM_PALL = 3'd4;
+localparam [2:0] FSM_REF  = 3'd5;
+
+// init-sequence cycle counter (MODE_RESET/LDM/PRE phases only)
+localparam STATE_IDLE  = 4'd0;
+localparam STATE_START = 4'd1;
+localparam STATE_LAST  = 4'd8;
 
 reg  [3:0] state;
+reg  [2:0] fsm = FSM_IDLE;
+reg  [3:0] dly;
 reg [22:1] a;
 reg [15:0] data;
 reg        we;
 reg  [1:0] ba = 0;
 reg  [1:0] dqm;
-reg        active = 0;
 reg  [2:0] ram_req = 0;
+
+reg [12:0] open_row [0:3];
+reg  [3:0] row_open = 0;
 
 wire [2:0] wr = {wrl2|wrh2,wrl1|wrh1,wrl0|wrh0};
 wire [2:0] rd = {rd2,rd1,rd0};
@@ -109,84 +128,21 @@ assign dout2 = dout2_r;
 
 localparam [9:0] RFS_CNT = 766;
 
-// access manager
-always @(posedge clk) begin
-	reg [9:0] rfs_timer = 0;
-	reg [2:0] old_rd, old_wr;
-
-	old_rd <= old_rd & rd;
-	old_wr <= old_wr & wr;
-
-	if(rfs_timer) rfs_timer <= rfs_timer - 1'd1;
-
-	if(state == STATE_IDLE && mode == MODE_NORMAL) begin
-		if (!rfs_timer) begin
-			rfs_timer <= RFS_CNT;
-			active <= 0;
-			we <= 0;
-			dqm <= 0;
-			state <= STATE_START;
-		end
-		else if ((~old_rd[0] && rd[0]) || (~old_wr[0] && wr[0])) begin
-			old_rd[0] <= rd[0];
-			old_wr[0] <= wr[0];
-			{ba, a} <= addr0;
-			data <= din0;
-			we <= wr[0];
-			dqm <= wr[0] ? ~{wrh0,wrl0} : 2'b00;
-			active <= 1;
-			state <= STATE_START;
-			ram_req[0] <= 1;
-		end
-		else if ((~old_rd[1] && rd[1]) || (~old_wr[1] && wr[1])) begin
-			old_rd[1] <= rd[1];
-			old_wr[1] <= wr[1];
-			{ba, a} <= addr1;
-			data <= din1;
-			we <= wr[1];
-			dqm <= wr[1] ? ~{wrh1,wrl1} : 2'b00;
-			active <= 1;
-			state <= STATE_START;
-			ram_req[1] <= 1;
-		end
-		else if ((~old_rd[2] && rd[2]) || (~old_wr[2] && wr[2])) begin
-			old_rd[2] <= rd[2];
-			old_wr[2] <= wr[2];
-			{ba, a} <= addr2;
-			data <= din2;
-			we <= wr[2];
-			dqm <= wr[2] ? ~{wrh2,wrl2} : 2'b00;
-			active <= 1;
-			state <= STATE_START;
-			ram_req[2] <= 1;
-		end
-	end
-
-	if(state == STATE_READY && ram_req) begin
-		if(ram_req[0]) dout0_r <= SDRAM_DQ;
-		if(ram_req[1]) dout1_r <= SDRAM_DQ;
-		if(ram_req[2]) dout2_r <= SDRAM_DQ;
-		active <= 0;
-		ram_req <= 0;
-	end
-
-	if(mode != MODE_NORMAL || state != STATE_IDLE || reset) begin
-		state <= state + 1'd1;
-		if(state == STATE_LAST) state <= STATE_IDLE;
-	end
-end
-
-assign busy0 = ram_req[0];
-assign busy1 = ram_req[1];
-assign busy2 = ram_req[2];
-
+localparam CMD_NOP             = 3'b111;
+localparam CMD_ACTIVE          = 3'b011;
+localparam CMD_READ            = 3'b101;
+localparam CMD_WRITE           = 3'b100;
+localparam CMD_BURST_TERMINATE = 3'b110;
+localparam CMD_PRECHARGE       = 3'b010;
+localparam CMD_AUTO_REFRESH    = 3'b001;
+localparam CMD_LOAD_MODE       = 3'b000;
 
 localparam MODE_NORMAL = 2'b00;
 localparam MODE_RESET  = 2'b01;
 localparam MODE_LDM    = 2'b10;
 localparam MODE_PRE    = 2'b11;
 
-// initialization 
+// initialization
 reg [1:0] mode;
 reg [4:0] reset=5'h1f;
 always @(posedge clk) begin
@@ -205,42 +161,166 @@ always @(posedge clk) begin
 	end
 end
 
-localparam CMD_NOP             = 3'b111;
-localparam CMD_ACTIVE          = 3'b011;
-localparam CMD_READ            = 3'b101;
-localparam CMD_WRITE           = 3'b100;
-localparam CMD_BURST_TERMINATE = 3'b110;
-localparam CMD_PRECHARGE       = 3'b010;
-localparam CMD_AUTO_REFRESH    = 3'b001;
-localparam CMD_LOAD_MODE       = 3'b000;
+// access manager + command generator (single engine)
+task do_cas(input [1:0] tba, input [22:1] ta, input [15:0] tdin, input twe, input [1:0] tdqm);
+begin
+	{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= twe ? CMD_WRITE : CMD_READ;
+	if (twe) SDRAM_DQ <= tdin;
+	SDRAM_BA <= tba;
+	SDRAM_A  <= {tdqm, 2'b00, ta[22:14]};
+	dly <= DLY_CL;
+	fsm <= FSM_CAS;
+end
+endtask
 
-// SDRAM state machines
+task do_act(input [1:0] tba, input [22:1] ta);
+begin
+	{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_ACTIVE;
+	SDRAM_BA <= tba;
+	SDRAM_A  <= ta[13:1];
+	open_row[tba] <= ta[13:1];
+	row_open[tba] <= 1'b1;
+	dly <= DLY_RCD;
+	fsm <= FSM_ACT;
+end
+endtask
+
+task do_pre(input [1:0] tba);
+begin
+	{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_PRECHARGE;
+	SDRAM_BA <= tba;
+	SDRAM_A  <= 13'b0000000000000;
+	dly <= DLY_RP;
+	fsm <= FSM_PRE;
+end
+endtask
+
+task grant(input [2:0] idx, input [24:1] taddr, input [15:0] tdin, input twr, input [1:0] tmask);
+	reg [1:0] gdqm;
+begin
+	{ba, a} <= taddr;
+	data <= tdin;
+	we   <= twr;
+	gdqm = twr ? ~tmask : 2'b00;
+	dqm  <= gdqm;
+	ram_req <= idx;
+	if (row_open[taddr[24:23]] && open_row[taddr[24:23]] == taddr[13:1])
+		do_cas(taddr[24:23], taddr[22:1], tdin, twr, gdqm);
+	else if (row_open[taddr[24:23]])
+		do_pre(taddr[24:23]);
+	else
+		do_act(taddr[24:23], taddr[22:1]);
+end
+endtask
+
 always @(posedge clk) begin
-	if(state == STATE_START) SDRAM_BA <= (mode == MODE_NORMAL) ? ba : 2'b00;
+	reg [9:0] rfs_timer = 0;
+	reg [2:0] old_rd, old_wr;
+
+	old_rd <= old_rd & rd;
+	old_wr <= old_wr & wr;
+
+	if(rfs_timer) rfs_timer <= rfs_timer - 1'd1;
 
 	SDRAM_DQ <= 'Z;
-	casex({active,we,mode,state})
-		{2'bXX, MODE_NORMAL, STATE_START}: {SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= active ? CMD_ACTIVE : CMD_AUTO_REFRESH;
-		{2'b11, MODE_NORMAL, STATE_CONT }: {SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE, SDRAM_DQ} <= {CMD_WRITE, data};
-		{2'b10, MODE_NORMAL, STATE_CONT }: {SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_READ;
+	{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_NOP;
 
-		// init
-		{2'bXX,    MODE_LDM, STATE_START}: {SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_LOAD_MODE;
-		{2'bXX,    MODE_PRE, STATE_START}: {SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_PRECHARGE;
-
-		                          default: {SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_NOP;
-	endcase
-
-	if(mode == MODE_NORMAL) begin
-		casex(state)
-			STATE_START: SDRAM_A <= a[13:1];
-			STATE_CONT:  SDRAM_A <= {dqm, 2'b10, a[22:14]};
-		endcase;
+	if (mode != MODE_NORMAL) begin
+		// init sequencer (original command pattern)
+		state <= state + 1'd1;
+		if(state == STATE_LAST) state <= STATE_IDLE;
+		row_open <= 0;
+		fsm <= FSM_IDLE;
+		ram_req <= 0;
+		if (state == STATE_START) begin
+			SDRAM_BA <= 2'b00;
+			if (mode == MODE_LDM) begin
+				{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_LOAD_MODE;
+				SDRAM_A <= MODE;
+			end
+			else if (mode == MODE_PRE) begin
+				{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_PRECHARGE;
+				SDRAM_A <= 13'b0010000000000;
+			end
+			else begin
+				{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_AUTO_REFRESH;
+				SDRAM_A <= 0;
+			end
+		end
+		else SDRAM_A <= 0;
 	end
-	else if(mode == MODE_LDM && state == STATE_START) SDRAM_A <= MODE;
-	else if(mode == MODE_PRE && state == STATE_START) SDRAM_A <= 13'b0010000000000;
-	else SDRAM_A <= 0;
+	else begin
+		state <= STATE_IDLE;
+		case (fsm)
+		FSM_IDLE: begin
+			if (!rfs_timer) begin
+				rfs_timer <= RFS_CNT;
+				if (|row_open) begin
+					{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_PRECHARGE;
+					SDRAM_A <= 13'b0010000000000; // A10 = all banks
+					row_open <= 0;
+					dly <= DLY_RP;
+					fsm <= FSM_PALL;
+				end
+				else begin
+					{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_AUTO_REFRESH;
+					dly <= DLY_REF;
+					fsm <= FSM_REF;
+				end
+			end
+			else if ((~old_rd[0] && rd[0]) || (~old_wr[0] && wr[0])) begin
+				old_rd[0] <= rd[0];
+				old_wr[0] <= wr[0];
+				grant(3'b001, addr0, din0, wr[0], {wrh0,wrl0});
+			end
+			else if ((~old_rd[1] && rd[1]) || (~old_wr[1] && wr[1])) begin
+				old_rd[1] <= rd[1];
+				old_wr[1] <= wr[1];
+				grant(3'b010, addr1, din1, wr[1], {wrh1,wrl1});
+			end
+			else if ((~old_rd[2] && rd[2]) || (~old_wr[2] && wr[2])) begin
+				old_rd[2] <= rd[2];
+				old_wr[2] <= wr[2];
+				grant(3'b100, addr2, din2, wr[2], {wrh2,wrl2});
+			end
+		end
+
+		FSM_PRE:
+			if (dly) dly <= dly - 1'd1;
+			else do_act(ba, a);
+
+		FSM_ACT:
+			if (dly) dly <= dly - 1'd1;
+			else do_cas(ba, a, data, we, dqm);
+
+		FSM_CAS:
+			if (dly) dly <= dly - 1'd1;
+			else begin
+				if(ram_req[0]) dout0_r <= SDRAM_DQ;
+				if(ram_req[1]) dout1_r <= SDRAM_DQ;
+				if(ram_req[2]) dout2_r <= SDRAM_DQ;
+				ram_req <= 0;
+				fsm <= FSM_IDLE;
+			end
+
+		FSM_PALL:
+			if (dly) dly <= dly - 1'd1;
+			else begin
+				{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_AUTO_REFRESH;
+				dly <= DLY_REF;
+				fsm <= FSM_REF;
+			end
+
+		FSM_REF:
+			if (dly) dly <= dly - 1'd1;
+			else fsm <= FSM_IDLE;
+		endcase
+	end
 end
+
+assign busy0 = ram_req[0];
+assign busy1 = ram_req[1];
+assign busy2 = ram_req[2];
 
 altddio_out
 #(

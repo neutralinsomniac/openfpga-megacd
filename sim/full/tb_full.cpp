@@ -65,6 +65,10 @@ int main(int argc,char**argv){
                                      (c>=1220000000 && c<1280000000) ||
                                      (c>=1390000000 && c<1450000000);
                     static long fevery = getenv("FRAME_EVERY")?atol(getenv("FRAME_EVERY")):100;
+                    static long fw0=-1, fw1=-1;
+                    { static bool fwi=false; if(!fwi){ fwi=true; const char* e=getenv("FRAMEWIN");
+                      if(e) sscanf(e,"%ld,%ld",&fw0,&fw1); } }
+                    if(fw0>=0 && c>=fw0 && c<fw1) press_win = true;
                     if(frame>0 && maxx>0 && ((frame%fevery)==0 || press_win)){
                         char fn[64]; snprintf(fn,sizeof fn,"frames/f%05ld.ppm",frame);
                         FILE*fp=fopen(fn,"wb");
@@ -220,6 +224,45 @@ int main(int argc,char**argv){
                                   r->core_top__DOT__gen__DOT__vdp__DOT__dma_copy);
         static long slot_edges=0; static int se_prev=0;
         { int se=r->core_top__DOT__gen__DOT__vdp__DOT__slot_en; if(se&&!se_prev)slot_edges++; se_prev=se; }
+        static long wr_acc=0, prg_acc=0;
+        { static int w_prev=0, p_prev=0;
+          int w = r->core_top__DOT__WR0_RD | r->core_top__DOT__WR0_WR |
+                  r->core_top__DOT__WR1_RD | r->core_top__DOT__WR1_WR;
+          int p = !r->core_top__DOT__MCD_PRG_OE_N;
+          if(w && !w_prev) wr_acc++;
+          if(p && !p_prev) prg_acc++;
+          w_prev=w; p_prev=p; }
+        if((c%2000000)==0 && c){ printf("TRAF [%ld] wram_acc=%ld prg_rd=%ld\n",c,wr_acc,prg_acc); wr_acc=0; prg_acc=0; }
+        // WR0 request lifecycle: req rise -> grant (RDY fall) -> done (RDY
+        // rise) -> req fall -> next req rise
+        { static int rq_p=0, rdy_p=1; static long t_rise=0, t_grant=0, t_done=0, t_fall=0;
+          static long s_wait=0, s_serv=0, s_drop=0, s_gap=0, n_cyc=0;
+          int rq = r->core_top__DOT__WR0_RD | r->core_top__DOT__WR0_WR;
+          int rdy = r->core_top__DOT__WR0_RDY;
+          if(rq && !rq_p){ if(t_fall) s_gap += c-t_fall; t_rise=c; }
+          if(!rdy && rdy_p && rq){ t_grant=c; s_wait += c-t_rise; }
+          if(rdy && !rdy_p && rq){ t_done=c; s_serv += c-t_grant; }
+          if(!rq && rq_p){ t_fall=c; s_drop += c-t_done; n_cyc++; }
+          rq_p=rq; rdy_p=rdy;
+          static int prq_p=0, pb_p=0; static long p_rise=0, p_busy=0, p_fall=0;
+          static long p_wait=0, p_serv=0, p_gap=0, p_n=0;
+          int prq = !r->core_top__DOT__MCD_PRG_OE_N;
+          int pb  = r->core_top__DOT__dbg_prg_busy;
+          if(prq && !prq_p){ if(p_fall) p_gap += c-p_fall; p_rise=c; }
+          if(pb && !pb_p && prq){ p_busy=c; p_wait += c-p_rise; }
+          if(!pb && pb_p && prq){ p_serv += c-p_busy; }
+          if(!prq && prq_p){ p_fall=c; p_n++; }
+          prq_p=prq; pb_p=pb;
+          if((c%2000000)==0 && c && p_n){
+            printf("PLIFE [%ld] n=%ld wait=%.1f serv=%.1f gap=%.1f\n",
+                   c, p_n, (double)p_wait/p_n, (double)p_serv/p_n, (double)p_gap/p_n);
+            p_wait=p_serv=p_gap=0; p_n=0; }
+          if((c%2000000)==0 && c && n_cyc){
+            printf("LIFE [%ld] n=%ld wait=%.1f serv=%.1f drop=%.1f gap=%.1f (iters)\n",
+                   c, n_cyc, (double)s_wait/n_cyc, (double)s_serv/n_cyc,
+                   (double)s_drop/n_cyc, (double)s_gap/n_cyc);
+            s_wait=s_serv=s_drop=s_gap=0; n_cyc=0; }
+        }
         static long fe_edges=0; static int fe_prev=0;
         { int fe=r->core_top__DOT__gen__DOT__vdp__DOT__fifo_en; if(fe&&!fe_prev)fe_edges++; fe_prev=fe; }
         if((c%2000000)==0){
