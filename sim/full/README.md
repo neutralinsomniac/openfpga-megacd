@@ -230,3 +230,19 @@ handshake + arbiter protocol cycles (CE-grid quantization stacks);
 sequential blit pattern is ideal for the open row. Color swirl is
 likely sub-rendered and may already be fixed by 501750f — hardware
 test pending.
+
+## Animation slowness ROOT CAUSE (2026-07-21, measured)
+mstate histogram during the animation: main bus time = ~1/3 IDLE, ~1/3
+MBUS_FINISH, ~1/3 MBUS_ROM_READ — no VDP stalls, no VBUS DMA, no bank
+swaps (RET/DMNA never toggle in the intro). ROM reads through the MCD
+window cost ~43 clk_sys (~10 CPU wait cycles) each vs ~2-4 real; the
+main both EXECUTES from and BLITS from that window -> main at ~25%
+throughput -> both intro animations at ~1/3 render rate with correct
+real-time pacing. Open-row SDRAM (501750f) did not change this: the
+cost is stacked handshakes (gen MBUS_ROM_READ exp_dtack_armed guard =
+full extra round-trip; ASIC ROM machine RDY waits; p1 front-end grant/
+hold; SDRAM ~4).
+FIXES: (1) cheap — retire/reduce exp_dtack_armed (its stale-DTACK
+motivation predates the per-user private RDYs) + 1-2 cycle handshake
+trims; (2) decisive — BIOS ROM (128KB) into FPGA BRAM (feasibility
+note: ~128 M10K reclaimable = fits), 1-cycle ROM window.

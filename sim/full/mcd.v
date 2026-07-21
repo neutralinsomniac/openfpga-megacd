@@ -3327,8 +3327,8 @@ module asic_Brtl(clk, rst_n, enable, s68k_a, s68k_di, s68k_as_n, s68k_rnw, s68k_
   wire dma_run;
   wire dma_word_ram_sel;
   wire [15:0] dmaa;
-  wire dmna0;
-  wire dmna1;
+  wire dmna0 /* verilator public_flat_rd */;
+  wire dmna1 /* verilator public_flat_rd */;
   wire [2:0] dot;
   wire [2:0] ds;
   wire dsr;
@@ -3403,8 +3403,8 @@ module asic_Brtl(clk, rst_n, enable, s68k_a, s68k_di, s68k_as_n, s68k_rnw, s68k_
   wire [3:0] prms;
   wire [3:0] prss;
   wire res0;
-  wire ret0;
-  wire ret1;
+  wire ret0 /* verilator public_flat_rd */;
+  wire ret1 /* verilator public_flat_rd */;
   wire rfs_prgram_dtack_n;
   wire [1:0] roms;
   wire rpt;

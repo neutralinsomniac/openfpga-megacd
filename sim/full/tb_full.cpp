@@ -253,6 +253,35 @@ int main(int argc,char**argv){
           if(!pb && pb_p && prq){ p_serv += c-p_busy; }
           if(!prq && prq_p){ p_fall=c; p_n++; }
           prq_p=prq; pb_p=pb;
+          static int vb_p=0; static long vb_start=0, vb_sum=0, vb_n=0, vb_max=0;
+          { int vb = r->core_top__DOT__gen__DOT__vdp__DOT__dma_vbus;
+            if(vb && !vb_p) vb_start=c;
+            if(!vb && vb_p){ long d=c-vb_start; vb_sum+=d; vb_n++; if(d>vb_max)vb_max=d; }
+            vb_p=vb; }
+          static int g1_p=0; static long g1_rise=0, g1_serv=0, g1_gap=0, g1_fall=0, g1_n=0;
+          { int g1 = r->core_top__DOT__p1_act;
+            if(g1 && !g1_p){ if(g1_fall) g1_gap += c-g1_fall; g1_rise=c; }
+            if(!g1 && g1_p){ g1_fall=c; g1_serv += c-g1_rise; g1_n++; }
+            g1_p=g1; }
+          if((c%2000000)==0 && c){
+            if(vb_n) printf("VBUS [%ld] n=%ld avg=%.0f max=%ld\n",c,vb_n,(double)vb_sum/vb_n,vb_max);
+            if(g1_n) printf("P1 [%ld] n=%ld serv=%.1f gap=%.1f\n",c,g1_n,(double)g1_serv/g1_n,(double)g1_gap/g1_n);
+            vb_sum=0; vb_n=0; vb_max=0; g1_serv=0; g1_gap=0; g1_n=0; }
+          static int r0_p=0,r1_p=0,d0_p=0,d1_p=0; static long swp[4]={0,0,0,0};
+          { int r0=r->core_top__DOT__MCD__DOT__asic__DOT__ret0, r1=r->core_top__DOT__MCD__DOT__asic__DOT__ret1;
+            int d0=r->core_top__DOT__MCD__DOT__asic__DOT__dmna0, d1=r->core_top__DOT__MCD__DOT__asic__DOT__dmna1;
+            if(r0!=r0_p) swp[0]++; if(r1!=r1_p) swp[1]++;
+            if(d0!=d0_p) swp[2]++; if(d1!=d1_p) swp[3]++;
+            r0_p=r0; r1_p=r1; d0_p=d0; d1_p=d1; }
+          if((c%2000000)==0 && c){
+            printf("SWAP [%ld] ret0=%ld ret1=%ld dmna0=%ld dmna1=%ld\n",c,swp[0],swp[1],swp[2],swp[3]);
+            swp[0]=swp[1]=swp[2]=swp[3]=0; }
+          static long mshist[16]={0};
+          mshist[r->core_top__DOT__gen__DOT__mstate & 15]++;
+          if((c%2000000)==0 && c){
+            printf("MST [%ld]",c);
+            for(int i=0;i<16;i++){ if(mshist[i]) printf(" %d:%ld",i,mshist[i]); mshist[i]=0; }
+            printf("\n"); }
           if((c%2000000)==0 && c && p_n){
             printf("PLIFE [%ld] n=%ld wait=%.1f serv=%.1f gap=%.1f\n",
                    c, p_n, (double)p_wait/p_n, (double)p_serv/p_n, (double)p_gap/p_n);
