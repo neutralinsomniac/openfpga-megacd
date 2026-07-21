@@ -1009,13 +1009,12 @@ always @(posedge clk_sys) begin
 	end else begin
 		case (bc_st)
 		3'd0: if (brom_acc & ~brom_hold) begin
+			// grant + lookup in one cycle: the RAM read is issued with the
+			// live bus address, hit/miss decided next cycle (2-cycle hits)
 			brom_busy <= 1;
 			bc_addr   <= GEN_VA[16:1];
-			bc_st     <= BC_LOOKUP;
-		end
-		BC_LOOKUP: begin
-			bc_q  <= bios_cache[GEN_VA[14:1]];
-			bc_st <= BC_CHECK;
+			bc_q      <= bios_cache[GEN_VA[14:1]];
+			bc_st     <= BC_CHECK;
 		end
 		BC_CHECK: begin
 			if (bc_q[18] && bc_q[17:16] == bc_addr[15:14]) begin
