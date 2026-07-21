@@ -38,6 +38,9 @@ reg  [3:0] drv_status = STAT_STOP;
 reg  [3:0] n0, n1, n2, n3, n4, n5, n6, n7, n8;
 wire [3:0] csum = ~(n0 + n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8) & 4'hF;
 
+reg        door = 0;
+reg        cycled = 0;
+reg  [9:0] quiet = 0;
 reg [25:0] wdog = 0;
 reg        send_d = 0;
 reg  [3:0] rec_cnt = 0;
@@ -59,24 +62,42 @@ always @(posedge clk) begin
         send_d   <= 0;
         ms_tick  <= 0;
         latency  <= 4'd10;
+        door     <= 0;
+        cycled   <= 0;
+        quiet    <= 0;
     end else begin
         send_d <= cdd_send;
         wdog   <= wdog + 1'b1;
 
-        // STOP/OPEN/TRAY drain to NO_DISC after the latency ticks run out
-        // (megacdd.cpp Update() semantics — the door-open report is a
-        // transient reply, not a resting state).
-        if (drv_status == STAT_STOP || drv_status == STAT_OPEN) begin
-            if (ms_tick == TICK_13MS) begin
-                ms_tick <= 0;
+        // Door model: boot-time disc check runs with the lid closed (CLOSE
+        // TRAY -> NO_DISC drains, the proven-clean boot). The BIOS's only
+        // interactive empty-drive state is DOOR OPEN (its disc-type resolver
+        // $6384 fires solely on CDD status 5 -> code-4/\$FF response ->
+        // main \$FDDC != 0 -> player-screen cursor enabled). The Pocket has
+        // no physical lid, so ~4s after the drive goes command-quiet we
+        // emulate the user opening it.
+        if (ms_tick == TICK_13MS) begin
+            ms_tick <= 0;
+            if (drv_status == STAT_STOP) begin
                 if (latency != 0) latency <= latency - 1'b1;
-                else drv_status <= STAT_NO_DISC;
-            end else begin
-                ms_tick <= ms_tick + 1'b1;
+                else drv_status <= door ? STAT_OPEN : STAT_NO_DISC;
             end
+            if (quiet != 10'd525) quiet <= quiet + 1'b1;
+            if (quiet == 10'd300 && !door && !cycled) begin
+                door <= 1;
+                drv_status <= STAT_OPEN;
+            end
+            if (quiet == 10'd525 && door && !cycled) begin
+                door   <= 0;
+                cycled <= 1;
+                drv_status <= STAT_NO_DISC;
+            end
+        end else begin
+            ms_tick <= ms_tick + 1'b1;
         end
 
         if (cdd_send & ~send_d) begin
+            if (cdd_comm[3:0] != 4'h0) quiet <= 0;
             case (cdd_comm[3:0])
                 // Exact megacdd.cpp reply semantics: the kernel keys on each
                 // command's IMMEDIATE reply nibble; internal state drains to
@@ -100,11 +121,13 @@ always @(posedge clk) begin
                 // "operation in progress" ($40xx oscillating), and the UI
                 // (correctly) ignores all input = the dead-cursor bug.
                 4'hD: begin                   // OPEN TRAY: reply OPEN
+                    door <= 1;
                     drv_status <= STAT_OPEN;
                     latency <= 4'd0;
                     n0 <= STAT_OPEN; n1 <= 0; zeros;
                 end
-                4'hC: begin                   // CLOSE TRAY: reply STOP, no disc
+                4'hC: begin                   // CLOSE TRAY: closed, no disc
+                    door <= 0;
                     drv_status <= STAT_NO_DISC;
                     latency <= 4'd0;
                     n0 <= STAT_STOP; n1 <= 0; zeros;

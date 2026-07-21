@@ -45,6 +45,7 @@ int main(int argc,char**argv){
             if(c>=750000000 && c<775000000) k |= 1u<<15;   // START (title up ~frame 200)
             if(c>=1150000000 && c<1165000000) k |= 1u<<3;  // RIGHT on player screen
             if(c>=1230000000 && c<1245000000) k |= 1u<<1;  // DOWN too
+            if(c>=1400000000 && c<1415000000) k |= 1u<<3;  // RIGHT (post-auto-open)
             dut->cont1_key = k;
         }
         dut->eval(); t++;
@@ -61,7 +62,8 @@ int main(int argc,char**argv){
                 int hb=dut->rootp->core_top__DOT__hblank;
                 if(vb && !vb_prev){
                     bool press_win = (c>=1140000000 && c<1200000000) ||
-                                     (c>=1220000000 && c<1280000000);
+                                     (c>=1220000000 && c<1280000000) ||
+                                     (c>=1390000000 && c<1450000000);
                     static long fevery = getenv("FRAME_EVERY")?atol(getenv("FRAME_EVERY")):100;
                     if(frame>0 && maxx>0 && ((frame%fevery)==0 || press_win)){
                         char fn[64]; snprintf(fn,sizeof fn,"frames/f%05ld.ppm",frame);
@@ -110,6 +112,20 @@ int main(int argc,char**argv){
         if(vbl && !vbl_prev) vbl_cnt++;
         vint_prev=vint; cepix_prev=cepix; vbl_prev=vbl;
         if(mpc==last) stuck++; else { stuck=0; last=mpc; }
+        { static bool gw_on = getenv("GATEWATCH")!=nullptr;
+          static uint32_t gw_prev=0;
+          if(gw_on && mpc!=gw_prev && c>1140000000 && c<1160000000){
+            switch(mpc){
+              case 0x32DC: case 0x32EE: case 0x32F8: case 0x3300: case 0x3306:
+              case 0x331A: case 0x331E: case 0x3342: case 0x3448: case 0x3470:
+              case 0x3654: case 0x3710: case 0x3A46: case 0x3A40: case 0x3ABC:
+              case 0x3AE4: case 0x34DA: case 0x34A2: case 0x4054: case 0x3BD8:
+              case 0x35CA: case 0x34F2:
+                printf("GW %ld pc=%04X\n", c, mpc); break;
+              default: break;
+            }
+            gw_prev=mpc;
+          } }
         { static int sd_prev=0; static unsigned long long lastcomm=~0ULL;
           int sd_now = r->core_top__DOT__cdd_send;
           if(sd_now && !sd_prev){
@@ -184,8 +200,16 @@ int main(int argc,char**argv){
             unsigned pad = r->core_top__DOT__sdram__DOT__mem[0x407F10];
             unsigned s44 = r->core_top__DOT__sdram__DOT__mem[0x8041C0];
             unsigned s58 = r->core_top__DOT__sdram__DOT__mem[0x8041CA];
-            printf("SS %ld m=%06X s=%06X mode=%04X ab=%02X busy=%02X six=%02X pad=%04X st44=%04X st58=%02X\n",
-                   c, mpc, spc, mw, (ab>>8)&0xFF, ab&0xFF, (sx>>8)&0xFF, pad, s44, (s58>>8)&0xFF);
+            unsigned d008 = r->core_top__DOT__sdram__DOT__mem[0x406804];
+            unsigned d060 = r->core_top__DOT__sdram__DOT__mem[0x406830];
+            unsigned d002 = r->core_top__DOT__sdram__DOT__mem[0x406801];
+            unsigned d024 = r->core_top__DOT__sdram__DOT__mem[0x406812];
+            unsigned fddc = r->core_top__DOT__sdram__DOT__mem[0x407EEE];
+            unsigned fdf0 = r->core_top__DOT__sdram__DOT__mem[0x407EF8];
+            unsigned fdf2 = r->core_top__DOT__sdram__DOT__mem[0x407EF9];
+            printf("SS %ld m=%06X s=%06X mode=%04X pad=%04X st44=%04X st58=%02X D008=%02X sub24=%04X FDDC=%02X FDF0=%04X FDF2=%04X\n",
+                   c, mpc, spc, mw, pad, s44, (s58>>8)&0xFF,
+                   (d008>>8)&0xFF, d024, (fddc>>8)&0xFF, fdf0, fdf2);
           } }
 #endif
         if((c%2000000)==0) printf("[%ld] main=%06X sub=%06X VINT=%ld VBL=%ld  in_dma=%d fill=%d vbus=%d copy=%d\n",

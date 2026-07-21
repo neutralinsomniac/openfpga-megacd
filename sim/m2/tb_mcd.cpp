@@ -47,12 +47,15 @@ static void wrw(std::vector<uint8_t>& m, uint32_t byte, uint16_t v, bool hi, boo
 struct Cdd {
     int status = 0;          // 0=STOP
     int latency = 10;
+    int door = 0;            // 1 = lid open (empty drive's interactive state)
+    int quiet = 0;           // 75Hz ticks since last non-poll command
+    int cycled = 0;          // one auto open/close cycle only
     uint8_t n[9] = {0};
     int beat = 0;
     bool rec = false; int reccnt = 0;
     int ms = 0;
     int lastN1 = 0;
-    void reset() { status=0; latency=10; memset(n,0,9); n[0]=0; beat=0; rec=false; reccnt=0; ms=0; }
+    void reset() { status=0; latency=10; door=0; quiet=0; cycled=0; memset(n,0,9); n[0]=0; beat=0; rec=false; reccnt=0; ms=0; }
     uint64_t pack() {
         int cs = (~(n[0]+n[1]+n[2]+n[3]+n[4]+n[5]+n[6]+n[7]+n[8])) & 0xF;
         uint64_t s=0; for(int i=0;i<9;i++) s |= (uint64_t)(n[i]&0xF) << (i*4);
@@ -67,10 +70,15 @@ struct Cdd {
         // Exact megacdd.cpp (MiSTer) no-disc reply semantics: the kernel
         // keys on each command's IMMEDIATE reply nibble; the internal state
         // then drains STOP/OPEN -> NO_DISC on later 75Hz ticks.
-        if (c0==1) { status=0x0; n[0]=0x0; memset(n+1,0,8); }              // STOP: reply STOP
+        // Empty Pocket drive = "lid open, waiting for a disc": the BIOS
+        // disc-type resolver ($6384) only resolves the no-disc interactive
+        // state from CDD status 5 (DOOR OPEN); resting at NO_DISC(B) leaves
+        // the disc type unresolved and the UI cursor disabled ($FDDC==0).
+        if (c0!=0) quiet=0;
+        if (c0==1) { status=0x0; n[0]=0x0; memset(n+1,0,8); }              // STOP: reply STOP, drains per door
         else if (c0==2) { n[0]=status; n[1]=fmt; memset(n+2,0,7); }        // ReadTOC: no data
-        else if (c0==0xD) { status=0x5; n[0]=0x5; memset(n+1,0,8); }       // OPEN TRAY: reply OPEN
-        else if (c0==0xC) { status=0xB; n[0]=0x0; memset(n+1,0,8); }       // CLOSE TRAY: reply STOP, no disc
+        else if (c0==0xD) { door=1; status=0x5; n[0]=0x5; memset(n+1,0,8); } // OPEN TRAY
+        else if (c0==0xC) { door=0; status=0xB; n[0]=0x0; memset(n+1,0,8); } // CLOSE TRAY: closed, no disc
         else { n[0]=status; }
     }
 };
@@ -235,8 +243,17 @@ int main(int argc, char** argv) {
         // ---- CDD exchange (75Hz beat modeled at ~clk/715909) ----
         if(!dut->MCD_RST_N) cdd.reset();
         // drain STOP->NO_DISC
-        if(cdd.status==0 || cdd.status==0x5 || cdd.status==0xE){
-            if(++cdd.ms>=698010){cdd.ms=0; if(cdd.latency)cdd.latency--; else cdd.status=0xB;} }
+        if(++cdd.ms>=698010){ cdd.ms=0;
+            if(cdd.status==0 || cdd.status==0xE){
+                if(cdd.latency)cdd.latency--; else cdd.status=cdd.door?0x5:0xB; }
+            // no lid on the Pocket: emulate the user opening it ~4s after
+            // the drive goes quiet post-boot (resolves the disc type to $FF
+            // via the BIOS $6384 door-open path), then closing it empty ~3s
+            // later (status back to the closed family so the $1856 gate
+            // reopens) — one cycle only
+            ++cdd.quiet;
+            if(cdd.quiet==300 && !cdd.door && !cdd.cycled){ cdd.door=1; cdd.status=0x5; }
+            if(cdd.quiet==525 && cdd.door && !cdd.cycled){ cdd.door=0; cdd.status=0xB; cdd.cycled=1; } }
         static int sd=0;
         if(dut->CDD_SEND && !sd){
             static uint64_t lastcomm=~0ULL; uint64_t cm=(uint64_t)dut->CDD_COMM;
@@ -286,9 +303,9 @@ int main(int argc, char** argv) {
         else { idlepc=0; last_pc=pc; }
 
         if (c>4000000 && (c%200000)==0)
-            printf("ST [%ld] mode=%04X abort=%02X busy=%02X six=%02X st44=%02X%02X st58=%02X pc=%06X\n",
+            printf("ST [%ld] mode=%04X abort=%02X busy=%02X six=%02X st44=%02X%02X st58=%02X t42=%02X pc=%06X\n",
                    c,(prg[0x833C]<<8)|prg[0x833D],prg[0x833E],prg[0x833F],prg[0x8342],
-                   prg[0x8380],prg[0x8381],prg[0x8394],pc);
+                   prg[0x8380],prg[0x8381],prg[0x8394],prg[0x837E],pc);
         if ((c % 500000)==0)
             printf("[%ld] pc=%06X ipl=%X pend=%02X ack=%02X gron=%d cdd_st=%X iters=%ld qchk=%ld\n",
                    c, pc, dut->DBG_S68K_IPL_N, dut->DBG_INT_PEND, dut->DBG_INT_ACK,
