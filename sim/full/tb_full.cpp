@@ -43,8 +43,8 @@ int main(int argc,char**argv){
         {
             uint16_t k=0;
             if(c>=750000000 && c<775000000) k |= 1u<<15;   // START (title up ~frame 200)
-            if(c>=800000000 && c<815000000) k |= 1u<<3;    // RIGHT on player screen
-            if(c>=830000000 && c<845000000) k |= 1u<<1;    // DOWN too
+            if(c>=1150000000 && c<1165000000) k |= 1u<<3;  // RIGHT on player screen
+            if(c>=1230000000 && c<1245000000) k |= 1u<<1;  // DOWN too
             dut->cont1_key = k;
         }
         dut->eval(); t++;
@@ -60,9 +60,8 @@ int main(int argc,char**argv){
                 int vb=dut->rootp->core_top__DOT__vblank_sys;
                 int hb=dut->rootp->core_top__DOT__hblank;
                 if(vb && !vb_prev){
-                    bool press_win = (c>=750000000 && c<830000000) ||
-                                     (c>=1300000000 && c<1360000000) ||
-                                     (c>=1600000000 && c<1660000000);
+                    bool press_win = (c>=1140000000 && c<1200000000) ||
+                                     (c>=1220000000 && c<1280000000);
                     static long fevery = getenv("FRAME_EVERY")?atol(getenv("FRAME_EVERY")):100;
                     if(frame>0 && maxx>0 && ((frame%fevery)==0 || press_win)){
                         char fn[64]; snprintf(fn,sizeof fn,"frames/f%05ld.ppm",frame);
@@ -111,6 +110,13 @@ int main(int argc,char**argv){
         if(vbl && !vbl_prev) vbl_cnt++;
         vint_prev=vint; cepix_prev=cepix; vbl_prev=vbl;
         if(mpc==last) stuck++; else { stuck=0; last=mpc; }
+        { static int sd_prev=0; static unsigned long long lastcomm=~0ULL;
+          int sd_now = r->core_top__DOT__cdd_send;
+          if(sd_now && !sd_prev){
+            unsigned long long cm = r->core_top__DOT__cdd_comm;
+            if(cm!=lastcomm){ printf("CDDCMD [%ld] %010llX\n", c, cm); lastcomm=cm; }
+          }
+          sd_prev=sd_now; }
         static long padvar_rd=0, padport_rd=0;
         { static uint32_t pv=0; if(mpc!=pv){ if(mpc==0xFFFE20||mpc==0xFFFE21) padvar_rd++;
           if(mpc==0xA10003) padport_rd++; pv=mpc; } }
@@ -176,8 +182,10 @@ int main(int argc,char**argv){
             unsigned ab = r->core_top__DOT__sdram__DOT__mem[0x80419F];
             unsigned sx = r->core_top__DOT__sdram__DOT__mem[0x8041A1];
             unsigned pad = r->core_top__DOT__sdram__DOT__mem[0x407F10];
-            printf("SS %ld m=%06X s=%06X mode=%04X ab=%02X busy=%02X six=%02X pad=%04X\n",
-                   c, mpc, spc, mw, (ab>>8)&0xFF, ab&0xFF, (sx>>8)&0xFF, pad);
+            unsigned s44 = r->core_top__DOT__sdram__DOT__mem[0x8041C0];
+            unsigned s58 = r->core_top__DOT__sdram__DOT__mem[0x8041CA];
+            printf("SS %ld m=%06X s=%06X mode=%04X ab=%02X busy=%02X six=%02X pad=%04X st44=%04X st58=%02X\n",
+                   c, mpc, spc, mw, (ab>>8)&0xFF, ab&0xFF, (sx>>8)&0xFF, pad, s44, (s58>>8)&0xFF);
           } }
 #endif
         if((c%2000000)==0) printf("[%ld] main=%06X sub=%06X VINT=%ld VBL=%ld  in_dma=%d fill=%d vbus=%d copy=%d\n",

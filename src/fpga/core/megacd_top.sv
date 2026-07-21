@@ -1869,8 +1869,8 @@ always @(posedge clk_sys) begin
 end
 
 // CDD drive stub (M1): "no disc" responder; the real drive MPU lands in M2
-wire [39:0] cdd_stat, cdd_comm;
-wire        cdd_send, cdd_rec, cdd_dm;
+wire [39:0] cdd_stat, cdd_comm /* verilator public_flat_rd */;
+wire        cdd_send /* verilator public_flat_rd */, cdd_rec, cdd_dm;
 megacd_cdd_stub cdd_stub
 (
 	.clk(clk_sys),

@@ -64,12 +64,13 @@ struct Cdd {
     // command play (mode 8) -> the $7302 subcode-wait freeze.
     void command(uint64_t comm) {
         int c0 = comm & 0xF, fmt = (comm>>12)&0xF;
-        // While the door is open the drive reports OPEN(5) to everything
-        // except CLOSE TRAY — a STOP must not fake a "closed, no disc".
-        if (c0==1) { latency=0; if(status!=0x5) status=0xB; n[0]=status; memset(n+1,0,8); } // STOP
+        // Exact megacdd.cpp (MiSTer) no-disc reply semantics: the kernel
+        // keys on each command's IMMEDIATE reply nibble; the internal state
+        // then drains STOP/OPEN -> NO_DISC on later 75Hz ticks.
+        if (c0==1) { status=0x0; n[0]=0x0; memset(n+1,0,8); }              // STOP: reply STOP
         else if (c0==2) { n[0]=status; n[1]=fmt; memset(n+2,0,7); }        // ReadTOC: no data
-        else if (c0==0xD) { latency=0; status=0x5; n[0]=status; memset(n+1,0,8); } // OPEN TRAY -> door open
-        else if (c0==0xC) { latency=0; status=0xB; n[0]=status; memset(n+1,0,8); } // CLOSE TRAY -> still no disc
+        else if (c0==0xD) { status=0x5; n[0]=0x5; memset(n+1,0,8); }       // OPEN TRAY: reply OPEN
+        else if (c0==0xC) { status=0xB; n[0]=0x0; memset(n+1,0,8); }       // CLOSE TRAY: reply STOP, no disc
         else { n[0]=status; }
     }
 };
@@ -234,7 +235,8 @@ int main(int argc, char** argv) {
         // ---- CDD exchange (75Hz beat modeled at ~clk/715909) ----
         if(!dut->MCD_RST_N) cdd.reset();
         // drain STOP->NO_DISC
-        if(cdd.status==0){ if(++cdd.ms>=698010){cdd.ms=0; if(cdd.latency)cdd.latency--; else cdd.status=0xB;} }
+        if(cdd.status==0 || cdd.status==0x5 || cdd.status==0xE){
+            if(++cdd.ms>=698010){cdd.ms=0; if(cdd.latency)cdd.latency--; else cdd.status=0xB;} }
         static int sd=0;
         if(dut->CDD_SEND && !sd){
             static uint64_t lastcomm=~0ULL; uint64_t cm=(uint64_t)dut->CDD_COMM;

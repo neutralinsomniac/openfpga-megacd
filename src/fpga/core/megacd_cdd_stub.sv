@@ -63,9 +63,10 @@ always @(posedge clk) begin
         send_d <= cdd_send;
         wdog   <= wdog + 1'b1;
 
-        // STOP drains to NO_DISC after the spin-up-detect latency and the
-        // status then stays at B for good (no TOC state exists to eject from).
-        if (drv_status == STAT_STOP) begin
+        // STOP/OPEN/TRAY drain to NO_DISC after the latency ticks run out
+        // (megacdd.cpp Update() semantics — the door-open report is a
+        // transient reply, not a resting state).
+        if (drv_status == STAT_STOP || drv_status == STAT_OPEN) begin
             if (ms_tick == TICK_13MS) begin
                 ms_tick <= 0;
                 if (latency != 0) latency <= latency - 1'b1;
@@ -77,14 +78,16 @@ always @(posedge clk) begin
 
         if (cdd_send & ~send_d) begin
             case (cdd_comm[3:0])
-                4'h1: begin                   // STOP: empty drive -> NO_DISC;
-                    // while the door is open the drive stays OPEN(5) — only
-                    // CLOSE TRAY leaves that state (a STOP faking "closed,
-                    // no disc" restarts the kernel's open/stop churn)
-                    if (drv_status != STAT_OPEN) drv_status <= STAT_NO_DISC;
+                // Exact megacdd.cpp reply semantics: the kernel keys on each
+                // command's IMMEDIATE reply nibble; internal state drains to
+                // NO_DISC on later ticks. STOP must reply STOP, not NO_DISC —
+                // an unexpected reply reads as a failed drive op and restarts
+                // the kernel STOP/OPEN churn that gates all player-screen
+                // input ("operation in progress").
+                4'h1: begin                   // STOP: reply STOP
+                    drv_status <= STAT_STOP;
                     latency <= 4'd0;
-                    n0 <= (drv_status == STAT_OPEN) ? STAT_OPEN : STAT_NO_DISC;
-                    n1 <= 0; zeros;
+                    n0 <= STAT_STOP; n1 <= 0; zeros;
                 end
                 4'h2: begin                   // Read TOC: status only, no data
                     n0 <= drv_status;
@@ -96,15 +99,15 @@ always @(posedge clk) begin
                 // retries OPEN/STOP forever, CDBSTAT never settles out of
                 // "operation in progress" ($40xx oscillating), and the UI
                 // (correctly) ignores all input = the dead-cursor bug.
-                4'hD: begin
+                4'hD: begin                   // OPEN TRAY: reply OPEN
                     drv_status <= STAT_OPEN;
                     latency <= 4'd0;
                     n0 <= STAT_OPEN; n1 <= 0; zeros;
                 end
-                4'hC: begin                   // CLOSE TRAY: still no disc
+                4'hC: begin                   // CLOSE TRAY: reply STOP, no disc
                     drv_status <= STAT_NO_DISC;
                     latency <= 4'd0;
-                    n0 <= STAT_NO_DISC; n1 <= 0; zeros;
+                    n0 <= STAT_STOP; n1 <= 0; zeros;
                 end
                 default: begin
                     n0 <= drv_status;
