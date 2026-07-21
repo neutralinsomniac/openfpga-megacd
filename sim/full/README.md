@@ -211,3 +211,22 @@ in when the abort lands. NEXT: substate trace (SUBSTATE=<cycle> env, SS
 lines: main/sub PC + mode/abort/busy/$6) across the transition shows the
 exact order; then decide fix (likely CDD stub behavior, NOT an RTL hack
 around the BIOS protocol).
+
+## Boot-animation performance (2026-07-21, measured)
+Symptom: logo swirl time-locked but rendered ~20fps on HW (~8-frame
+cadence in sim); color swirl actually slow. Profiling (TRAF/LIFE/PLIFE/
+VBUS/P1 tb counters, FRAMEWIN frame diffing):
+- NOT memory bandwidth: post open-row controller (501750f), PRG fetch =
+  0.9 grant + 4.2 service clk_sys (sub CPU ~70-100% ideal), word-RAM
+  service ~9 clk_sys, requester gap ~131 clk_sys (self-paced).
+- NOT VDP VBUS DMA: zero vbus activity during the animations.
+- The renders are MAIN-CPU programmed-IO blits (move.w (a0)+,$C00000
+  loops at $2340): ~131 clk_sys/word = ~84 instruction + ~47 wait
+  states on the main's word-RAM reads (EXT -> ASIC 2M machine ->
+  word-RAM arbiter -> SDRAM). Real HW pays ~10-15 waits -> blit fits a
+  frame; ours spills to 2-3 frames -> dropped updates.
+NEXT: profile main word-RAM read DTACK stalls; trim the ASIC EXT 2M
+handshake + arbiter protocol cycles (CE-grid quantization stacks);
+sequential blit pattern is ideal for the open row. Color swirl is
+likely sub-rendered and may already be fixed by 501750f — hardware
+test pending.
