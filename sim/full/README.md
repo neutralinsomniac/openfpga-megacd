@@ -185,3 +185,29 @@ Lesson for all converted VHDL: EVERY input port with a VHDL default must be
 explicitly connected in the SV instantiations, or sim and Quartus diverge.
 NEXT: long boot run — watch SRES release, sub BIOS boot, CDD stub comm
 (no-disc model), and the CD-player screen NOT freezing (cursor alive).
+
+## Cursor soft-lock (2026-07-21) — current state
+The CD-player screen renders fully (sim + hardware identical: TRACK 0,
+00:00, NO DISC, cursor) but ignores input. Root: the SUB's main loop is
+soft-locked in the $616A busy-wait — $6(a6)=0 so INT2 takes the $6178
+command branch and never reaches the busy-clear at $6094; interrupts and
+the INT2 command path stay alive (comm keeps working, CFS phase toggles),
+so the MAIN happily runs its UI but waits forever for a mode-entry
+completion only the sub's (dead) main loop could post -> input ignored.
+Trigger chain: main raises CFM bit 7 (abort, $16E6: bset7 + DMNA) during
+the title->player transition; the sub-side teardown/kernel clears $6(a6);
+if the sub thread sits inside ANY $6166 busy-wait at that moment (which
+is ~the whole frame in mode 4), busy can never clear again. m2 repro:
+ABORT7=1 env + --mode 4 -> identical lock; control without bit7 stays
+healthy indefinitely. The main-side per-frame comm protocol ($15EE): CFM
+bit0 alive, CFS bit0 ready-gate, CFS bit1 phase toggle, command block
+copied to CC0..7 every frame, IFL2 raised by main, responses read from
+$A12020+. Abort ack = sub sets CFS bit 7 (from the $60AE main-loop
+teardown) — in the locked runs the ack never gets sent (kernel reacted
+before the thread reached a safe point). Real hardware must not lock
+here, so some INPUT to this dance differs on our core — prime suspects:
+CDD status timing/content from the stub changing WHICH state the sub is
+in when the abort lands. NEXT: substate trace (SUBSTATE=<cycle> env, SS
+lines: main/sub PC + mode/abort/busy/$6) across the transition shows the
+exact order; then decide fix (likely CDD stub behavior, NOT an RTL hack
+around the BIOS protocol).

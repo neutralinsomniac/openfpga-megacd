@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
     const char* prgf=nullptr; const char* romf=nullptr;
     long maxc = 5000000; bool trace_pc = true;
-    long cddphase=0, int2phase=0; int memlat=12; bool inject=true;
+    long cddphase=0, int2phase=0; int memlat=12; bool inject=true; int injmode=8;
     for (int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--prg")&&i+1<argc) prgf=argv[++i];
         else if(!strcmp(argv[i],"--rom")&&i+1<argc) romf=argv[++i];
@@ -84,6 +84,7 @@ int main(int argc, char** argv) {
         else if(!strcmp(argv[i],"--int2phase")&&i+1<argc) int2phase=atol(argv[++i]);
         else if(!strcmp(argv[i],"--memlat")&&i+1<argc) memlat=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--noinject")) inject=false;
+        else if(!strcmp(argv[i],"--mode")&&i+1<argc) injmode=atoi(argv[++i]);
     }
     if (romf){ FILE*f=fopen(romf,"rb"); if(f){fread(rom.data(),1,rom.size(),f);fclose(f);printf("loaded ROM %s\n",romf);} }
     if (prgf){ FILE*f=fopen(prgf,"rb"); if(f){fread(prg.data(),1,prg.size(),f);fclose(f);printf("loaded PRG %s\n",prgf);} }
@@ -105,7 +106,7 @@ int main(int argc, char** argv) {
     // EXT-bus gate-array writer (emulating the main CPU). A scripted queue of
     // register writes: {reg_offset (word), value}. reg 0=$A12000, 7=$A1200E
     // (comm flag), 8..15=$A12010.. (comm command CC0..7).
-    struct Wr { uint32_t at; int off; uint16_t val; };
+    struct Wr { uint32_t at; int off; uint16_t val; bool rd=false; };
     std::vector<Wr> script = {
         {2000, 0, 0x0001},   // SRES=1: release the sub
     };
@@ -121,14 +122,22 @@ int main(int argc, char** argv) {
         long t = INJ + 10000;
         script.push_back({t,       8, 0x0001});  // CC0 = track 1 arg
         script.push_back({t+400,  10, 0x0001});  // CC2 = action 1: set mode
-        script.push_back({t+800,  11, 0x0008});  // CC3 = mode 8: drive-read loop
+        script.push_back({t+800,  11, (uint16_t)injmode});  // CC3 = player mode (--mode)
         script.push_back({t+2000,  7, 0x0400});  // raise CFM bit2
         script.push_back({t+1200000,7,0x0000});  // lower after >1 INT2 frame
+        if (getenv("ABORT7")) {
+            script.push_back({9000000, 7, 0x8000});
+            // read back $A1200E (CFM|CFS) while abort held: sub ack = CFS bit7
+            script.push_back({9500000, 7, 0, true});
+            script.push_back({9700000, 7, 0, true});
+            script.push_back({11000000,7, 0x0000});
+            script.push_back({11500000,7, 0, true});
+        }
     }
 
     size_t sp=0;
     enum { EXT_IDLE, EXT_DRIVE } ext_st = EXT_IDLE;
-    long ext_wait=0; uint16_t ext_val=0; int ext_off=0; bool sres_done=false;
+    long ext_wait=0; uint16_t ext_val=0; int ext_off=0; bool sres_done=false, ext_rd=false;
     const long FRAME = 895000;
     bool seen_cmd=false, seen_616a=false;
     bool seen_726e=false, seen_7302=false, seen_7350=false;
@@ -142,19 +151,21 @@ int main(int argc, char** argv) {
             bool go=false;
             // scripted writes
             if (sp<script.size() && (long)script[sp].at<=c) {
-                ext_off=script[sp].off; ext_val=script[sp].val; sp++; go=true;
-                if (ext_off==0 && ext_val==1) sres_done=true;
+                ext_off=script[sp].off; ext_val=script[sp].val; ext_rd=script[sp].rd; sp++; go=true;
+                if (!ext_rd && ext_off==0 && ext_val==1) sres_done=true;
             }
             // periodic INT2 heartbeat (IFL2|SRES) once released
             else if (sres_done && ((c+int2phase) % FRAME)==0) { ext_off=0; ext_val=0x0101; go=true; }
             if (go) {
-                dut->EXT_FDC_N=0; dut->EXT_ASEL_N=0; dut->EXT_RNW=0;
+                dut->EXT_FDC_N=0; dut->EXT_ASEL_N=0; dut->EXT_RNW=ext_rd?1:0;
                 dut->EXT_LDS_N=0; dut->EXT_UDS_N=0; dut->EXT_VA=ext_off;
                 dut->EXT_VDI=ext_val; dut->EXT_AS_N=0;
                 ext_st=EXT_DRIVE; ext_wait=0;
             }
         } else {
             if (!dut->EXT_DTACK_N || ++ext_wait>200) {
+                if (ext_rd) printf("EXTRD [%ld] off=%d -> %04X (dtack=%d)\n",
+                                   c, ext_off, dut->EXT_VDO, !dut->EXT_DTACK_N);
                 dut->EXT_FDC_N=1; dut->EXT_ASEL_N=1; dut->EXT_RNW=1;
                 dut->EXT_LDS_N=1; dut->EXT_UDS_N=1; dut->EXT_AS_N=1;
                 ext_st=EXT_IDLE;
@@ -264,6 +275,9 @@ int main(int argc, char** argv) {
                              c,pc,dut->DBG_S68K_IPL_N,dut->DBG_INT_PEND,dut->DBG_GRON); idlepc=0; } }
         else { idlepc=0; last_pc=pc; }
 
+        if (c>8500000 && (c%100000)==0)
+            printf("ST [%ld] mode=%04X abort=%02X busy=%02X six=%02X pc=%06X\n",
+                   c,(prg[0x833C]<<8)|prg[0x833D],prg[0x833E],prg[0x833F],prg[0x8342],pc);
         if ((c % 500000)==0)
             printf("[%ld] pc=%06X ipl=%X pend=%02X ack=%02X gron=%d cdd_st=%X iters=%ld qchk=%ld\n",
                    c, pc, dut->DBG_S68K_IPL_N, dut->DBG_INT_PEND, dut->DBG_INT_ACK,

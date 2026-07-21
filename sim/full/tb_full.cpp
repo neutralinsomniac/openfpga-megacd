@@ -164,6 +164,17 @@ int main(int argc,char**argv){
                 r->core_top__DOT__p1_ram_busy, r->core_top__DOT__p1_rom_busy,
                 r->core_top__DOT__GEN_MEM_BUSY, r->core_top__DOT__p1_dout);
         }
+#ifndef REALSD
+        { static bool ssinit=false; static long ss0=-1;
+          if(!ssinit){ ssinit=true; const char* e=getenv("SUBSTATE"); if(e) ss0=atol(e); }
+          if(ss0>=0 && c>=ss0 && (c%100000)==0){
+            unsigned mw = r->core_top__DOT__sdram__DOT__mem[0x80419E];
+            unsigned ab = r->core_top__DOT__sdram__DOT__mem[0x80419F];
+            unsigned sx = r->core_top__DOT__sdram__DOT__mem[0x8041A1];
+            printf("SS %ld m=%06X s=%06X mode=%04X ab=%02X busy=%02X six=%02X\n",
+                   c, mpc, spc, mw, (ab>>8)&0xFF, ab&0xFF, (sx>>8)&0xFF);
+          } }
+#endif
         if((c%2000000)==0) printf("[%ld] main=%06X sub=%06X VINT=%ld VBL=%ld  in_dma=%d fill=%d vbus=%d copy=%d\n",
                                   c, mpc, spc, vint_cnt, vbl_cnt,
                                   r->core_top__DOT__gen__DOT__vdp__DOT__in_dma,
