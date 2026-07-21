@@ -49,15 +49,17 @@ int main(int argc,char**argv){
         }
         dut->eval(); t++;
 
-        // ---- video frame capture (PPM dumps) ----
+        // ---- video frame capture (PPM dumps), all in clk_sys domain ----
         {
-            static int vclk_prev=0, vs_prev=0, hs_prev=0;
+            static const uint8_t lut[16]={0,27,49,71,87,103,119,130,146,157,174,190,206,228,255,255};
+            static int vclk_prev=0, vb_prev=0, hb_prev=0;
             static int fx=0, fy=0, maxx=0, maxy=0; static long frame=0;
-            static uint8_t fb[300][400][3];
-            int vclk = dut->video_rgb_clock;
+            static uint8_t fb[300][512][3];
+            int vclk = dut->rootp->core_top__DOT__ce_pix;
             if(vclk && !vclk_prev){
-                int vs=dut->video_vs, hs=dut->video_hs, de=dut->video_de;
-                if(vs && !vs_prev){
+                int vb=dut->rootp->core_top__DOT__vblank_sys;
+                int hb=dut->rootp->core_top__DOT__hblank;
+                if(vb && !vb_prev){
                     bool press_win = (c>=470000000 && c<520000000) ||
                                      (c>=1500000000 && c<1545000000) ||
                                      (c>=1800000000 && c<1845000000);
@@ -73,13 +75,14 @@ int main(int argc,char**argv){
                     }
                     frame++; fy=0; fx=0; maxx=0; maxy=0;
                 }
-                if(hs && !hs_prev){ if(fx>maxx)maxx=fx; if(fx>0)fy++; if(fy>maxy)maxy=fy; fx=0; }
-                if(de && fy<300 && fx<400){
-                    uint32_t rgb=dut->video_rgb;
-                    fb[fy][fx][0]=rgb>>16; fb[fy][fx][1]=rgb>>8; fb[fy][fx][2]=rgb;
+                if(hb && !hb_prev){ if(fx>maxx)maxx=fx; if(fx>0)fy++; if(fy>maxy)maxy=fy; fx=0; }
+                if(!hb && !vb && fy<300 && fx<512){
+                    fb[fy][fx][0]=lut[dut->rootp->core_top__DOT__r & 15];
+                    fb[fy][fx][1]=lut[dut->rootp->core_top__DOT__g & 15];
+                    fb[fy][fx][2]=lut[dut->rootp->core_top__DOT__b & 15];
                     fx++;
                 }
-                vs_prev=vs; hs_prev=hs;
+                vb_prev=vb; hb_prev=hb;
             }
             vclk_prev=vclk;
         }

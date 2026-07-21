@@ -728,10 +728,10 @@ wire [7:0] color_lut[16] = '{
 	8'd206, 8'd228, 8'd255, 8'd255
 };
 
-wire [3:0] r, g, b;
-wire vs, hs;
+wire [3:0] r /* verilator public_flat_rd */, g /* verilator public_flat_rd */, b /* verilator public_flat_rd */;
+wire vs /* verilator public_flat_rd */, hs /* verilator public_flat_rd */;
 wire ce_pix /* verilator public_flat_rd */;
-wire hblank, vblank_sys /* verilator public_flat_rd */;
+wire hblank /* verilator public_flat_rd */, vblank_sys /* verilator public_flat_rd */;
 
 reg video_de_reg;
 reg video_hs_reg;
@@ -1735,8 +1735,11 @@ reg        dbg_prg_req = 0;
 reg        dbg_prg_go = 0;
 reg [255:0] dbg_prg_data = 0;
 // two windows: PRG bytes $6168.. and $8330..
+// bank0: PRG $8390-$839F = CDBSTAT block ($8394 = CDD drive status; $0B =
+// NO_DISC expected with empty drive). bank1: PRG $8330-$833F = player mode
+// word ($833C), abort ($833E), busy ($833F).
 wire [17:0] dbg_prg_addr = dbg_prg_idx[3] ? (18'h4198 + dbg_prg_idx[2:0])
-                                          : (18'h30B4 + dbg_prg_idx[2:0]);
+                                          : (18'h41C8 + dbg_prg_idx[2:0]);
 
 always @(posedge clk_sys) begin
 	reg old_busy3;
