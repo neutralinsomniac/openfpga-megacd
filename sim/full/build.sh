@@ -29,6 +29,7 @@ if [ "${REALSD:-0}" = "1" ]; then
       -e 's/\tinout  reg \[15:0\] SDRAM_DQ,.*/\toutput reg [15:0] SDRAM_DQ, input [15:0] SDRAM_DQ_IN, output reg SDRAM_DQ_OE,/' \
       -e "s/SDRAM_DQ <= 'Z;/SDRAM_DQ_OE <= 0;/" \
       -e 's/dout0_r <= SDRAM_DQ;/dout0_r <= SDRAM_DQ_IN;/' \
+      -e 's/dout <= SDRAM_DQ;/dout <= SDRAM_DQ_IN;/' \
       -e 's/dout1_r <= SDRAM_DQ;/dout1_r <= SDRAM_DQ_IN;/' \
       -e 's/dout2_r <= SDRAM_DQ;/dout2_r <= SDRAM_DQ_IN;/' > sdram_ctrl_gen.v
   SDMOD="sdram_real.v sdram_ctrl_gen.v"

@@ -1118,9 +1118,18 @@ reg  [15:0] wr_addr;
 reg  [15:0] wr_din;
 // per-direction re-grant guards: a completed access holds off a new grant
 // until its request line drops (RMW flips RD->WR on one edge, so the two
-// directions must be tracked independently)
+// directions must be tracked independently). The hold must NOT rely on the
+// line ever gapping: ASIC engines share a bank's request line, and a
+// gapless engine switch leaves the hold set forever (request invisible ->
+// sub CPU wedged mid-bus-cycle on word RAM = the CD-player freeze; caught
+// live in cosim at the title->player transition). A serviced engine always
+// drops its line 1-2 clks after seeing RDY=1, so a line still held
+// HOLD_TMO clks after completion is a queued new request: time the hold
+// out and re-grant (worst case a harmless repeat of the same access).
+localparam [2:0] HOLD_TMO = 3'd4;
 reg         wr0_rd_hold /* verilator public_flat_rd */ = 0, wr0_wr_hold /* verilator public_flat_rd */ = 0;
 reg         wr1_rd_hold /* verilator public_flat_rd */ = 0, wr1_wr_hold /* verilator public_flat_rd */ = 0;
+reg   [2:0] wr0_rd_tmo, wr0_wr_tmo, wr1_rd_tmo, wr1_wr_tmo;
 
 wire grant0_rd = WR0_RD & ~wr0_rd_hold;
 wire grant0_wr = WR0_WR & ~wr0_wr_hold;
@@ -1132,9 +1141,25 @@ always @(posedge clk_sys) begin
 	old_busy <= sdld_busy;
 
 	if (~WR0_RD) wr0_rd_hold <= 0;
+	else if (wr0_rd_hold) begin
+		wr0_rd_tmo <= wr0_rd_tmo - 1'b1;
+		if (wr0_rd_tmo == 0) wr0_rd_hold <= 0;
+	end
 	if (~WR0_WR) wr0_wr_hold <= 0;
+	else if (wr0_wr_hold) begin
+		wr0_wr_tmo <= wr0_wr_tmo - 1'b1;
+		if (wr0_wr_tmo == 0) wr0_wr_hold <= 0;
+	end
 	if (~WR1_RD) wr1_rd_hold <= 0;
+	else if (wr1_rd_hold) begin
+		wr1_rd_tmo <= wr1_rd_tmo - 1'b1;
+		if (wr1_rd_tmo == 0) wr1_rd_hold <= 0;
+	end
 	if (~WR1_WR) wr1_wr_hold <= 0;
+	else if (wr1_wr_hold) begin
+		wr1_wr_tmo <= wr1_wr_tmo - 1'b1;
+		if (wr1_wr_tmo == 0) wr1_wr_hold <= 0;
+	end
 
 	if ((reset & ~st2_active) | bios_download) begin
 		wr_active <= 0;
@@ -1168,13 +1193,13 @@ always @(posedge clk_sys) begin
 		if (!wr_owner) begin
 			WR0_DI  <= sdwr_do;
 			WR0_RDY <= 1;
-			if (wr_rd_r) wr0_rd_hold <= 1;
-			else         wr0_wr_hold <= 1;
+			if (wr_rd_r) begin wr0_rd_hold <= 1; wr0_rd_tmo <= HOLD_TMO; end
+			else         begin wr0_wr_hold <= 1; wr0_wr_tmo <= HOLD_TMO; end
 		end else begin
 			WR1_DI  <= sdwr_do;
 			WR1_RDY <= 1;
-			if (wr_rd_r) wr1_rd_hold <= 1;
-			else         wr1_wr_hold <= 1;
+			if (wr_rd_r) begin wr1_rd_hold <= 1; wr1_rd_tmo <= HOLD_TMO; end
+			else         begin wr1_wr_hold <= 1; wr1_wr_tmo <= HOLD_TMO; end
 		end
 		wr_active <= 0;
 		wr_rd_r   <= 0;
