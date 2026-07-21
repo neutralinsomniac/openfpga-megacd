@@ -77,10 +77,14 @@ always @(posedge clk) begin
 
         if (cdd_send & ~send_d) begin
             case (cdd_comm[3:0])
-                4'h1: begin                   // STOP: empty drive -> NO_DISC
-                    drv_status <= STAT_NO_DISC;
+                4'h1: begin                   // STOP: empty drive -> NO_DISC;
+                    // while the door is open the drive stays OPEN(5) — only
+                    // CLOSE TRAY leaves that state (a STOP faking "closed,
+                    // no disc" restarts the kernel's open/stop churn)
+                    if (drv_status != STAT_OPEN) drv_status <= STAT_NO_DISC;
                     latency <= 4'd0;
-                    n0 <= STAT_NO_DISC; n1 <= 0; zeros;
+                    n0 <= (drv_status == STAT_OPEN) ? STAT_OPEN : STAT_NO_DISC;
+                    n1 <= 0; zeros;
                 end
                 4'h2: begin                   // Read TOC: status only, no data
                     n0 <= drv_status;

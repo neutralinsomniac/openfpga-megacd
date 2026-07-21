@@ -64,7 +64,9 @@ struct Cdd {
     // command play (mode 8) -> the $7302 subcode-wait freeze.
     void command(uint64_t comm) {
         int c0 = comm & 0xF, fmt = (comm>>12)&0xF;
-        if (c0==1) { latency=0; status=0xB; n[0]=status; memset(n+1,0,8); } // STOP
+        // While the door is open the drive reports OPEN(5) to everything
+        // except CLOSE TRAY — a STOP must not fake a "closed, no disc".
+        if (c0==1) { latency=0; if(status!=0x5) status=0xB; n[0]=status; memset(n+1,0,8); } // STOP
         else if (c0==2) { n[0]=status; n[1]=fmt; memset(n+2,0,7); }        // ReadTOC: no data
         else if (c0==0xD) { latency=0; status=0x5; n[0]=status; memset(n+1,0,8); } // OPEN TRAY -> door open
         else if (c0==0xC) { latency=0; status=0xB; n[0]=status; memset(n+1,0,8); } // CLOSE TRAY -> still no disc
