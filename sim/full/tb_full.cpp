@@ -43,8 +43,8 @@ int main(int argc,char**argv){
         {
             uint16_t k=0;
             if(c>=750000000 && c<775000000) k |= 1u<<15;   // START (title up ~frame 200)
-            if(c>=1300000000 && c<1315000000) k |= 1u<<3;  // RIGHT on player screen
-            if(c>=1600000000 && c<1615000000) k |= 1u<<3;  // RIGHT again
+            if(c>=800000000 && c<815000000) k |= 1u<<3;    // RIGHT on player screen
+            if(c>=830000000 && c<845000000) k |= 1u<<1;    // DOWN too
             dut->cont1_key = k;
         }
         dut->eval(); t++;
@@ -111,6 +111,10 @@ int main(int argc,char**argv){
         if(vbl && !vbl_prev) vbl_cnt++;
         vint_prev=vint; cepix_prev=cepix; vbl_prev=vbl;
         if(mpc==last) stuck++; else { stuck=0; last=mpc; }
+        static long padvar_rd=0, padport_rd=0;
+        { static uint32_t pv=0; if(mpc!=pv){ if(mpc==0xFFFE20||mpc==0xFFFE21) padvar_rd++;
+          if(mpc==0xA10003) padport_rd++; pv=mpc; } }
+        if((c%50000000)==0 && c) printf("PADCNT [%ld] padvar=%ld padport=%ld\n",c,padvar_rd,padport_rd);
         static bool sub_started=false;
         if(!sub_started && spc!=0){ sub_started=true; printf("[%ld] SUB RELEASED: first sub addr=%06X\n",c,spc); }
         static uint32_t sub_last=0; static long sub_stuck=0;
@@ -171,8 +175,9 @@ int main(int argc,char**argv){
             unsigned mw = r->core_top__DOT__sdram__DOT__mem[0x80419E];
             unsigned ab = r->core_top__DOT__sdram__DOT__mem[0x80419F];
             unsigned sx = r->core_top__DOT__sdram__DOT__mem[0x8041A1];
-            printf("SS %ld m=%06X s=%06X mode=%04X ab=%02X busy=%02X six=%02X\n",
-                   c, mpc, spc, mw, (ab>>8)&0xFF, ab&0xFF, (sx>>8)&0xFF);
+            unsigned pad = r->core_top__DOT__sdram__DOT__mem[0x407F10];
+            printf("SS %ld m=%06X s=%06X mode=%04X ab=%02X busy=%02X six=%02X pad=%04X\n",
+                   c, mpc, spc, mw, (ab>>8)&0xFF, ab&0xFF, (sx>>8)&0xFF, pad);
           } }
 #endif
         if((c%2000000)==0) printf("[%ld] main=%06X sub=%06X VINT=%ld VBL=%ld  in_dma=%d fill=%d vbus=%d copy=%d\n",

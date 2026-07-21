@@ -66,6 +66,8 @@ struct Cdd {
         int c0 = comm & 0xF, fmt = (comm>>12)&0xF;
         if (c0==1) { latency=0; status=0xB; n[0]=status; memset(n+1,0,8); } // STOP
         else if (c0==2) { n[0]=status; n[1]=fmt; memset(n+2,0,7); }        // ReadTOC: no data
+        else if (c0==0xD) { latency=0; status=0x5; n[0]=status; memset(n+1,0,8); } // OPEN TRAY -> door open
+        else if (c0==0xC) { latency=0; status=0xB; n[0]=status; memset(n+1,0,8); } // CLOSE TRAY -> still no disc
         else { n[0]=status; }
     }
 };
@@ -232,7 +234,11 @@ int main(int argc, char** argv) {
         // drain STOP->NO_DISC
         if(cdd.status==0){ if(++cdd.ms>=698010){cdd.ms=0; if(cdd.latency)cdd.latency--; else cdd.status=0xB;} }
         static int sd=0;
-        if(dut->CDD_SEND && !sd) cdd.command(((uint64_t)dut->CDD_COMM));
+        if(dut->CDD_SEND && !sd){
+            static uint64_t lastcomm=~0ULL; uint64_t cm=(uint64_t)dut->CDD_COMM;
+            if(cm!=lastcomm){ printf("CDD [%ld] comm=%010llX\n", c, (unsigned long long)cm); lastcomm=cm; }
+            cdd.command(cm);
+        }
         sd=dut->CDD_SEND;
         if(++cdd.beat>=715909){ cdd.beat=0;
             uint64_t p=cdd.pack();
@@ -275,9 +281,10 @@ int main(int argc, char** argv) {
                              c,pc,dut->DBG_S68K_IPL_N,dut->DBG_INT_PEND,dut->DBG_GRON); idlepc=0; } }
         else { idlepc=0; last_pc=pc; }
 
-        if (c>8500000 && (c%100000)==0)
-            printf("ST [%ld] mode=%04X abort=%02X busy=%02X six=%02X pc=%06X\n",
-                   c,(prg[0x833C]<<8)|prg[0x833D],prg[0x833E],prg[0x833F],prg[0x8342],pc);
+        if (c>4000000 && (c%200000)==0)
+            printf("ST [%ld] mode=%04X abort=%02X busy=%02X six=%02X st44=%02X%02X st58=%02X pc=%06X\n",
+                   c,(prg[0x833C]<<8)|prg[0x833D],prg[0x833E],prg[0x833F],prg[0x8342],
+                   prg[0x8380],prg[0x8381],prg[0x8394],pc);
         if ((c % 500000)==0)
             printf("[%ld] pc=%06X ipl=%X pend=%02X ack=%02X gron=%d cdd_st=%X iters=%ld qchk=%ld\n",
                    c, pc, dut->DBG_S68K_IPL_N, dut->DBG_INT_PEND, dut->DBG_INT_ACK,

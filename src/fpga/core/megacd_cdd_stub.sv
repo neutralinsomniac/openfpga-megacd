@@ -26,6 +26,7 @@ module megacd_cdd_stub
 
 localparam [3:0] STAT_STOP    = 4'h0;
 localparam [3:0] STAT_NO_DISC = 4'hB;
+localparam [3:0] STAT_OPEN    = 4'h5;
 
 localparam [25:0] BEAT = 26'd715909;      // 13.3ms @ 53.693175MHz
 localparam [19:0] TICK_13MS = 20'd698010; // drain-to-NO_DISC tick
@@ -85,6 +86,21 @@ always @(posedge clk) begin
                     n0 <= drv_status;
                     n1 <= cdd_comm[15:12];
                     zeros;
+                end
+                // OPEN TRAY: the no-disc player parks in "door open, waiting
+                // for a disc" — without this reply the kernel drive task
+                // retries OPEN/STOP forever, CDBSTAT never settles out of
+                // "operation in progress" ($40xx oscillating), and the UI
+                // (correctly) ignores all input = the dead-cursor bug.
+                4'hD: begin
+                    drv_status <= STAT_OPEN;
+                    latency <= 4'd0;
+                    n0 <= STAT_OPEN; n1 <= 0; zeros;
+                end
+                4'hC: begin                   // CLOSE TRAY: still no disc
+                    drv_status <= STAT_NO_DISC;
+                    latency <= 4'd0;
+                    n0 <= STAT_NO_DISC; n1 <= 0; zeros;
                 end
                 default: begin
                     n0 <= drv_status;
