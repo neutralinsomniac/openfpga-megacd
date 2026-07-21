@@ -776,7 +776,7 @@ reg [9:0] dbg_x, dbg_y;
 reg       dbg_de_line;
 
 // hex readout: II 44 P2 P1 JJ (INT2 acks/s, INT4 acks/s, duties, live joypad byte)
-wire [31:0] dbg_hexval = {dbg_ack2_rate, dbg_ack4_rate,
+wire [31:0] dbg_hexval = {dbg_ack2_rate, dbg_vdpw_rate,
                           dbg_bus_rate,
                           joystick_0[7:0]};
 wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
@@ -1841,10 +1841,14 @@ always @(posedge clk_sys) begin
 			dbg_s68k_smp <= dbg_s68k_a;
 			dbg_bus_rate <= dbg_bus_cnt[20:13];
 			dbg_bus_cnt <= 0;
+			dbg_vdpw_rate <= dbg_vdpw_cnt[20:13];
+			dbg_vdpw_cnt <= 0;
 		end else begin
 			dbg_sec <= dbg_sec + 1'b1;
 			dbg_as_d <= GEN_AS_N;
 			if (dbg_as_d & ~GEN_AS_N) dbg_bus_cnt <= dbg_bus_cnt + 1'b1;
+			dbg_vdpw_d <= dbg_vdpw;
+			if (~dbg_vdpw_d & dbg_vdpw) dbg_vdpw_cnt <= dbg_vdpw_cnt + 1'b1;
 			if (dbg_s68k_a != dbg_s68k_a_d && ~&dbg_rate_cnt)
 				dbg_rate_cnt <= dbg_rate_cnt + 1'b1;
 			if (dbg_s68k_ipl_n != 3'b111)
@@ -1886,6 +1890,11 @@ reg [25:0] dbg_sec = 0;
 reg [20:0] dbg_bus_cnt = 0;
 reg  [7:0] dbg_bus_rate = 0;
 reg        dbg_as_d = 1;
+// VDP data-port write rate (>>13): how many blit words land per second
+reg [20:0] dbg_vdpw_cnt = 0;
+reg  [7:0] dbg_vdpw_rate = 0;
+reg        dbg_vdpw_d = 0;
+wire       dbg_vdpw = ~GEN_AS_N & ~GEN_RNW & (GEN_VA[23:1] >= 23'h600000) & (GEN_VA[23:1] < 23'h600002);
 reg [22:0] dbg_rate_cnt = 0;
 reg [22:0] dbg_rate = 0;         // sub address changes in the last second
 reg [25:0] dbg_ipl_cnt = 0;
