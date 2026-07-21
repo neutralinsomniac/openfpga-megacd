@@ -24,7 +24,8 @@ SIM="sdram_sim.v pll_sim.v bram_prims.v ram_models.v dcfifo_sim.v"
 
 cp $R/rtl/FX68K/microrom.mem $R/rtl/FX68K/nanorom.mem . 2>/dev/null || true
 
-nix shell nixpkgs#verilator -c verilator --cc --exe --build -j 4 \
+nix shell nixpkgs#verilator -c verilator --cc --exe --build -j 8 \
+  -O3 -CFLAGS "-O2 -march=native" \
   --top-module core_top --no-assert-case \
   -Wno-fatal --no-timing -Wno-BLKANDNBLK -Wno-WIDTH -Wno-CASEINCOMPLETE \
   -Wno-UNOPTFLAT -Wno-MULTIDRIVEN -Wno-LATCH -Wno-COMBDLY -Wno-CASEOVERLAP -Wno-PROCASSWIRE -Wno-IMPLICIT -Wno-BLKSEQ -Wno-SYMRSVDWORD \

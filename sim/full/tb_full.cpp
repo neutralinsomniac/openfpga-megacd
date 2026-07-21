@@ -37,7 +37,52 @@ int main(int argc,char**argv){
             dut->bridge_wr = 0; did_reset_exit=true;
             printf("[%ld] sent Reset Exit\n", c);
         }
+        // scripted controller input (cont1_key active-high):
+        // START (bit15) after the intro starts -> should skip to the player
+        // screen; d-pad RIGHT (bit3) twice later -> cursor must move.
+        {
+            uint16_t k=0;
+            if(c>=470000000 && c<490000000) k |= 1u<<15;   // START
+            if(c>=1500000000 && c<1512000000) k |= 1u<<3;  // RIGHT
+            if(c>=1800000000 && c<1812000000) k |= 1u<<3;  // RIGHT again
+            dut->cont1_key = k;
+        }
         dut->eval(); t++;
+
+        // ---- video frame capture (PPM dumps) ----
+        {
+            static int vclk_prev=0, vs_prev=0, hs_prev=0;
+            static int fx=0, fy=0, maxx=0, maxy=0; static long frame=0;
+            static uint8_t fb[300][400][3];
+            int vclk = dut->video_rgb_clock;
+            if(vclk && !vclk_prev){
+                int vs=dut->video_vs, hs=dut->video_hs, de=dut->video_de;
+                if(vs && !vs_prev){
+                    bool press_win = (c>=470000000 && c<520000000) ||
+                                     (c>=1500000000 && c<1545000000) ||
+                                     (c>=1800000000 && c<1845000000);
+                    static long fevery = getenv("FRAME_EVERY")?atol(getenv("FRAME_EVERY")):100;
+                    if(frame>0 && maxx>0 && ((frame%fevery)==0 || press_win)){
+                        char fn[64]; snprintf(fn,sizeof fn,"frames/f%05ld.ppm",frame);
+                        FILE*fp=fopen(fn,"wb");
+                        if(fp){ fprintf(fp,"P6\n%d %d\n255\n",maxx,maxy);
+                            for(int y=0;y<maxy;y++) fwrite(fb[y],1,(size_t)maxx*3,fp);
+                            fclose(fp);
+                            printf("[%ld] wrote %s (%dx%d)\n",c,fn,maxx,maxy);
+                        }
+                    }
+                    frame++; fy=0; fx=0; maxx=0; maxy=0;
+                }
+                if(hs && !hs_prev){ if(fx>maxx)maxx=fx; if(fx>0)fy++; if(fy>maxy)maxy=fy; fx=0; }
+                if(de && fy<300 && fx<400){
+                    uint32_t rgb=dut->video_rgb;
+                    fb[fy][fx][0]=rgb>>16; fb[fy][fx][1]=rgb>>8; fb[fy][fx][2]=rgb;
+                    fx++;
+                }
+                vs_prev=vs; hs_prev=hs;
+            }
+            vclk_prev=vclk;
+        }
 
         uint32_t mpc = dut->rootp->core_top__DOT__dbg_m68k_a & 0xFFFFFF;
         uint32_t spc = dut->rootp->core_top__DOT__dbg_s68k_a & 0xFFFFFF;
