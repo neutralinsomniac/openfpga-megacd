@@ -777,7 +777,7 @@ reg       dbg_de_line;
 
 // hex readout: II 44 P2 P1 JJ (INT2 acks/s, INT4 acks/s, duties, live joypad byte)
 wire [31:0] dbg_hexval = {dbg_ack2_rate, dbg_ack4_rate,
-                          1'b0, dbg_pend_duty[2], 1'b0, dbg_pend_duty[1],
+                          dbg_bus_rate,
                           joystick_0[7:0]};
 wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
                          (dbg_y < 10'd54) ? {8'h00, dbg_m68k_smp} :
@@ -1839,8 +1839,12 @@ always @(posedge clk_sys) begin
 			dbg_gron_cnt <= 0;
 			dbg_m68k_smp <= dbg_m68k_a;
 			dbg_s68k_smp <= dbg_s68k_a;
+			dbg_bus_rate <= dbg_bus_cnt[20:13];
+			dbg_bus_cnt <= 0;
 		end else begin
 			dbg_sec <= dbg_sec + 1'b1;
+			dbg_as_d <= GEN_AS_N;
+			if (dbg_as_d & ~GEN_AS_N) dbg_bus_cnt <= dbg_bus_cnt + 1'b1;
 			if (dbg_s68k_a != dbg_s68k_a_d && ~&dbg_rate_cnt)
 				dbg_rate_cnt <= dbg_rate_cnt + 1'b1;
 			if (dbg_s68k_ipl_n != 3'b111)
@@ -1877,6 +1881,11 @@ reg        dbg_wr_stuck /* verilator public_flat_rd */ = 0;     // a word-RAM re
 reg [24:0] dbg_dtack_cnt = 0;
 reg        dbg_dtack_stuck /* verilator public_flat_rd */ = 0;  // main CPU wedged on an MCD access ~0.6s
 reg [25:0] dbg_sec = 0;
+// main-CPU bus cycles per second (GEN_AS_N falling edges); displayed as
+// rate>>13 in the overlay so ideal ~1.9M/s reads ~0xE8, half-speed ~0x74
+reg [20:0] dbg_bus_cnt = 0;
+reg  [7:0] dbg_bus_rate = 0;
+reg        dbg_as_d = 1;
 reg [22:0] dbg_rate_cnt = 0;
 reg [22:0] dbg_rate = 0;         // sub address changes in the last second
 reg [25:0] dbg_ipl_cnt = 0;
