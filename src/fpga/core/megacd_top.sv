@@ -974,6 +974,73 @@ assign MCD_PRG_DI   = sdr_do;
 wire [15:0] GEN_MEM_DO;
 wire        GEN_MEM_BUSY /* verilator public_flat_rd */;
 
+// ---- BIOS ROM cache (32KB, direct-mapped) --------------------------------
+// The main CPU executes from and blits from the MCD ROM window; serving it
+// from SDRAM cost ~43 clk_sys (~10 CPU wait cycles) per word and starved
+// the main to ~25% throughput during the BIOS boot animations. A full
+// 128KB BRAM copy needs 128 M10K blocks and overflows the device (fitter:
+// 325/308); a 16Kx19 direct-mapped cache (16 data + 2 tag + 1 valid packed
+// per entry = exactly 32 M10K) serves hits in 2 cycles. The animations
+// re-blit the same ROM assets every frame, so steady-state hit rate is
+// ~100%; misses fall through to the (open-row) SDRAM path and fill.
+reg [18:0] bios_cache [0:16383];
+reg        bc_flushing = 1;
+reg [13:0] bc_flush_a = 0;
+
+reg        brom_busy /* verilator public_flat_rd */ = 0;
+reg        brom_hold = 0;
+reg  [2:0] bc_st = 0;
+reg [18:0] bc_q;
+reg [15:0] brom_dout;
+reg [15:0] bc_addr;
+reg        bc_miss_req = 0;
+wire brom_acc = ~GEN_ROM_CE_N & ~GEN_OE_N;
+
+localparam BC_LOOKUP = 3'd1, BC_CHECK = 3'd2, BC_MISS = 3'd3, BC_FILL = 3'd4;
+
+always @(posedge clk_sys) begin
+	if (~brom_acc) brom_hold <= 0;
+	if (reset | bios_download) begin
+		brom_busy <= 0; brom_hold <= 0; bc_st <= 0; bc_miss_req <= 0;
+		bc_flushing <= 1; bc_flush_a <= 0;
+	end else if (bc_flushing) begin
+		bios_cache[bc_flush_a] <= 19'd0;
+		{bc_flushing, bc_flush_a} <= {1'b1, bc_flush_a} + 1'b1;
+	end else begin
+		case (bc_st)
+		3'd0: if (brom_acc & ~brom_hold) begin
+			brom_busy <= 1;
+			bc_addr   <= GEN_VA[16:1];
+			bc_st     <= BC_LOOKUP;
+		end
+		BC_LOOKUP: begin
+			bc_q  <= bios_cache[GEN_VA[14:1]];
+			bc_st <= BC_CHECK;
+		end
+		BC_CHECK: begin
+			if (bc_q[18] && bc_q[17:16] == bc_addr[15:14]) begin
+				brom_dout <= bc_q[15:0];
+				brom_busy <= 0;
+				brom_hold <= 1;
+				bc_st     <= 0;
+			end else begin
+				bc_miss_req <= 1;
+				bc_st       <= BC_MISS;
+			end
+		end
+		BC_MISS: if (p1_rom_done) begin
+			bc_miss_req <= 0;
+			brom_dout   <= p1_dout;
+			bios_cache[bc_addr[13:0]] <= {1'b1, bc_addr[15:14], p1_dout};
+			brom_busy   <= 0;
+			brom_hold   <= 1;
+			bc_st       <= 0;
+		end
+		default: bc_st <= 0;
+		endcase
+	end
+end
+
 // ---- SDRAM port-1 front-end ----------------------------------------------
 // Port 1 is shared by two independent state machines: gen's work-RAM path
 // (RAM_CE) and the MCD ASIC's CD-BIOS ROM window (ROM_CE). Both used the raw
@@ -991,6 +1058,7 @@ wire        GEN_MEM_BUSY /* verilator public_flat_rd */;
 // completion.
 reg         p1_act /* verilator public_flat_rd */ = 0, p1_started = 0, p1_owner /* verilator public_flat_rd */ = 0; // 0=gen-RAM 1=MCD-ROM
 reg         p1_ram_hold = 0, p1_rom_hold = 0;
+reg         p1_rom_done = 0;
 reg         p1_ram_busy /* verilator public_flat_rd */ = 0, p1_rom_busy /* verilator public_flat_rd */ = 0;
 reg         p1_rd = 0, p1_wrl = 0, p1_wrh = 0;
 reg  [24:1] p1_addr;
@@ -1003,8 +1071,9 @@ wire p1_rom_acc = ~GEN_ROM_CE_N & ~GEN_OE_N;
 always @(posedge clk_sys) begin
 	reg old_b1;
 	old_b1 <= GEN_MEM_BUSY;
+	p1_rom_done <= 0;  // one-cycle completion pulse to the ROM cache
 	if (~p1_ram_acc) p1_ram_hold <= 0;
-	if (~p1_rom_acc) p1_rom_hold <= 0;
+	if (~bc_miss_req) p1_rom_hold <= 0;
 	if (reset | bios_download) begin
 		p1_act <= 0; p1_started <= 0;
 		p1_rd <= 0; p1_wrl <= 0; p1_wrh <= 0;
@@ -1019,18 +1088,17 @@ always @(posedge clk_sys) begin
 			p1_wrl  <= ~GEN_WRL_N;
 			p1_wrh  <= ~GEN_WRH_N;
 			p1_ram_busy <= 1;
-		end else if (p1_rom_acc & ~p1_rom_hold) begin
+		end else if (bc_miss_req & ~p1_rom_hold) begin
 			p1_act  <= 1; p1_started <= 0; p1_owner <= 1;
-			p1_addr <= {8'b01111000, GEN_VA[16:1]};
+			p1_addr <= {8'b01111000, bc_addr};
 			p1_rd   <= 1; p1_wrl <= 0; p1_wrh <= 0;
-			p1_rom_busy <= 1;
 		end
 	end else begin
 		if (GEN_MEM_BUSY) p1_started <= 1;
 		if (p1_started & old_b1 & ~GEN_MEM_BUSY) begin
 			p1_dout <= GEN_MEM_DO;
 			if (!p1_owner) begin p1_ram_busy <= 0; p1_ram_hold <= 1; end
-			else          begin p1_rom_busy <= 0; p1_rom_hold <= 1; end
+			else          begin p1_rom_done <= 1; p1_rom_hold <= 1; end
 			p1_act <= 0; p1_rd <= 0; p1_wrl <= 0; p1_wrh <= 0;
 		end
 	end
@@ -1666,9 +1734,9 @@ MCD MCD
 	.PRG_RFS(),
 	.PRG_RDY(~MCD_PRG_BUSY),
 
-	.ROM_DI(p1_dout),
+	.ROM_DI(brom_dout),
 	.ROM_CE_N(GEN_ROM_CE_N),
-	.ROM_RDY(~p1_rom_busy),
+	.ROM_RDY(~brom_busy),
 
 	.BRAM_A(MCD_BRAM_ADDR),
 	.BRAM_DI(MCD_BRAM_DI),

@@ -16,6 +16,7 @@ int main(int argc,char**argv){
     for(int i=1;i<argc;i++) if(!strcmp(argv[i],"--cycles")&&i+1<argc) maxc=atol(argv[++i]);
 
     Vcore_top* dut = new Vcore_top;
+    // (BIOS cache needs no preload: misses fill from the SDRAM +bios= image)
     dut->clk_74a=0; dut->clk_74b=0;
     dut->bridge_addr=0; dut->bridge_rd=0; dut->bridge_wr=0; dut->bridge_wr_data=0;
     dut->bridge_endian_little=0;
