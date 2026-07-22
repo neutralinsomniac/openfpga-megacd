@@ -1571,9 +1571,19 @@ begin
 				case WR0S is
 					when WRS_IDLE =>
 						if WR0R.EXEC = '1' then
-							WORD_RAM_1M0_RD <= '1';
 							WORDRAM0_A_R <= WORDRAM0_A_C;	-- freeze address for the whole RMW
-							WR0S <= WRS_READ;
+							-- Pocket port: the real ASIC's DRAM cycle is always RMW, but with
+							-- slow external RAM each phase is a full round trip. A full-word
+							-- write with no priority mask and no dot-image packing never uses
+							-- the read data: skip the read phase.
+							if WR0R.RNW = "0000" and WR0R.PM = "00" and WR0R.DOT_IMAGE = "00" then
+								WORD_RAM_1M0_DO <= WR0R.DO;
+								WORD_RAM_1M0_WR <= '1';
+								WR0S <= WRS_WRITE;
+							else
+								WORD_RAM_1M0_RD <= '1';
+								WR0S <= WRS_READ;
+							end if;
 						end if;
 
 					when WRS_READ =>
@@ -1611,8 +1621,14 @@ begin
 							WORD_RAM_1M0_DO(15 downto 12) <= WORDRAM0_DI(15 downto 12);
 						end if;
 						WORD_RAM_1M0_RD <= '0';
-						WORD_RAM_1M0_WR <= '1';
-						WR0S <= WRS_WRITE;
+						-- Pocket port: a pure read's write-back would rewrite identical
+						-- data — skip it (halves external transactions for GFX/CPU reads)
+						if WR0R.RNW = "1111" then
+							WR0S <= WRS_END;
+						else
+							WORD_RAM_1M0_WR <= '1';
+							WR0S <= WRS_WRITE;
+						end if;
 						end if;
 
 					when WRS_WRITE =>
@@ -1649,9 +1665,19 @@ begin
 				case WR1S is
 					when WRS_IDLE =>
 						if WR1R.EXEC = '1' then
-							WORD_RAM_1M1_RD <= '1';
 							WORDRAM1_A_R <= WORDRAM1_A_C;	-- freeze address for the whole RMW
-							WR1S <= WRS_READ;
+							-- Pocket port: the real ASIC's DRAM cycle is always RMW, but with
+							-- slow external RAM each phase is a full round trip. A full-word
+							-- write with no priority mask and no dot-image packing never uses
+							-- the read data: skip the read phase.
+							if WR1R.RNW = "0000" and WR1R.PM = "00" and WR1R.DOT_IMAGE = "00" then
+								WORD_RAM_1M1_DO <= WR1R.DO;
+								WORD_RAM_1M1_WR <= '1';
+								WR1S <= WRS_WRITE;
+							else
+								WORD_RAM_1M1_RD <= '1';
+								WR1S <= WRS_READ;
+							end if;
 						end if;
 
 					when WRS_READ =>
@@ -1689,8 +1715,14 @@ begin
 							WORD_RAM_1M1_DO(15 downto 12) <= WORDRAM1_DI(15 downto 12);
 						end if;
 						WORD_RAM_1M1_RD <= '0';
-						WORD_RAM_1M1_WR <= '1';
-						WR1S <= WRS_WRITE;
+						-- Pocket port: a pure read's write-back would rewrite identical
+						-- data — skip it (halves external transactions for GFX/CPU reads)
+						if WR1R.RNW = "1111" then
+							WR1S <= WRS_END;
+						else
+							WORD_RAM_1M1_WR <= '1';
+							WR1S <= WRS_WRITE;
+						end if;
 						end if;
 
 					when WRS_WRITE =>
