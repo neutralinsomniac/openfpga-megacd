@@ -179,9 +179,13 @@ reg [31:0] fetch_lba;
 wire       fetch_wanted = disc_present &&
                           (drv_status == STAT_PLAY || drv_status == STAT_SEEK ||
                            drv_status == STAT_PAUSE || drv_status == STAT_TOC);
-wire       want_head  = !(buf_valid[head[0]]   && buf_lba[head[0]]   == head);
+// LBAs are signed: seeks into the track-1 pregap (down to -150) are part
+// of the BIOS boot flow. Negative sectors are never fetched from the file.
+wire       want_head  = !head[31] &&
+                        !(buf_valid[head[0]]   && buf_lba[head[0]]   == head);
 wire [31:0] head1 = head + 1'b1;
-wire       want_next  = !(buf_valid[head1[0]] && buf_lba[head1[0]] == head1);
+wire       want_next  = !head1[31] &&
+                        !(buf_valid[head1[0]] && buf_lba[head1[0]] == head1);
 always @(posedge clk) begin
     cdack_s <= {cdack_s[0], cd_ack_74a};
     if (reset | ~mcd_rst_n) begin
@@ -305,7 +309,8 @@ always @(posedge clk) begin
             end
             if (drv_status == STAT_PLAY && disc_present) begin
                 cdd_dm <= 1;                    // data track (v1: all data)
-                dlv_kick <= 1;                  // deliver current sector
+                if (head[31]) head <= head + 1'b1;  // pregap: roll forward, no data
+                else dlv_kick <= 1;             // deliver current sector
             end
         end else begin
             ms_tick <= ms_tick + 1'b1;
@@ -330,7 +335,7 @@ always @(posedge clk) begin
             n0 <= drv_status;
             case (rs_type)
             4'h0: begin msf_lba <= head + 32'd150; msf_start <= 1; rpt_st <= 3'd2; end
-            4'h1: begin msf_lba <= head;           msf_start <= 1; rpt_st <= 3'd2; end
+            4'h1: begin msf_lba <= head[31] ? (~head + 1'b1) : head; msf_start <= 1; rpt_st <= 3'd2; end
             4'h3: begin msf_lba <= leadout_lba + 32'd150; msf_start <= 1; rpt_st <= 3'd2; end
             4'h2: begin n1 <= 4'h2; n2 <= 0; n3 <= 1; n4 <= 0; n5 <= 0; n6 <= 0; n7 <= 0; n8 <= 0; rpt_st <= 3'd4; end
             4'h4: begin n1 <= 4'h4; n2 <= 0; n3 <= 1; n4 <= 0; n5 <= 1; n6 <= 0; n7 <= 0; n8 <= 0; rpt_st <= 3'd4; end
