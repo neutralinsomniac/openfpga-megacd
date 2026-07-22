@@ -785,8 +785,8 @@ wire [31:0] dbg_hexval = {dbg_gfx_rate, dbg_glen,
                           dbg_bus_rate,
                           dbg_sub_rate};
 wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
-                         (dbg_y < 10'd54) ? {dbg_vdpwf_rate, dbg_m68k_smp} :
-                         (dbg_y < 10'd66) ? {dbg_gfxf_rate, dbg_s68k_smp} :
+                         (dbg_y < 10'd54) ? {dbg_wracc_rate, dbg_m68k_smp} :
+                         (dbg_y < 10'd66) ? {dbg_wrbusy_duty, dbg_s68k_smp} :
                          (dbg_y < 10'd78) ? dbg_prg_data[255:224] :
                          (dbg_y < 10'd90) ? dbg_prg_data[223:192] :
                          (dbg_y < 10'd102) ? dbg_prg_data[191:160] :
@@ -1866,6 +1866,10 @@ always @(posedge clk_sys) begin
 			dbg_gfxf_cnt <= 0;
 			dbg_glen <= dbg_glen_max;
 			dbg_glen_max <= 0;
+			dbg_wracc_rate <= dbg_wracc_cnt[20:13];
+			dbg_wracc_cnt <= 0;
+			dbg_wrbusy_duty <= dbg_wrbusy_cnt[25:18];
+			dbg_wrbusy_cnt <= 0;
 		end else begin
 			dbg_sec <= dbg_sec + 1'b1;
 			dbg_as_d <= GEN_AS_N;
@@ -1907,6 +1911,10 @@ always @(posedge clk_sys) begin
 			end
 			if (~dbg_vdpw_d & dbg_vdpw) dbg_f_vdpw <= 1;
 			if (dbg_gron_d & ~dbg_gron) dbg_f_gfx <= 1;
+			// word-RAM arbiter profile: completed accesses/s + busy duty
+			dbg_wract_d <= wr_active;
+			if (dbg_wract_d & ~wr_active) dbg_wracc_cnt <= dbg_wracc_cnt + 1'b1;
+			if (wr_active) dbg_wrbusy_cnt <= dbg_wrbusy_cnt + 1'b1;
 		end
 		if (cdd_send) dbg_cdd_seen <= 1;
 		if (WR0_RD | WR0_WR | WR1_RD | WR1_WR) dbg_wr_req <= 1;
@@ -1980,6 +1988,13 @@ reg        dbg_vbl_d = 0;
 reg        dbg_f_vdpw = 0, dbg_f_gfx = 0;      // event-seen-this-frame flags
 reg [7:0]  dbg_vdpwf_cnt = 0, dbg_vdpwf_rate = 0;  // frames/sec with a data-port write
 reg [7:0]  dbg_gfxf_cnt = 0, dbg_gfxf_rate = 0;    // frames/sec with a GFX-op completion
+// word-RAM arbiter profile (row 2/3 pad bytes): completions/s >>13 and
+// wr_active duty in 1/256s units (0xCC = busy the whole second)
+reg        dbg_wract_d = 0;
+reg [20:0] dbg_wracc_cnt = 0;
+reg [7:0]  dbg_wracc_rate = 0;
+reg [25:0] dbg_wrbusy_cnt = 0;
+reg [7:0]  dbg_wrbusy_duty = 0;
 reg [23:0] dbg_m68k_smp = 0;     // 1Hz address-bus samples (crude profiler)
 reg [23:0] dbg_s68k_smp = 0;
 
