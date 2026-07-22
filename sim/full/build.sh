@@ -7,7 +7,7 @@ R=../../src/fpga/core
 
 # native SV/Verilog (exclude sdram.sv + mf_pllbase, replaced by sim models)
 NATIVE="
-  $R/megacd_top.sv $R/megacd_cdd_stub.sv
+  $R/megacd_top.sv $R/megacd_cdd_stub.sv $R/megacd_cdd_drive.sv
   $R/data_loader.sv $R/data_unloader.sv $R/core_bridge_cmd.v
   $R/sound_i2s.sv $R/sync_fifo.sv
   $R/rtl/cheatcodes.sv $R/rtl/cofi.sv $R/rtl/EEPROM_STM95.sv $R/rtl/lightgun.sv

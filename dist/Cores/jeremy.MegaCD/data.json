@@ -18,6 +18,15 @@
                 "parameters": "0x84",
                 "extensions": ["sav"],
                 "address": "0x60000000"
+            },
+            {
+                "id": 1,
+                "name": "CD Image",
+                "required": false,
+                "deferload": true,
+                "parameters": "0x109",
+                "extensions": ["bin", "iso"],
+                "address": "0x70000000"
             }
         ]
     }

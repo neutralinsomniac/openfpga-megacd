@@ -422,9 +422,71 @@ core_bridge_cmd icb (
     .datatable_addr         ( datatable_addr ),
     .datatable_wren         ( datatable_wren ),
     .datatable_data         ( datatable_data ),
-    .datatable_q            ( datatable_q )
+    .datatable_q            ( datatable_q ),
+
+    .target_dataslot_read       ( target_dataslot_read ),
+    .target_dataslot_ack        ( target_dataslot_ack ),
+    .target_dataslot_done       ( target_dataslot_done ),
+    .target_dataslot_err        ( ),
+    .target_dataslot_id         ( 16'd1 ),                 // CD image slot
+    .target_dataslot_slotoffset ( cd_req_offset ),
+    .target_dataslot_bridgeaddr ( {19'h38000, cd_req_buf, 12'h000} ), // 0x7000_0000 / 0x7000_1000
+    .target_dataslot_length     ( 32'd2352 )
 
 );
+
+///////////////////////////////////////////////
+// CD sector fetch: the drive (clk_sys) requests a 2352-byte sector; a
+// clk_74a FSM turns it into an APF target_dataslot_read whose data the
+// host writes through the bridge into the double-buffered sector RAM.
+///////////////////////////////////////////////
+
+    reg             target_dataslot_read = 0;
+    wire            target_dataslot_ack;
+    wire            target_dataslot_done;
+
+    wire        cd_req;             // clk_sys, level-held until cd_ack
+    wire [31:0] cd_req_offset;      // stable while cd_req held
+    wire        cd_req_buf;
+    reg         cd_ack = 0;         // clk_74a; synced back inside the drive
+
+    reg  [2:0]  cdreq_s = 0;
+    reg  [1:0]  cdf_st = 0;
+always @(posedge clk_74a) begin
+    cdreq_s <= {cdreq_s[1:0], cd_req};
+    case (cdf_st)
+    2'd0: if (cdreq_s[1]) begin
+        target_dataslot_read <= 1;
+        cdf_st <= 2'd1;
+    end
+    2'd1: if (target_dataslot_ack) begin
+        target_dataslot_read <= 0;
+        cdf_st <= 2'd2;
+    end
+    2'd2: if (target_dataslot_done) begin
+        cd_ack <= 1;
+        cdf_st <= 2'd3;
+    end
+    2'd3: if (!cdreq_s[1]) begin
+        cd_ack <= 0;
+        cdf_st <= 2'd0;
+    end
+    endcase
+end
+
+// double sector buffer: host writes 32-bit words at 0x7000_0000/0x7000_1000,
+// drive reads on clk_sys (contents race-free: only read after cd_ack).
+// Normalize packing so file byte 0 always lands in bits [7:0].
+reg [31:0] cd_buf [0:2047];
+wire [31:0] cd_buf_wd = bridge_endian_little ? bridge_wr_data :
+    {bridge_wr_data[7:0], bridge_wr_data[15:8], bridge_wr_data[23:16], bridge_wr_data[31:24]};
+always @(posedge clk_74a) begin
+    if (bridge_wr && bridge_addr[31:28] == 4'h7)
+        cd_buf[bridge_addr[12:2]] <= cd_buf_wd;
+end
+wire [10:0] cd_buf_addr;    // clk_sys
+reg  [31:0] cd_buf_q;
+always @(posedge clk_sys) cd_buf_q <= cd_buf[cd_buf_addr];
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Core Settings
@@ -509,6 +571,7 @@ wire [15:0] sd_buff_dout;
 
 reg [ 2:0] datatable_div = 0;
 reg [31:0] rom_file_size = 0;
+reg [31:0] cd_img_size = 0;   // clk_74a; quasi-static once mounted
 
 always @(posedge clk_74a or negedge pll_core_locked) begin
 	if (~pll_core_locked) begin
@@ -522,13 +585,21 @@ always @(posedge clk_74a or negedge pll_core_locked) begin
 			datatable_data <= 32'd524288;
 			// Data slot index 1, not id 1
 			datatable_addr <= 1 * 2 + 1;
-		end else begin
+		end else if (datatable_div > 2) begin
 			datatable_wren <= 0;
-			// Read ROM size rest of the time
+			// Read ROM size
 			datatable_addr <= 1;
 
 			if (datatable_div == 4) begin
 				rom_file_size <= datatable_q;
+			end
+		end else begin
+			datatable_wren <= 0;
+			// Read CD image size (slot index 2 = id 1, listed after Save)
+			datatable_addr <= 2 * 2 + 1;
+
+			if (datatable_div == 2) begin
+				cd_img_size <= datatable_q;
 			end
 		end
 
@@ -1840,8 +1911,8 @@ MCD MCD
 	.CDD_REC(cdd_rec),
 	.CDD_DM(cdd_dm),
 
-	.CDC_DATA(16'h0000),
-	.CDC_DAT_WR(1'b0),
+	.CDC_DATA(CD_CDC_DATA),
+	.CDC_DAT_WR(CD_CDC_DAT_WR),
 	.CDC_SC_WR(1'b0),
 	.CDC_CDDA_WR(1'b0),
 	.CDDA_WR_READY(MCD_CDDA_WR_READY),
@@ -2114,7 +2185,18 @@ end
 // CDD drive stub (M1): "no disc" responder; the real drive MPU lands in M2
 wire [39:0] cdd_stat, cdd_comm /* verilator public_flat_rd */;
 wire        cdd_send /* verilator public_flat_rd */, cdd_rec, cdd_dm;
-megacd_cdd_stub cdd_stub
+// CD image size crosses from clk_74a as a quasi-static value: sample it
+// through a 2FF-deep pipe and only accept when stable
+reg [31:0] cd_img_size_s1, cd_img_size_sys = 0;
+always @(posedge clk_sys) begin
+	cd_img_size_s1 <= cd_img_size;
+	if (cd_img_size_s1 == cd_img_size) cd_img_size_sys <= cd_img_size_s1;
+end
+
+wire [15:0] CD_CDC_DATA;
+wire        CD_CDC_DAT_WR;
+
+megacd_cdd_drive cdd_drive
 (
 	.clk(clk_sys),
 	.reset(reset),
@@ -2123,7 +2205,20 @@ megacd_cdd_stub cdd_stub
 	.cdd_send(cdd_send),
 	.cdd_stat(cdd_stat),
 	.cdd_rec(cdd_rec),
-	.cdd_dm(cdd_dm)
+	.cdd_dm(cdd_dm),
+
+	.img_size(cd_img_size_sys),
+
+	.cd_req(cd_req),
+	.cd_req_offset(cd_req_offset),
+	.cd_req_buf(cd_req_buf),
+	.cd_ack_74a(cd_ack),
+
+	.cd_buf_addr(cd_buf_addr),
+	.cd_buf_q(cd_buf_q),
+
+	.cdc_data(CD_CDC_DATA),
+	.cdc_dat_wr(CD_CDC_DAT_WR)
 );
 
 ///////////////////////////////////////////////

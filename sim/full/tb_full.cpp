@@ -8,6 +8,8 @@
 #include "verilated.h"
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <vector>
 static vluint64_t t=0; double sc_time_stamp(){return t;}
 
 int main(int argc,char**argv){
@@ -48,6 +50,61 @@ int main(int argc,char**argv){
             if(c>=1230000000 && c<1245000000) k |= 1u<<1;  // DOWN too
             if(c>=1400000000 && c<1415000000) k |= 1u<<3;  // RIGHT (post-auto-open)
             dut->cont1_key = k;
+        }
+
+        // ---- APF host: CD-image dataslot server (--cd <file>) ----
+        // Emulates the Pocket host: advertises the image size in the data
+        // table (slot index 2), acks Ready-To-Run, and serves target
+        // command 0x0180 (dataslot read) by writing the requested bytes
+        // through the bridge into the sector buffer.
+        {
+            static FILE* cdf=nullptr; static uint32_t cdsize=0; static bool cdinit=false;
+            static bool table_written=false;
+            struct W { uint32_t a,d; };
+            static std::deque<W> q; static int ph=0;
+            if(!cdinit){ cdinit=true;
+                for(int i=1;i<argc;i++) if(!strcmp(argv[i],"--cd")&&i+1<argc){
+                    cdf=fopen(argv[i+1],"rb");
+                    if(cdf){ fseek(cdf,0,SEEK_END); cdsize=(uint32_t)ftell(cdf); }
+                    printf("CD image: %s (%u bytes)%s\n", argv[i+1], cdsize,
+                           cdf?"":" -- OPEN FAILED");
+                }
+            }
+            if(did_reset_exit && c>5000){
+                if(cdf && !table_written){ table_written=true;
+                    q.push_back({0xF8002014u, cdsize});   // datatable: slot idx 2 size
+                }
+                if(q.empty() && (c&63)==0){
+                    uint32_t t0 = dut->rootp->core_top__DOT__icb__DOT__target_0;
+                    if(t0==0x636D0140u){                  // Ready To Run
+                        q.push_back({0xF8001000u,0x6F6B0000u});
+                    } else if(t0==0x636D0180u){           // dataslot read
+                        uint32_t off=dut->rootp->core_top__DOT__icb__DOT__target_24;
+                        uint32_t dst=dut->rootp->core_top__DOT__icb__DOT__target_28;
+                        uint32_t len=dut->rootp->core_top__DOT__icb__DOT__target_2C;
+                        static long nserved=0;
+                        if(nserved<8 || (nserved&511)==0)
+                            printf("[%ld] CD read #%ld: off=%u len=%u dst=%08X\n",
+                                   c,nserved,off,len,dst);
+                        nserved++;
+                        std::vector<uint8_t> buf(((size_t)len+3)&~(size_t)3,0);
+                        if(cdf){ fseek(cdf,off,SEEK_SET);
+                                 size_t got=fread(buf.data(),1,len,cdf); (void)got; }
+                        for(uint32_t i=0;i<len;i+=4)
+                            q.push_back({dst+i,(uint32_t)((buf[i]<<24)|(buf[i+1]<<16)|
+                                                          (buf[i+2]<<8)|buf[i+3])});
+                        q.push_back({0xF8001000u,0x6F6B0000u});
+                    }
+                }
+                if(!q.empty()){
+                    // 6 half-cycle write: asserted across >=2 rising edges, then idle
+                    if(ph==0){ dut->bridge_addr=q.front().a;
+                               dut->bridge_wr_data=q.front().d; dut->bridge_wr=1; }
+                    if(ph==4){ dut->bridge_wr=0; }
+                    ph++;
+                    if(ph==6){ ph=0; q.pop_front(); }
+                }
+            }
         }
         dut->eval(); t++;
 

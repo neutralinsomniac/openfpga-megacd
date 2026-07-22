@@ -782,6 +782,7 @@ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_
 # ---- MegaCD core (gen + MCD + CART from MiSTer MegaCD, srg320) ----
 set_global_assignment -name SYSTEMVERILOG_FILE core/megacd_top.sv
 set_global_assignment -name SYSTEMVERILOG_FILE core/megacd_cdd_stub.sv
+set_global_assignment -name SYSTEMVERILOG_FILE core/megacd_cdd_drive.sv
 set_global_assignment -name SYSTEMVERILOG_FILE core/rtl/megacd/GEN/gen.sv
 set_global_assignment -name SYSTEMVERILOG_FILE core/rtl/megacd/GEN/gen_io.sv
 set_global_assignment -name SYSTEMVERILOG_FILE core/rtl/megacd/GEN/multitap.sv
