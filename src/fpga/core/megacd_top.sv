@@ -2183,8 +2183,8 @@ always @(posedge clk_sys) begin
 end
 
 // CDD drive stub (M1): "no disc" responder; the real drive MPU lands in M2
-wire [39:0] cdd_stat, cdd_comm /* verilator public_flat_rd */;
-wire        cdd_send /* verilator public_flat_rd */, cdd_rec, cdd_dm;
+wire [39:0] cdd_stat /* verilator public_flat_rd */, cdd_comm /* verilator public_flat_rd */;
+wire        cdd_send /* verilator public_flat_rd */, cdd_rec /* verilator public_flat_rd */, cdd_dm;
 // CD image size crosses from clk_74a as a quasi-static value: sample it
 // through a 2FF-deep pipe and only accept when stable
 reg [31:0] cd_img_size_s1, cd_img_size_sys = 0;

@@ -49,6 +49,7 @@ localparam [3:0] STAT_PLAY    = 4'h1;
 localparam [3:0] STAT_SEEK    = 4'h2;
 localparam [3:0] STAT_PAUSE   = 4'h4;
 localparam [3:0] STAT_OPEN    = 4'h5;
+localparam [3:0] STAT_TOC     = 4'h9;   // TOC read done = "disc ready"
 localparam [3:0] STAT_NO_DISC = 4'hB;
 
 localparam [25:0] BEAT = 26'd715909;      // 13.3ms @ 53.693175MHz
@@ -177,7 +178,7 @@ reg  [1:0] fetch_st = 0;
 reg [31:0] fetch_lba;
 wire       fetch_wanted = disc_present &&
                           (drv_status == STAT_PLAY || drv_status == STAT_SEEK ||
-                           drv_status == STAT_PAUSE);
+                           drv_status == STAT_PAUSE || drv_status == STAT_TOC);
 wire       want_head  = !(buf_valid[head[0]]   && buf_lba[head[0]]   == head);
 wire [31:0] head1 = head + 1'b1;
 wire       want_next  = !(buf_valid[head1[0]] && buf_lba[head1[0]] == head1);
@@ -371,8 +372,13 @@ always @(posedge clk) begin
                 end
                 4'h2: begin                   // REQUEST report c3
                     if (disc_present) begin
+                        // megacdd.cpp: first TOC request while stopped moves
+                        // the drive to TOC (9) — the "disc ready" resting
+                        // state the BIOS polls for before booting
+                        if (drv_status == STAT_STOP) drv_status <= STAT_TOC;
                         rs_type <= c3;
-                        n0 <= drv_status; n1 <= c3;
+                        n0 <= (drv_status == STAT_STOP) ? STAT_TOC : drv_status;
+                        n1 <= c3;
                         rpt_st <= 3'd1;       // rebuild payload now
                     end else begin
                         n0 <= drv_status; n1 <= c3; zeros;
@@ -414,9 +420,9 @@ always @(posedge clk) begin
                     latency <= 4'd0;
                     n0 <= STAT_OPEN; n1 <= 0; zeros;
                 end
-                4'hC: begin                   // CLOSE TRAY
-                    door <= 0;
-                    drv_status <= disc_present ? STAT_STOP : STAT_NO_DISC;
+                4'hC: begin                   // CLOSE TRAY (reply STOP; with a
+                    door <= 0;                // disc the drive lands in TOC)
+                    drv_status <= disc_present ? STAT_TOC : STAT_NO_DISC;
                     latency <= 4'd0;
                     n0 <= STAT_STOP; n1 <= 0; zeros;
                 end

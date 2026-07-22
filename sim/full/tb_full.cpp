@@ -195,6 +195,13 @@ int main(int argc,char**argv){
             if(cm!=lastcomm){ printf("CDDCMD [%ld] %010llX\n", c, cm); lastcomm=cm; }
           }
           sd_prev=sd_now; }
+        { static int rc_prev=0; static unsigned long long laststat=~0ULL;
+          int rc_now = r->core_top__DOT__cdd_rec;
+          if(rc_now && !rc_prev){
+            unsigned long long st = r->core_top__DOT__cdd_stat;
+            if(st!=laststat){ printf("CDDSTAT [%ld] %010llX\n", c, st); laststat=st; }
+          }
+          rc_prev=rc_now; }
         static long padvar_rd=0, padport_rd=0;
         { static uint32_t pv=0; if(mpc!=pv){ if(mpc==0xFFFE20||mpc==0xFFFE21) padvar_rd++;
           if(mpc==0xA10003) padport_rd++; pv=mpc; } }
