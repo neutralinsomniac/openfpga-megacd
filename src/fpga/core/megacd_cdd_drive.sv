@@ -348,7 +348,9 @@ always @(posedge clk) begin
             n2 <= msf_m10; n3 <= msf_m1;
             n4 <= msf_s10; n5 <= msf_s1;
             n6 <= msf_f10; n7 <= msf_f1;
-            n8 <= (rs_type == 4'h0 && disc_present) ? 4'h4 : 4'h0; // data-track flag
+            // megacdd.cpp: ABSOLUTE and RELATIVE both report the current
+            // track's type<<2 in n8 (the BIOS checks it before PLAYing)
+            n8 <= (rs_type != 4'h3 && disc_present) ? 4'h4 : 4'h0;
             rpt_st <= 3'd4;
         end
         3'd3: if (msf_done) begin // track-1 start (type 5): data flag in n6 bit3
@@ -366,8 +368,17 @@ always @(posedge clk) begin
         // command handling: immediate reply nibbles per megacdd.cpp/GPGX
         if (cdd_send & ~send_d) begin
             case (c0)
-                4'h0: begin                   // DRIVE STATUS
+                4'h0: begin                   // DRIVE STATUS (IDLE)
                     n0 <= drv_status;
+                    // megacdd.cpp: while a seek/play is settling the report
+                    // type is F ("busy"); the IDLE poll near completion
+                    // flips it to a live absolute-position report — that
+                    // F->0 transition is the BIOS's seek-done signal
+                    if (rs_type == 4'hF &&
+                        (drv_status != STAT_SEEK || seek_cnt <= 4'd3)) begin
+                        rs_type <= 4'h0;
+                        rpt_st <= 3'd1;
+                    end
                 end
                 4'h1: begin                   // STOP
                     drv_status <= disc_present ? STAT_STOP : STAT_STOP;
@@ -395,7 +406,8 @@ always @(posedge clk) begin
                         seek_to_play <= 1;
                         seek_cnt <= 4'd10;
                         drv_status <= STAT_SEEK;
-                        n0 <= STAT_SEEK; n1 <= 0; zeros;
+                        rs_type <= 4'hF;      // busy until an IDLE poll near done
+                        n0 <= STAT_SEEK; n1 <= 4'hF; zeros;
                     end else begin
                         n0 <= drv_status;
                     end
@@ -406,7 +418,8 @@ always @(posedge clk) begin
                         seek_to_play <= 0;
                         seek_cnt <= 4'd10;
                         drv_status <= STAT_SEEK;
-                        n0 <= STAT_SEEK; n1 <= 0; zeros;
+                        rs_type <= 4'hF;      // busy until an IDLE poll near done
+                        n0 <= STAT_SEEK; n1 <= 4'hF; zeros;
                     end else begin
                         n0 <= drv_status;
                     end
