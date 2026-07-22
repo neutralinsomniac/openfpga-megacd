@@ -780,8 +780,8 @@ wire [31:0] dbg_hexval = {dbg_ack2_rate, dbg_vdpw_rate,
                           dbg_bus_rate,
                           joystick_0[7:0]};
 wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
-                         (dbg_y < 10'd54) ? {8'h00, dbg_m68k_smp} :
-                         (dbg_y < 10'd66) ? {8'h00, dbg_s68k_smp} :
+                         (dbg_y < 10'd54) ? {dbg_wrrd_rate, dbg_m68k_smp} :
+                         (dbg_y < 10'd66) ? {dbg_dmna_rate, dbg_s68k_smp} :
                          (dbg_y < 10'd78) ? dbg_prg_data[255:224] :
                          (dbg_y < 10'd90) ? dbg_prg_data[223:192] :
                          (dbg_y < 10'd102) ? dbg_prg_data[191:160] :
@@ -892,7 +892,7 @@ always @(posedge current_pix_clk) begin
                 default: ;
             endcase
         end else if (dbg_y >= 10'd30 && dbg_y < 10'd162) begin
-            // numeric readout rows: stats / M68K addr sample / S68K addr sample
+            // numeric readout rows: stats / [WR-rd rate, M68K addr] / [DMNA rate, S68K addr]
             if (dbg_x[9:4] < 6'd8) begin
                 if (~dbg_x[3])
                     video_rgb_reg <= dbg_grow[2'd3 - dbg_x[2:1]] ? 24'hFFFFFF : 24'h000000;
@@ -1843,12 +1843,20 @@ always @(posedge clk_sys) begin
 			dbg_bus_cnt <= 0;
 			dbg_vdpw_rate <= dbg_vdpw_cnt[20:13];
 			dbg_vdpw_cnt <= 0;
+			dbg_wrrd_rate <= dbg_wrrd_cnt[20:13];
+			dbg_wrrd_cnt <= 0;
+			dbg_dmna_rate <= dbg_dmna_cnt;
+			dbg_dmna_cnt <= 0;
 		end else begin
 			dbg_sec <= dbg_sec + 1'b1;
 			dbg_as_d <= GEN_AS_N;
 			if (dbg_as_d & ~GEN_AS_N) dbg_bus_cnt <= dbg_bus_cnt + 1'b1;
 			dbg_vdpw_d <= dbg_vdpw;
 			if (~dbg_vdpw_d & dbg_vdpw) dbg_vdpw_cnt <= dbg_vdpw_cnt + 1'b1;
+			dbg_wrrd_d <= dbg_wrrd;
+			if (~dbg_wrrd_d & dbg_wrrd) dbg_wrrd_cnt <= dbg_wrrd_cnt + 1'b1;
+			dbg_dmna_d <= dbg_dmna;
+			if (~dbg_dmna_d & dbg_dmna & ~&dbg_dmna_cnt) dbg_dmna_cnt <= dbg_dmna_cnt + 1'b1;
 			if (dbg_s68k_a != dbg_s68k_a_d && ~&dbg_rate_cnt)
 				dbg_rate_cnt <= dbg_rate_cnt + 1'b1;
 			if (dbg_s68k_ipl_n != 3'b111)
@@ -1895,6 +1903,20 @@ reg [20:0] dbg_vdpw_cnt = 0;
 reg  [7:0] dbg_vdpw_rate = 0;
 reg        dbg_vdpw_d = 0;
 wire       dbg_vdpw = ~GEN_AS_N & ~GEN_RNW & (GEN_VA[23:1] >= 23'h600000) & (GEN_VA[23:1] < 23'h600002);
+// word-RAM window (200000-23FFFF) read rate (>>13), shown in row 2's pad
+// byte. Qualified on ASEL_N, not AS_N, so VDP-DMA reads count too (gen.sv
+// only asserts the exported AS_N for CPU-mastered cycles).
+reg [20:0] dbg_wrrd_cnt = 0;
+reg  [7:0] dbg_wrrd_rate = 0;
+reg        dbg_wrrd_d = 0;
+wire       dbg_wrrd = ~GEN_ASEL_N & GEN_RNW & (GEN_VA[23:1] >= 23'h100000) & (GEN_VA[23:1] < 23'h120000);
+// main-CPU writes to gate-array A12003 (DMNA) per second, shown in row 3's
+// pad byte: the word-RAM bank-swap request rate. 3C = 60Hz produce/consume
+// loop, 1E = the handshake itself runs at half rate. Saturates at FF.
+reg  [7:0] dbg_dmna_cnt = 0;
+reg  [7:0] dbg_dmna_rate = 0;
+reg        dbg_dmna_d = 0;
+wire       dbg_dmna = ~GEN_AS_N & ~GEN_RNW & (GEN_VA[23:1] == 23'h509001);
 reg [22:0] dbg_rate_cnt = 0;
 reg [22:0] dbg_rate = 0;         // sub address changes in the last second
 reg [25:0] dbg_ipl_cnt = 0;
