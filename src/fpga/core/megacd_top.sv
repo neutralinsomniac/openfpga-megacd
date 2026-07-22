@@ -775,12 +775,13 @@ reg vs_prev;
 reg [9:0] dbg_x, dbg_y;
 reg       dbg_de_line;
 
-// hex readout row 1: GG VV MM SS
+// hex readout row 1: GG LL MM SS
 //   GG = GFX-engine ops completed/s (3C = one op per frame, 00 = unused)
-//   VV = VDP data-port write rate >>13
+//   LL = longest GFX op this second, clk_sys cycles >>13 (153.5us units;
+//        one NTSC frame ~0x6D, so >0x36 means two ops can't fit a frame)
 //   MM = main-CPU bus-cycle rate >>13 (ideal ~E8, starved ~74)
 //   SS = sub-CPU addr-change rate >>14 (ideal ~BE, starved lower)
-wire [31:0] dbg_hexval = {dbg_gfx_rate, dbg_vdpw_rate,
+wire [31:0] dbg_hexval = {dbg_gfx_rate, dbg_glen,
                           dbg_bus_rate,
                           dbg_sub_rate};
 wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
@@ -1863,6 +1864,8 @@ always @(posedge clk_sys) begin
 			dbg_vdpwf_cnt <= 0;
 			dbg_gfxf_rate <= dbg_gfxf_cnt;
 			dbg_gfxf_cnt <= 0;
+			dbg_glen <= dbg_glen_max;
+			dbg_glen_max <= 0;
 		end else begin
 			dbg_sec <= dbg_sec + 1'b1;
 			dbg_as_d <= GEN_AS_N;
@@ -1884,6 +1887,14 @@ always @(posedge clk_sys) begin
 			if (dbg_gron) dbg_gron_cnt <= dbg_gron_cnt + 1'b1;
 			dbg_gron_d <= dbg_gron;
 			if (dbg_gron_d & ~dbg_gron & ~&dbg_gfx_cnt) dbg_gfx_cnt <= dbg_gfx_cnt + 1'b1;
+			// GFX op duration: count clk cycles while GRON high; keep the
+			// second's max as a saturating >>13 byte
+			if (dbg_gron) begin
+				if (~&dbg_glen_cnt) dbg_glen_cnt <= dbg_glen_cnt + 1'b1;
+			end else if (dbg_gron_d) begin
+				if (dbg_glen_byte > dbg_glen_max) dbg_glen_max <= dbg_glen_byte;
+				dbg_glen_cnt <= 0;
+			end
 			// per-frame parity: at each vblank rising edge, count whether the
 			// frame just ended saw any data-port write / any GFX-op completion.
 			// 3C = the event happens every frame; 1E = bunched in alternate frames.
@@ -1961,6 +1972,9 @@ reg [25:0] dbg_gron_cnt = 0;
 reg [2:0]  dbg_gron_duty = 0;    // GFX op in-flight duty (/8)
 reg        dbg_gron_d = 0;
 reg [7:0]  dbg_gfx_cnt = 0, dbg_gfx_rate = 0;  // GFX ops completed/sec (saturating)
+reg [23:0] dbg_glen_cnt = 0;     // clk cycles of the in-flight GFX op
+wire [7:0] dbg_glen_byte = |dbg_glen_cnt[23:21] ? 8'hFF : dbg_glen_cnt[20:13];
+reg [7:0]  dbg_glen_max = 0, dbg_glen = 0;     // longest op this/last second
 reg [7:0]  dbg_sub_rate = 0;     // sub addr-change rate >>14 (ideal ~0xBE)
 reg        dbg_vbl_d = 0;
 reg        dbg_f_vdpw = 0, dbg_f_gfx = 0;      // event-seen-this-frame flags
