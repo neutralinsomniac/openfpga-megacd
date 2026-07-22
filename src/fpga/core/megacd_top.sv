@@ -775,10 +775,14 @@ reg vs_prev;
 reg [9:0] dbg_x, dbg_y;
 reg       dbg_de_line;
 
-// hex readout: II 44 P2 P1 JJ (INT2 acks/s, INT4 acks/s, duties, live joypad byte)
-wire [31:0] dbg_hexval = {dbg_ack2_rate, dbg_vdpw_rate,
+// hex readout row 1: GG VV MM SS
+//   GG = GFX-engine ops completed/s (3C = one op per frame, 00 = unused)
+//   VV = VDP data-port write rate >>13
+//   MM = main-CPU bus-cycle rate >>13 (ideal ~E8, starved ~74)
+//   SS = sub-CPU addr-change rate >>14 (ideal ~BE, starved lower)
+wire [31:0] dbg_hexval = {dbg_gfx_rate, dbg_vdpw_rate,
                           dbg_bus_rate,
-                          joystick_0[7:0]};
+                          dbg_sub_rate};
 wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
                          (dbg_y < 10'd54) ? {dbg_wrrd_rate, dbg_m68k_smp} :
                          (dbg_y < 10'd66) ? {dbg_dmna_rate, dbg_s68k_smp} :
@@ -869,6 +873,11 @@ always @(posedge current_pix_clk) begin
                 // IRQ-pending duty: green <25%, yellow <75%, red = storm
                 6'd7: video_rgb_reg <= (dbg_ipl_duty >= 3'd6) ? 24'hFF0000 :
                                        (dbg_ipl_duty >= 3'd2) ? 24'hFFFF00 : 24'h00FF00;
+                // GFX-engine busy duty: gray = idle all second, green <25%,
+                // yellow <75%, red = saturated (producer-bound)
+                6'd8: video_rgb_reg <= (dbg_gron_duty >= 3'd6) ? 24'hFF0000 :
+                                       (dbg_gron_duty >= 3'd2) ? 24'hFFFF00 :
+                                       (dbg_gron_duty != 0 || dbg_gfx_rate != 0) ? 24'h00FF00 : 24'h404040;
                 default: ;
             endcase
         end else if (dbg_y < 10'd20) begin
@@ -1847,6 +1856,9 @@ always @(posedge clk_sys) begin
 			dbg_wrrd_cnt <= 0;
 			dbg_dmna_rate <= dbg_dmna_cnt;
 			dbg_dmna_cnt <= 0;
+			dbg_gfx_rate <= dbg_gfx_cnt;
+			dbg_gfx_cnt <= 0;
+			dbg_sub_rate <= dbg_rate_cnt[22] ? 8'hFF : dbg_rate_cnt[21:14];
 		end else begin
 			dbg_sec <= dbg_sec + 1'b1;
 			dbg_as_d <= GEN_AS_N;
@@ -1866,6 +1878,8 @@ always @(posedge clk_sys) begin
 			if (dbg_int_ack[2] & ~dbg_ack_d[2] & ~&dbg_ack2_cnt) dbg_ack2_cnt <= dbg_ack2_cnt + 1'b1;
 			if (dbg_int_ack[4] & ~dbg_ack_d[4] & ~&dbg_ack4_cnt) dbg_ack4_cnt <= dbg_ack4_cnt + 1'b1;
 			if (dbg_gron) dbg_gron_cnt <= dbg_gron_cnt + 1'b1;
+			dbg_gron_d <= dbg_gron;
+			if (dbg_gron_d & ~dbg_gron & ~&dbg_gfx_cnt) dbg_gfx_cnt <= dbg_gfx_cnt + 1'b1;
 		end
 		if (cdd_send) dbg_cdd_seen <= 1;
 		if (WR0_RD | WR0_WR | WR1_RD | WR1_WR) dbg_wr_req <= 1;
@@ -1929,6 +1943,9 @@ reg [7:0]  dbg_ack2_cnt = 0, dbg_ack2_rate = 0;  // INT2 (frame) acks/sec
 reg [7:0]  dbg_ack4_cnt = 0, dbg_ack4_rate = 0;  // INT4 (CDD) acks/sec
 reg [25:0] dbg_gron_cnt = 0;
 reg [2:0]  dbg_gron_duty = 0;    // GFX op in-flight duty (/8)
+reg        dbg_gron_d = 0;
+reg [7:0]  dbg_gfx_cnt = 0, dbg_gfx_rate = 0;  // GFX ops completed/sec (saturating)
+reg [7:0]  dbg_sub_rate = 0;     // sub addr-change rate >>14 (ideal ~0xBE)
 reg [23:0] dbg_m68k_smp = 0;     // 1Hz address-bus samples (crude profiler)
 reg [23:0] dbg_s68k_smp = 0;
 
