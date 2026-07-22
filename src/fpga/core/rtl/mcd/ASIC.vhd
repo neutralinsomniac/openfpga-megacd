@@ -2141,7 +2141,13 @@ begin
 				STAMP_N := GFX.SD(10 downto 0);
 				case GS is
 					when GS_IDLE => 
-						if GRON = '1' and CLK_12M_R = '1' then
+						-- Pocket port: the memory states below free-run at CLK instead of the
+							-- 12.5MHz enable. With word RAM external, every access is a full
+							-- handshake round trip; quantizing issue+consume to 12.5MHz edges
+							-- padded each access to ~3 enable periods and made a swirl GFX op
+							-- miss the BIOS's two-ops-per-frame deadline (half-speed swirl).
+							-- Op start stays on the enable edge.
+							if GRON = '1' and CLK_12M_R = '1' then
 							VA <= TVBA & "00";
 							IMAGE_DOT <= unsigned(DOT);
 							IMAGE_LINE <= "0000000000000" & unsigned(LN);
@@ -2152,7 +2158,7 @@ begin
 						end if;
 						
 					when GS_XY_READ => 
-						if CLK_12M_R = '1' then
+						if EN = '1' then	-- Pocket port: no 12.5MHz gate, see note at GS_IDLE
 							GFX_ADDR <= VA;
 							GFX_SEL <= '1';
 							GFX_RMW <= '0';
@@ -2162,7 +2168,7 @@ begin
 					when GS_XY_WAIT =>
 						if GFX_SEL = '1' and WR_GFX_RUN = '1' then
 							GFX_SEL <= '0';
-						elsif GFX_SEL = '0' and WR_GFX_RUN = '0' and CLK_12M_R = '1' then
+						elsif GFX_SEL = '0' and WR_GFX_RUN = '0' then
 							case VA(2 downto 1) is
 								when "00" => 	GFX.X <= GFX_WORDRAM_DO & x"00";
 								when "01" => 	GFX.Y <= GFX_WORDRAM_DO & x"00";
@@ -2201,7 +2207,7 @@ begin
 						
 						STAMP_A := std_logic_vector( unsigned(STAMP_BASE) + unsigned(STAMP_Y) + unsigned(STAMP_X) );
 						
-						if CLK_12M_R = '1' then
+						if EN = '1' then	-- Pocket port: no 12.5MHz gate, see note at GS_IDLE
 							GFX_ADDR <= STAMP_A;
 							GFX_SEL <= '1';
 							GFX_RMW <= '0';
@@ -2211,7 +2217,7 @@ begin
 					when GS_STAMP_WAIT =>
 						if GFX_SEL = '1' and WR_GFX_RUN = '1' then
 							GFX_SEL <= '0';
-						elsif GFX_SEL = '0' and WR_GFX_RUN = '0' and CLK_12M_R = '1' then
+						elsif GFX_SEL = '0' and WR_GFX_RUN = '0' then
 							GFX.SD <= GFX_WORDRAM_DO;
 							GS <= GS_DOT_READ;
 						end if;
@@ -2251,7 +2257,7 @@ begin
 							STAMP_DATA_ADDR := STAMP_N(10 downto 2) & PIX_X(4 downto 3) & PIX_Y(4 downto 3) & PIX_Y(2 downto 0) & PIX_X(2);
 						end if;
 						
-						if CLK_12M_R = '1' then
+						if EN = '1' then	-- Pocket port: no 12.5MHz gate, see note at GS_IDLE
 							GFX_ADDR <= STAMP_DATA_ADDR;
 							GFX_SEL <= '1';
 							GFX_RMW <= '0';
@@ -2261,7 +2267,7 @@ begin
 					when GS_DOT_WAIT =>
 						if GFX_SEL = '1' and WR_GFX_RUN = '1' then
 							GFX_SEL <= '0';
-						elsif GFX_SEL = '0' and WR_GFX_RUN = '0' and CLK_12M_R = '1' then
+						elsif GFX_SEL = '0' and WR_GFX_RUN = '0' then
 							if STAMP_N = "00000000000" or OUTSIDE = '1' then
 								COLOR := (others => '0');
 							else
@@ -2293,7 +2299,7 @@ begin
 						end if;
 	
 					when GS_WRITE =>					
-						if CLK_12M_R = '1' then
+						if EN = '1' then	-- Pocket port: no 12.5MHz gate, see note at GS_IDLE
 							GFX_ADDR <= IMAGE_DATA_ADDR(18 downto 2);
 							GFX_SEL <= '1';
 							GFX_RMW <= '1';
@@ -2304,7 +2310,7 @@ begin
 						if GFX_SEL = '1' and WR_GFX_RUN = '1' then
 							GFX_SEL <= '0';
 							GFX_RMW <= '0';
-						elsif GFX_SEL = '0' and WR_GFX_RUN = '0' and CLK_12M_R = '1' then
+						elsif GFX_SEL = '0' and WR_GFX_RUN = '0' then
 							IMAGE_DOT(2) <= not IMAGE_DOT(2);
 							if IMAGE_DOT(2) = '1' then
 								IMAGE_CELL <= IMAGE_CELL + unsigned(VCS) + 1;
