@@ -784,8 +784,8 @@ wire [31:0] dbg_hexval = {dbg_gfx_rate, dbg_vdpw_rate,
                           dbg_bus_rate,
                           dbg_sub_rate};
 wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
-                         (dbg_y < 10'd54) ? {dbg_wrrd_rate, dbg_m68k_smp} :
-                         (dbg_y < 10'd66) ? {dbg_dmna_rate, dbg_s68k_smp} :
+                         (dbg_y < 10'd54) ? {dbg_vdpwf_rate, dbg_m68k_smp} :
+                         (dbg_y < 10'd66) ? {dbg_gfxf_rate, dbg_s68k_smp} :
                          (dbg_y < 10'd78) ? dbg_prg_data[255:224] :
                          (dbg_y < 10'd90) ? dbg_prg_data[223:192] :
                          (dbg_y < 10'd102) ? dbg_prg_data[191:160] :
@@ -901,7 +901,7 @@ always @(posedge current_pix_clk) begin
                 default: ;
             endcase
         end else if (dbg_y >= 10'd30 && dbg_y < 10'd162) begin
-            // numeric readout rows: stats / [WR-rd rate, M68K addr] / [DMNA rate, S68K addr]
+            // numeric readout rows: stats / [frames-with-blit, M68K addr] / [frames-with-GFX-op, S68K addr]
             if (dbg_x[9:4] < 6'd8) begin
                 if (~dbg_x[3])
                     video_rgb_reg <= dbg_grow[2'd3 - dbg_x[2:1]] ? 24'hFFFFFF : 24'h000000;
@@ -1859,6 +1859,10 @@ always @(posedge clk_sys) begin
 			dbg_gfx_rate <= dbg_gfx_cnt;
 			dbg_gfx_cnt <= 0;
 			dbg_sub_rate <= dbg_rate_cnt[22] ? 8'hFF : dbg_rate_cnt[21:14];
+			dbg_vdpwf_rate <= dbg_vdpwf_cnt;
+			dbg_vdpwf_cnt <= 0;
+			dbg_gfxf_rate <= dbg_gfxf_cnt;
+			dbg_gfxf_cnt <= 0;
 		end else begin
 			dbg_sec <= dbg_sec + 1'b1;
 			dbg_as_d <= GEN_AS_N;
@@ -1880,6 +1884,18 @@ always @(posedge clk_sys) begin
 			if (dbg_gron) dbg_gron_cnt <= dbg_gron_cnt + 1'b1;
 			dbg_gron_d <= dbg_gron;
 			if (dbg_gron_d & ~dbg_gron & ~&dbg_gfx_cnt) dbg_gfx_cnt <= dbg_gfx_cnt + 1'b1;
+			// per-frame parity: at each vblank rising edge, count whether the
+			// frame just ended saw any data-port write / any GFX-op completion.
+			// 3C = the event happens every frame; 1E = bunched in alternate frames.
+			dbg_vbl_d <= vblank_sys;
+			if (~dbg_vbl_d & vblank_sys) begin
+				if (dbg_f_vdpw & ~&dbg_vdpwf_cnt) dbg_vdpwf_cnt <= dbg_vdpwf_cnt + 1'b1;
+				if (dbg_f_gfx & ~&dbg_gfxf_cnt) dbg_gfxf_cnt <= dbg_gfxf_cnt + 1'b1;
+				dbg_f_vdpw <= 0;
+				dbg_f_gfx <= 0;
+			end
+			if (~dbg_vdpw_d & dbg_vdpw) dbg_f_vdpw <= 1;
+			if (dbg_gron_d & ~dbg_gron) dbg_f_gfx <= 1;
 		end
 		if (cdd_send) dbg_cdd_seen <= 1;
 		if (WR0_RD | WR0_WR | WR1_RD | WR1_WR) dbg_wr_req <= 1;
@@ -1946,6 +1962,10 @@ reg [2:0]  dbg_gron_duty = 0;    // GFX op in-flight duty (/8)
 reg        dbg_gron_d = 0;
 reg [7:0]  dbg_gfx_cnt = 0, dbg_gfx_rate = 0;  // GFX ops completed/sec (saturating)
 reg [7:0]  dbg_sub_rate = 0;     // sub addr-change rate >>14 (ideal ~0xBE)
+reg        dbg_vbl_d = 0;
+reg        dbg_f_vdpw = 0, dbg_f_gfx = 0;      // event-seen-this-frame flags
+reg [7:0]  dbg_vdpwf_cnt = 0, dbg_vdpwf_rate = 0;  // frames/sec with a data-port write
+reg [7:0]  dbg_gfxf_cnt = 0, dbg_gfxf_rate = 0;    // frames/sec with a GFX-op completion
 reg [23:0] dbg_m68k_smp = 0;     // 1Hz address-bus samples (crude profiler)
 reg [23:0] dbg_s68k_smp = 0;
 
