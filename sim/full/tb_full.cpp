@@ -327,6 +327,8 @@ int main(int argc,char**argv){
         printf("%04X ", dut->rootp->core_top__DOT__sdram__DOT__mem[w] & 0xFFFF);
 #endif
     printf("\n");
+    printf("ST2 word-RAM selftest: ph=%d err=%d\n",
+           dut->rootp->core_top__DOT__st2_ph, dut->rootp->core_top__DOT__st2_err);
     dut->final(); delete dut;
     printf("done\n");
     return 0;

@@ -1194,6 +1194,51 @@ reg         wr_active /* verilator public_flat_rd */ = 0;
 reg         wr_rd_r = 0, wr_wr_r = 0;
 reg  [15:0] wr_addr;
 reg  [15:0] wr_din;
+
+// ---- word-RAM read cache (16KB, direct-mapped) ---------------------------
+// After the RMW phase-skip, GFX op time is dominated by per-access overhead,
+// not SDRAM busy time (~133ns of a ~580ns access): the ASIC engine
+// requantizes every access to its 12.5MHz enable, so shaving the arbiter
+// round trip below one 12.5MHz period is what shortens an op. Hits complete
+// in 2 arbiter cycles. Coherence is exact: every word-RAM write (either
+// bank, any client) is granted through this same arbiter and updates the
+// cached entry in place. Key = {bank, word addr} = 17 bits; 8K entries so
+// tag is 4 bits; entry = {valid, tag[3:0], data[15:0]}.
+reg [20:0] wrc [0:8191];
+reg [20:0] wrc_q;
+reg        wrc_flushing = 1;
+reg [12:0] wrc_flush_a = 0;
+reg        wrc_busy_d = 0;
+reg        wr_chk = 0;
+reg  [3:0] wr_tag;
+reg [12:0] wr_idx;
+
+wire        wrc_sel0  = grant0_rd | grant0_wr;
+wire        wrc_gsel  = !wr_active && !wrc_flushing && !dbg_prg_active && !dump_active &&
+                        !((reset & ~st2_active) | bios_download) &&
+                        (wrc_sel0 | grant1_rd | grant1_wr);
+wire        wrc_gisrd = wrc_sel0 ? grant0_rd : grant1_rd;
+wire [16:0] wrc_gkey  = wrc_sel0 ? {1'b0, WR0_A} : {1'b1, WR1_A};
+wire [15:0] wrc_gdin  = wrc_sel0 ? WR0_DO : WR1_DO;
+
+always @(posedge clk_sys) begin
+	// grant cycle: look up the live key; afterwards hold the latched index
+	// (the live key can switch to the other bank's request mid-transaction,
+	// which must not reload wrc_q under the pending compare)
+	wrc_q <= wrc[wrc_gsel ? wrc_gkey[12:0] : wr_idx];
+	wrc_busy_d <= sdld_busy;
+	if ((reset & ~st2_active) | bios_download) begin
+		wrc_flushing <= 1;
+		wrc_flush_a  <= 0;
+	end else if (wrc_flushing) begin
+		wrc[wrc_flush_a] <= 21'd0;
+		{wrc_flushing, wrc_flush_a} <= {1'b1, wrc_flush_a} + 1'b1;
+	end else if (wrc_gsel && !wrc_gisrd) begin
+		wrc[wrc_gkey[12:0]] <= {1'b1, wrc_gkey[16:13], wrc_gdin};   // write-update
+	end else if (wr_active && wr_rd_r && wrc_busy_d && ~sdld_busy) begin
+		wrc[wr_idx] <= {1'b1, wr_tag, sdwr_do};                     // miss fill
+	end
+end
 // per-direction re-grant guards: a completed access holds off a new grant
 // until its request line drops (RMW flips RD->WR on one edge, so the two
 // directions must be tracked independently). The hold must NOT rely on the
@@ -1245,17 +1290,22 @@ always @(posedge clk_sys) begin
 		WR1_RDY <= 1;
 		wr_rd_r <= 0;
 		wr_wr_r <= 0;
+		wr_chk  <= 0;
 		wr0_rd_hold <= 0;
 		wr0_wr_hold <= 0;
 		wr1_rd_hold <= 0;
 		wr1_wr_hold <= 0;
-	end else if (!wr_active && !dbg_prg_active && !dump_active) begin
+	end else if (!wr_active && !wrc_flushing && !dbg_prg_active && !dump_active) begin
 		if (grant0_rd | grant0_wr) begin
 			wr_active <= 1;
 			wr_owner  <= 0;
 			wr_addr   <= WR0_A;
 			wr_din    <= WR0_DO;
-			wr_rd_r   <= grant0_rd;
+			// reads take a cache-lookup cycle first (wr_chk); the RAM read
+			// for {bank,addr} was issued combinationally this same cycle
+			wr_chk    <= grant0_rd;
+			{wr_tag, wr_idx} <= {1'b0, WR0_A};
+			wr_rd_r   <= 0;
 			wr_wr_r   <= grant0_wr & ~grant0_rd;
 			WR0_RDY   <= 0;
 		end else if (grant1_rd | grant1_wr) begin
@@ -1263,9 +1313,28 @@ always @(posedge clk_sys) begin
 			wr_owner  <= 1;
 			wr_addr   <= WR1_A;
 			wr_din    <= WR1_DO;
-			wr_rd_r   <= grant1_rd;
+			wr_chk    <= grant1_rd;
+			{wr_tag, wr_idx} <= {1'b1, WR1_A};
+			wr_rd_r   <= 0;
 			wr_wr_r   <= grant1_wr & ~grant1_rd;
 			WR1_RDY   <= 0;
+		end
+	end else if (wr_chk) begin
+		wr_chk <= 0;
+		if (wrc_q[20] && wrc_q[19:16] == wr_tag) begin
+			// hit: complete without touching SDRAM (2-cycle read)
+			if (!wr_owner) begin
+				WR0_DI  <= wrc_q[15:0];
+				WR0_RDY <= 1;
+				wr0_rd_hold <= 1; wr0_rd_tmo <= HOLD_TMO;
+			end else begin
+				WR1_DI  <= wrc_q[15:0];
+				WR1_RDY <= 1;
+				wr1_rd_hold <= 1; wr1_rd_tmo <= HOLD_TMO;
+			end
+			wr_active <= 0;
+		end else begin
+			wr_rd_r <= 1;   // miss: start the SDRAM read (fill on completion)
 		end
 	end else if (old_busy & ~sdld_busy) begin
 		if (!wr_owner) begin
@@ -1294,11 +1363,11 @@ end
 ///////////////////////////////////////////////
 
 localparam ST2_N = 10'd1023;
-reg  [1:0] st2_ph = 0;          // 0 wait, 1 RMW pass, 2 verify pass, 3 done
+reg  [1:0] st2_ph /* verilator public_flat_rd */ = 0;  // 0 wait, 1 RMW pass, 2 verify pass, 3 done
 reg  [2:0] st2_s0 = 0, st2_s1 = 0;
 reg  [9:0] st2_idx0 = 0, st2_idx1 = 0;
 reg        st2_d0 = 0, st2_d1 = 0;   // bank finished current pass
-reg [15:0] st2_err = 0;
+reg [15:0] st2_err /* verilator public_flat_rd */ = 0;
 reg        st2_rd0 = 0, st2_wr0 = 0, st2_rd1 = 0, st2_wr1 = 0;
 reg [19:0] st2_wait = 0;
 reg        st_done = 0, st_pass = 0;
