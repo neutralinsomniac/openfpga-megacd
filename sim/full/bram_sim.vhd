@@ -143,7 +143,8 @@ begin
 			end if;
 		end if;
 	end process;
-	-- port B: wide (RATIO consecutive narrow words, big-endian within the word)
+	-- port B: wide (RATIO consecutive narrow words). altsyncram mixed-width
+	-- packing is little-endian: wide-port LSB slice <-> LOWEST narrow address
 	process(clock)
 		variable base : integer;
 		variable rd   : std_logic_vector(data_width_b-1 downto 0);
@@ -153,11 +154,11 @@ begin
 				base := to_integer(unsigned(address_b)) * RATIO;
 				if wren_b = '1' then
 					for i in 0 to RATIO-1 loop
-						mem(base + i) := data_b((RATIO-1-i)*data_width_a + data_width_a-1 downto (RATIO-1-i)*data_width_a);
+						mem(base + i) := data_b(i*data_width_a + data_width_a-1 downto i*data_width_a);
 					end loop;
 				end if;
 				for i in 0 to RATIO-1 loop
-					rd((RATIO-1-i)*data_width_a + data_width_a-1 downto (RATIO-1-i)*data_width_a) := mem(base + i);
+					rd(i*data_width_a + data_width_a-1 downto i*data_width_a) := mem(base + i);
 				end loop;
 				qb <= rd;
 			end if;

@@ -105,6 +105,17 @@
         }
       },
       {
+        "name": "Debug Overlay",
+        "id": 599,
+        "type": "check",
+        "enabled": true,
+        "persist": true,
+        "address": "0x00000110",
+        "writeonly": true,
+        "defaultval": 0,
+        "value": 1
+      },
+      {
         "name": "M30 Controllers",
         "id": 499,
         "type": "check",

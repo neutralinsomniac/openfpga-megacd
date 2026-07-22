@@ -10,6 +10,29 @@
 #include <cstring>
 #include <deque>
 #include <vector>
+#include <string>
+#include <dirent.h>
+#include <strings.h>
+
+// FAT-style case-insensitive open: exact first, then scan the directory
+static FILE* fopen_fat(const char* path){
+    FILE* f = fopen(path, "rb");
+    if(f) return f;
+    const char* slash = strrchr(path, '/');
+    if(!slash) return nullptr;
+    std::string dir(path, slash - path), want(slash + 1);
+    DIR* d = opendir(dir.c_str());
+    if(!d) return nullptr;
+    while(struct dirent* e = readdir(d)){
+        if(!strcasecmp(e->d_name, want.c_str())){
+            std::string full = dir + "/" + e->d_name;
+            f = fopen(full.c_str(), "rb");
+            break;
+        }
+    }
+    closedir(d);
+    return f;
+}
 static vluint64_t t=0; double sc_time_stamp(){return t;}
 
 int main(int argc,char**argv){
@@ -49,6 +72,12 @@ int main(int argc,char**argv){
             if(c>=1150000000 && c<1165000000) k |= 1u<<3;  // RIGHT on player screen
             if(c>=1230000000 && c<1245000000) k |= 1u<<1;  // DOWN too
             if(c>=1400000000 && c<1415000000) k |= 1u<<3;  // RIGHT (post-auto-open)
+            // PRESS_START=start,end : extra scripted START window (e.g. to
+            // skip the game intro movie like a real player would)
+            { static long ps0=-1, ps1=-1; static bool psi=false;
+              if(!psi){ psi=true; const char* e=getenv("PRESS_START");
+                        if(e) sscanf(e,"%ld,%ld",&ps0,&ps1); }
+              if(ps0>=0 && c>=ps0 && c<ps1) k |= 1u<<15; }
             dut->cont1_key = k;
         }
 
@@ -58,42 +87,111 @@ int main(int argc,char**argv){
         // command 0x0180 (dataslot read) by writing the requested bytes
         // through the bridge into the sector buffer.
         {
-            static FILE* cdf=nullptr; static uint32_t cdsize=0; static bool cdinit=false;
+            static FILE* f1=nullptr;      // slot 1: mounted file (cue or bin)
+            static FILE* f2=nullptr;      // slot 2: bin opened via 0x0192
+            static char  f1path[512];
+            static uint32_t size1=0; static bool cdinit=false;
             static bool table_written=false;
             struct W { uint32_t a,d; };
             static std::deque<W> q; static int ph=0;
             if(!cdinit){ cdinit=true;
                 for(int i=1;i<argc;i++) if(!strcmp(argv[i],"--cd")&&i+1<argc){
-                    cdf=fopen(argv[i+1],"rb");
-                    if(cdf){ fseek(cdf,0,SEEK_END); cdsize=(uint32_t)ftell(cdf); }
-                    printf("CD image: %s (%u bytes)%s\n", argv[i+1], cdsize,
-                           cdf?"":" -- OPEN FAILED");
+                    snprintf(f1path,sizeof f1path,"%s",argv[i+1]);
+                    f1=fopen(f1path,"rb");
+                    if(f1){ fseek(f1,0,SEEK_END); size1=(uint32_t)ftell(f1); }
+                    printf("CD slot 1: %s (%u bytes)%s\n", f1path, size1,
+                           f1?"":" -- OPEN FAILED");
                 }
             }
+            if(c==60000){   // post-layout TOC snapshot
+                for(int t=1;t<=4;t++){
+                    auto& w=dut->rootp->core_top__DOT__toc_ram_b[t];
+                    uint64_t lo=((uint64_t)w[1]<<32)|w[0]; uint32_t hi=w[2];
+                    printf("  TOCPOST[%d]: audio=%d pgap=%d pre01=%d file=%d delta=%d disc_lba=%d\n",
+                           t,(int)((hi>>1)&1),(int)((((uint64_t)(hi&1)<<7)|(lo>>57))&0xFF),
+                           (int)((lo>>47)&0x3FF),(int)((lo>>40)&0x7F),
+                           (int)((lo>>20)&0xFFFFF),(int)(lo&0xFFFFF));
+                }
+            }
+            // MOUNT_AT=<cycle>: delay the mount to model a user browsing
+            // the menu mid-session (the default mounts at boot)
+            static long mount_at = 5001;
+            { static bool mi=false; if(!mi){ mi=true;
+                const char* e=getenv("MOUNT_AT"); if(e) mount_at=atol(e); } }
             if(did_reset_exit && c>5000){
-                if(cdf && !table_written){ table_written=true;
-                    q.push_back({0xF8002014u, cdsize});   // datatable: slot idx 2 size
+                if(f1 && !table_written && c>mount_at){ table_written=true;
+                    printf("[%ld] mounting CD (008A)\n", c);
+                    q.push_back({0xF8002014u, size1});   // datatable: slot idx 2 size
+                    // deferload mount notification (host cmd 0x008A):
+                    // params first, then the command word
+                    q.push_back({0xF8000020u, 1u});      // slot id
+                    q.push_back({0xF8000024u, size1});   // size
+                    q.push_back({0xF8000000u, 0x434D008Au});
                 }
                 if(q.empty() && (c&63)==0){
                     uint32_t t0 = dut->rootp->core_top__DOT__icb__DOT__target_0;
                     if(t0==0x636D0140u){                  // Ready To Run
                         q.push_back({0xF8001000u,0x6F6B0000u});
                     } else if(t0==0x636D0180u){           // dataslot read
+                        uint32_t id =dut->rootp->core_top__DOT__icb__DOT__target_20&0xFFFF;
                         uint32_t off=dut->rootp->core_top__DOT__icb__DOT__target_24;
                         uint32_t dst=dut->rootp->core_top__DOT__icb__DOT__target_28;
                         uint32_t len=dut->rootp->core_top__DOT__icb__DOT__target_2C;
+                        FILE* f = (id==2) ? f2 : f1;
                         static long nserved=0;
                         if(nserved<8 || (nserved&511)==0)
-                            printf("[%ld] CD read #%ld: off=%u len=%u dst=%08X\n",
-                                   c,nserved,off,len,dst);
+                            printf("[%ld] CD read #%ld: slot=%u off=%u len=%u dst=%08X\n",
+                                   c,nserved,id,off,len,dst);
                         nserved++;
-                        std::vector<uint8_t> buf(((size_t)len+3)&~(size_t)3,0);
-                        if(cdf){ fseek(cdf,off,SEEK_SET);
-                                 size_t got=fread(buf.data(),1,len,cdf); (void)got; }
-                        for(uint32_t i=0;i<len;i+=4)
-                            q.push_back({dst+i,(uint32_t)((buf[i]<<24)|(buf[i+1]<<16)|
-                                                          (buf[i+2]<<8)|buf[i+3])});
+                        // model firmware semantics: reads past EOF are an
+                        // "out of range" error and deliver NO data
+                        uint32_t fsz=0;
+                        if(f){ fseek(f,0,SEEK_END); fsz=(uint32_t)ftell(f); }
+                        bool ok = f && (uint64_t)off+len <= fsz;
+                        if(ok){
+                            std::vector<uint8_t> buf(((size_t)len+3)&~(size_t)3,0);
+                            fseek(f,off,SEEK_SET);
+                            size_t got=fread(buf.data(),1,len,f); (void)got;
+                            for(uint32_t i=0;i<len;i+=4)
+                                q.push_back({dst+i,(uint32_t)((buf[i]<<24)|(buf[i+1]<<16)|
+                                                              (buf[i+2]<<8)|buf[i+3])});
+                        } else if(nserved<20 || (nserved&255)==0)
+                            printf("[%ld] CD read ERR: slot=%u off=%u len=%u fsz=%u\n",
+                                   c,id,off,len,fsz);
+                        q.push_back({0xF8001000u,(uint32_t)(ok?0x6F6B0000u:0x6F6B0002u)});
+                    } else if(t0==0x636D0190u){           // getfile: write slot path
+                        uint32_t ptr=dut->rootp->core_top__DOT__icb__DOT__target_24;
+                        printf("[%ld] CD getfile -> %08X ('%s')\n",c,ptr,f1path);
+                        size_t n=strlen(f1path)+1;
+                        for(size_t i=0;i<n;i+=4){
+                            uint8_t b[4]={0,0,0,0};
+                            for(int k=0;k<4&&i+k<n;k++) b[k]=(uint8_t)f1path[i+k];
+                            q.push_back({(uint32_t)(ptr+i),
+                                (uint32_t)((b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3])});
+                        }
                         q.push_back({0xF8001000u,0x6F6B0000u});
+                    } else if(t0==0x636D0192u){           // openfile: read param path
+                        char path[257];
+                        for(int i=0;i<64;i++){
+                            uint32_t w=dut->rootp->core_top__DOT__icb__DOT__fbuf_ram_b[128+i];
+                            path[i*4+0]=(char)(w>>24); path[i*4+1]=(char)(w>>16);
+                            path[i*4+2]=(char)(w>>8);  path[i*4+3]=(char)w;
+                        }
+                        path[256]=0;
+                        printf("[%ld] fbuf[0]=%08X fbuf[1]=%08X fbuf[128]=%08X fbuf[129]=%08X\n",
+                               c, dut->rootp->core_top__DOT__icb__DOT__fbuf_ram_b[0],
+                               dut->rootp->core_top__DOT__icb__DOT__fbuf_ram_b[1],
+                               dut->rootp->core_top__DOT__icb__DOT__fbuf_ram_b[128],
+                               dut->rootp->core_top__DOT__icb__DOT__fbuf_ram_b[129]);
+                        if(f2) fclose(f2);
+                        f2=fopen_fat(path);
+                        uint32_t size2=0;
+                        if(f2){ fseek(f2,0,SEEK_END); size2=(uint32_t)ftell(f2); }
+                        printf("[%ld] CD openfile slot2: '%s' (%u bytes)%s\n",
+                               c,path,size2,f2?"":" -- OPEN FAILED");
+
+                        if(f2) q.push_back({0xF800201Cu,size2}); // datatable idx 3 size
+                        q.push_back({0xF8001000u,(uint32_t)(f2?0x6F6B0000u:0x6F6B0003u)});
                     }
                 }
                 if(!q.empty()){
@@ -107,6 +205,81 @@ int main(int argc,char**argv){
             }
         }
         dut->eval(); t++;
+
+        // ---- CDC instrumentation ----
+        // CDCTRACE=start[,end]: log the sub<->CDC register dialogue (AR
+        // shadow mirrors the LC8951 auto-increment) + host-read bursts +
+        // DTEN/INT edges. CDCRAMDUMP=iter: dump the 16KB CDC buffer RAM.
+        {
+            static long ct0=-1, ct1=(1L<<62); static long crd=-1;
+            static bool ci=false;
+            if(!ci){ ci=true;
+                const char* e=getenv("CDCTRACE");
+                if(e) sscanf(e,"%ld,%ld",&ct0,&ct1);
+                e=getenv("CDCRAMDUMP");
+                if(e) crd=atol(e);
+            }
+            auto* rr = dut->rootp;
+            static const char* wrn[16]={"SBOUT","IFCTRL","DBCL","DBCH","DACL","DACH","DTTRG","DTACK","WAL","WAH","CTRL0","CTRL1","PTL","PTH","CTRL2","RESET"};
+            static const char* rdn[16]={"COMIN","IFSTAT","DBCL","DBCH","HEAD0","HEAD1","HEAD2","HEAD3","PTL","PTH","WAL","WAH","STAT0","STAT1","STAT2","STAT3"};
+            static int ar=0, wr_p=1, rd_p=1, hrd_p=1, dten_p=1, int_p=1;
+            static int rd_ar=-1;
+            static long hn=0; static uint8_t hfirst[32]; static long hlast=0;
+            int cs  = rr->core_top__DOT__MCD__DOT__cdc_n;
+            int wr  = rr->core_top__DOT__MCD__DOT__clwe_n;
+            int rd  = rr->core_top__DOT__MCD__DOT__coe_n;
+            int rs  = rr->core_top__DOT__MCD__DOT__s68k_a & 1;
+            int di  = rr->core_top__DOT__MCD__DOT__s68k_do & 0xFF;
+            int dob = rr->core_top__DOT__MCD__DOT__cdc_do;
+            int hrd = rr->core_top__DOT__MCD__DOT__cdc_hrd_n;
+            int hdo = rr->core_top__DOT__MCD__DOT__cdc_hdo;
+            int dten= rr->core_top__DOT__MCD__DOT__cdc_dten_n;
+            int intn= rr->core_top__DOT__MCD__DOT__cdc_int_n;
+            bool on = (c>=ct0 && c<ct1);
+            auto hflush=[&](){ if(hn){
+                printf("CDC [%ld] HOST burst %ld bytes:",hlast,hn);
+                for(int i=0;i<(hn<32?hn:32);i++) printf(" %02X",hfirst[i]);
+                printf("%s\n", hn>32?" ...":"");
+                hn=0; } };
+            if(!cs && !wr && wr_p){          // register write strobe
+                if(!rs){ if(on){hflush();printf("CDC [%ld] AR <= %X\n",c,di&15);} ar=di&15; }
+                else {
+                    if(on){hflush();printf("CDC [%ld] WR %-6s <= %02X\n",c,wrn[ar],di);}
+                    if(ar) ar=(ar+1)&15;
+                }
+            }
+            if(!cs && !rd && rd_p) rd_ar = rs ? ar : 16;   // read begins
+            if(rd && !rd_p && rd_ar>=0){     // read strobe released: DO valid
+                static int lrep_reg=-1, lrep_val=-1; static long lrep_n=0;
+                if(rd_ar==16){ if(on){hflush();printf("CDC [%ld] RD AR = %02X\n",c,dob);} }
+                else {
+                    if(on){
+                        if(rd_ar==lrep_reg && dob==lrep_val) lrep_n++;  // poll dedupe
+                        else {
+                            hflush();
+                            if(lrep_n) printf("CDC ... RD %s repeated x%ld\n",rdn[lrep_reg],lrep_n);
+                            printf("CDC [%ld] RD %-6s = %02X\n",c,rdn[rd_ar],dob);
+                            lrep_reg=rd_ar; lrep_val=dob; lrep_n=0;
+                        }
+                    }
+                    if(ar) ar=(ar+1)&15;
+                }
+                rd_ar=-1;
+            }
+            if(hrd && !hrd_p){               // host byte consumed
+                if(hn<32) hfirst[hn]=hdo;
+                hn++; hlast=c;
+            }
+            if(on && dten!=dten_p){ hflush(); printf("CDC [%ld] DTEN_N=%d\n",c,dten); }
+            if(on && intn!=int_p){ printf("CDC [%ld] INT_N=%d\n",c,intn); }
+            if(on && hn && c-hlast>400000) hflush();
+            wr_p=wr; rd_p=rd; hrd_p=hrd; dten_p=dten; int_p=intn;
+            if(c==crd){
+                FILE*fp=fopen("cdcram_dump.bin","wb");
+                if(fp){ for(int i=0;i<16384;i++) fputc(rr->core_top__DOT__MCD__DOT__cdc_ram__DOT__mem[i],fp); fclose(fp); }
+                printf("[%ld] wrote cdcram_dump.bin\n",c);
+            }
+        }
 
         // ---- video frame capture (PPM dumps), all in clk_sys domain ----
         {
@@ -391,6 +564,18 @@ int main(int argc,char**argv){
         printf("%04X ", dut->rootp->core_top__DOT__sdram__DOT__mem[w] & 0xFFFF);
 #endif
     printf("\n");
+    {   // end-of-run CDC buffer + PRG RAM dumps for offline inspection
+        FILE*fp=fopen("cdcram_end.bin","wb");
+        if(fp){ for(int i=0;i<16384;i++) fputc(dut->rootp->core_top__DOT__MCD__DOT__cdc_ram__DOT__mem[i],fp); fclose(fp); }
+#ifndef REALSD
+        fp=fopen("prgram_end.bin","wb");
+        if(fp){ for(uint32_t w=0x800000;w<0x840000;w++){
+                    uint16_t v=dut->rootp->core_top__DOT__sdram__DOT__mem[w];
+                    fputc(v>>8,fp); fputc(v&0xFF,fp); }
+                fclose(fp); }
+#endif
+        printf("wrote cdcram_end.bin + prgram_end.bin\n");
+    }
     printf("ST2 word-RAM selftest: ph=%d err=%d\n",
            dut->rootp->core_top__DOT__st2_ph, dut->rootp->core_top__DOT__st2_err);
     dut->final(); delete dut;

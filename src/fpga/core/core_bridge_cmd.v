@@ -45,6 +45,10 @@ input   wire            dataslot_requestwrite_ok,
 
 output  reg             dataslot_allcomplete,
 
+output  reg             dataslot_update,
+output  reg     [15:0]  dataslot_update_id,
+output  reg     [31:0]  dataslot_update_size,
+
 // target dataslot read: core-initiated read of a slot file region into
 // bridge address space (APF target command 0x0180). Raise _read with the
 // parameters stable and hold until _ack; _done asserts when the host has
@@ -80,7 +84,29 @@ input   wire            savestate_load_err,
 input   wire    [9:0]   datatable_addr,
 input   wire            datatable_wren,
 input   wire    [31:0]  datatable_data,
-output  wire    [31:0]  datatable_q
+output  wire    [31:0]  datatable_q,
+
+// hardware-overlay debug: live target command register + FSM state
+output  wire    [31:0]  dbg_target_0,
+output  wire    [3:0]   dbg_tstate,
+
+// target getfile/openfile (edge-triggered requests; completion via the
+// shared target_dataslot_done/err). The 1KB file-struct buffer lives here,
+// bridge-mapped at 0xF8xx3000-0xF8xx33FF:
+//   0x3000: getfile response struct (256B path, APF writes)
+//   0x3200: openfile param struct (256B path + flags/size, APF reads)
+input   wire            target_dataslot_getfile,
+input   wire            target_dataslot_openfile,
+// completion strobe for getfile/openfile — SEPARATE from the read done:
+// a shared strobe lets a concurrent file op satisfy a pending sector
+// read's handshake with garbage (stale buffer marked valid)
+output  reg             target_dataslot_file_done,
+// core-side port into the file-struct buffer (32-bit words, byte 0 of a
+// string in bits [31:24] — raw big-endian bridge packing)
+input   wire    [7:0]   fbuf_addr,
+input   wire            fbuf_wr,
+input   wire    [31:0]  fbuf_di,
+output  wire    [31:0]  fbuf_q
 
 );
 
@@ -164,8 +190,42 @@ localparam  [3:0]   TARG_ST_SLOTREAD    = 'd3;
 localparam  [3:0]   TARG_ST_SLOTRELOAD  = 'd4;
 localparam  [3:0]   TARG_ST_SLOTWRITE   = 'd5;
 localparam  [3:0]   TARG_ST_SLOTFLUSH   = 'd6;
+localparam  [3:0]   TARG_ST_GETFILE     = 'd7;
+localparam  [3:0]   TARG_ST_OPENFILE    = 'd8;
 localparam  [3:0]   TARG_ST_WAITRESULT_DS = 'd14;
 localparam  [3:0]   TARG_ST_WAITRESULT  = 'd15;
+
+// bridge pointers handed to APF for the file-struct areas
+localparam  [31:0]  FBUF_GETFILE_PTR  = 32'hF8003000;
+localparam  [31:0]  FBUF_OPENFILE_PTR = 32'hF8003200;
+
+    reg             target_dataslot_getfile_1, target_dataslot_getfile_queue;
+    reg             target_dataslot_openfile_1, target_dataslot_openfile_queue;
+    reg             tgt_is_read = 0;
+
+// 1KB file-struct buffer. ONE write port (the bridge and the core FSM
+// never write at the same time), duplicated into two RAMs to give each
+// reader its own port — a dual-write array cannot map to M10K and
+// explodes into ~7K ALMs of registers and muxes.
+    reg     [31:0]  fbuf_ram_a [0:255];                                 // reader: bridge
+    reg     [31:0]  fbuf_ram_b [0:255] /* verilator public_flat_rd */;  // reader: core FSM
+    wire            fb_bridge_we = bridge_wr && bridge_addr[31:24]==8'hF8
+                                   && bridge_addr[13:12]==2'h3;
+    wire            fb_we = fb_bridge_we || fbuf_wr;
+    wire    [7:0]   fb_wa = fbuf_wr ? fbuf_addr : bridge_addr[9:2];
+    wire    [31:0]  fb_wd = fbuf_wr ? fbuf_di   : bridge_wr_data_in;
+    reg     [7:0]   fbuf_a_addr;
+    reg     [31:0]  fbuf_a_q, fbuf_b_q;
+    always @(posedge clk) begin
+        if (fb_we) begin
+            fbuf_ram_a[fb_wa] <= fb_wd;
+            fbuf_ram_b[fb_wa] <= fb_wd;
+        end
+        fbuf_a_addr <= bridge_addr[9:2];
+        fbuf_a_q <= fbuf_ram_a[fbuf_a_addr];
+        fbuf_b_q <= fbuf_ram_b[fbuf_addr];
+    end
+    assign fbuf_q = fbuf_b_q;
     reg     [3:0]   tstate;
     
     reg             status_setup_done_1;
@@ -176,7 +236,10 @@ initial begin
     reset_n <= 0;
     dataslot_requestread <= 0;
     dataslot_requestwrite <= 0;
+    dataslot_update <= 0;
     dataslot_allcomplete <= 0;
+    target_dataslot_getfile_queue <= 0;
+    target_dataslot_openfile_queue <= 0;
     savestate_start <= 0;
     savestate_load <= 0;
     osnotify_inmenu <= 0;
@@ -188,12 +251,23 @@ end
     
 always @(posedge clk) begin
 
+    // completion strobes: strictly one cycle (stale done levels otherwise
+    // fool multi-step consumers like the CD mount FSM)
+    target_dataslot_done <= 0;
+    target_dataslot_file_done <= 0;
+
     // detect a rising edge on the input signal
     // and flag a queue that will be cleared later
     status_setup_done_1 <= status_setup_done;
     if(status_setup_done & ~status_setup_done_1) begin
         status_setup_done_queue <= 1;
     end
+    target_dataslot_getfile_1 <= target_dataslot_getfile;
+    target_dataslot_openfile_1 <= target_dataslot_openfile;
+    if(target_dataslot_getfile & ~target_dataslot_getfile_1)
+        target_dataslot_getfile_queue <= 1;
+    if(target_dataslot_openfile & ~target_dataslot_openfile_1)
+        target_dataslot_openfile_queue <= 1;
     
     b_datatable_wren <= 0;
     b_datatable_addr <= bridge_addr >> 2;
@@ -257,6 +331,9 @@ always @(posedge clk) begin
             8'h2C: bridge_rd_data_out <= target_2C;
             endcase
         end
+        32'hF8xx3xxx: begin
+            bridge_rd_data_out <= fbuf_a_q;  // file-struct buffer window
+        end
         32'hF8xx2xxx: begin
             bridge_rd_data_out <= b_datatable_q;
         
@@ -274,6 +351,7 @@ always @(posedge clk) begin
     
         dataslot_requestread <= 0;
         dataslot_requestwrite <= 0;
+        dataslot_update <= 0;
         savestate_start <= 0;
         savestate_load <= 0;
         
@@ -337,9 +415,24 @@ always @(posedge clk) begin
                 hstate <= ST_DONE_CODE;
             end
         end
+        16'h008A: begin
+            // Data slot update (sent on deferload marked slots only) —
+            // the firmware notifies us a deferload file was mounted, with
+            // its id and size. MUST be acked OK: replying "unknown command"
+            // leaves the mount half-done and all target_dataslot_reads on
+            // the slot then fail with result code 2.
+            dataslot_update <= 1;
+            dataslot_update_id <= host_20[15:0];
+            dataslot_update_size <= host_24;
+            hstate <= ST_DONE_OK;
+        end
         16'h008F: begin
             // Data slot access all complete
             dataslot_allcomplete <= 1;
+            hstate <= ST_DONE_OK;
+        end
+        16'h0090: begin
+            // Real-time Clock Data (unused; ack so it isn't an error)
             hstate <= ST_DONE_OK;
         end
         16'h00A0: begin
@@ -423,9 +516,18 @@ always @(posedge clk) begin
             status_setup_done_queue <= 0;
             tstate <= TARG_ST_READYTORUN;
         end else if(target_dataslot_read) begin
-            target_dataslot_ack <= 1;
+            target_dataslot_ack <= 1;       // ack belongs to reads only
             target_dataslot_done <= 0;
+            tgt_is_read <= 1;
             tstate <= TARG_ST_SLOTREAD;
+        end else if(target_dataslot_getfile_queue) begin
+            target_dataslot_getfile_queue <= 0;
+            tgt_is_read <= 0;
+            tstate <= TARG_ST_GETFILE;
+        end else if(target_dataslot_openfile_queue) begin
+            target_dataslot_openfile_queue <= 0;
+            tgt_is_read <= 0;
+            tstate <= TARG_ST_OPENFILE;
         end
 
     end
@@ -441,6 +543,18 @@ always @(posedge clk) begin
         target_0 <= 32'h636D_0180;
         tstate <= TARG_ST_WAITRESULT_DS;
     end
+    TARG_ST_GETFILE: begin
+        target_20 <= target_dataslot_id;
+        target_24 <= FBUF_GETFILE_PTR;
+        target_0 <= 32'h636D_0190;
+        tstate <= TARG_ST_WAITRESULT_DS;
+    end
+    TARG_ST_OPENFILE: begin
+        target_20 <= target_dataslot_id;
+        target_24 <= FBUF_OPENFILE_PTR;
+        target_0 <= 32'h636D_0192;
+        tstate <= TARG_ST_WAITRESULT_DS;
+    end
     TARG_ST_WAITRESULT: begin
         if(target_0[31:16] == 16'h6F6B) begin
             // done
@@ -450,9 +564,13 @@ always @(posedge clk) begin
     end
     TARG_ST_WAITRESULT_DS: begin
         if(target_0[31:16] == 16'h6F6B) begin
-            target_dataslot_ack <= 0;
-            target_dataslot_done <= 1;
             target_dataslot_err <= target_0[2:0];
+            if (tgt_is_read) begin
+                target_dataslot_ack <= 0;
+                target_dataslot_done <= 1;
+            end else begin
+                target_dataslot_file_done <= 1;
+            end
             tstate <= TARG_ST_IDLE;
         end
     end
@@ -477,6 +595,9 @@ mf_datatable idt (
     .q_a            ( datatable_q ),
     .q_b            ( b_datatable_q )
 );
+
+assign dbg_target_0 = target_0;
+assign dbg_tstate   = tstate;
 
 
 endmodule

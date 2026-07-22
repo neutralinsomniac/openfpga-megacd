@@ -50,12 +50,15 @@ module dpram_dif_Bsim_14_8_13_16_b858cb282617fb0956d960215c8e84d1ccf909c6
         if (wren_a) mem[address_a] <= data_a;
         q_a <= mem[address_a];
     end
-    // port B big-endian word view over two bytes
+    // port B word view over two bytes. altsyncram mixed-width packing is
+    // little-endian: wide-port LSB byte <-> LOWER narrow address (verified
+    // against the CDC path: first CD byte arrives in cd_di[7:0] and must
+    // land at the even byte address for host reads to be in order)
     always @(posedge clock) if (enable_b) begin
         if (wren_b) begin
-            mem[{address_b,1'b0}] <= data_b[15:8];
-            mem[{address_b,1'b1}] <= data_b[7:0];
+            mem[{address_b,1'b0}] <= data_b[7:0];
+            mem[{address_b,1'b1}] <= data_b[15:8];
         end
-        q_b <= {mem[{address_b,1'b0}], mem[{address_b,1'b1}]};
+        q_b <= {mem[{address_b,1'b1}], mem[{address_b,1'b0}]};
     end
 endmodule

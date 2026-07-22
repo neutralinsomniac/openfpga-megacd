@@ -341,6 +341,9 @@ end
     wire            dataslot_requestwrite_ok = 1;
 
     wire            dataslot_allcomplete;
+    wire            dataslot_update;
+    wire    [15:0]  dataslot_update_id;
+    wire    [31:0]  dataslot_update_size;
 
     wire            savestate_supported;
     wire    [31:0]  savestate_addr;
@@ -400,6 +403,10 @@ core_bridge_cmd icb (
 
     .dataslot_allcomplete   ( dataslot_allcomplete ),
 
+    .dataslot_update        ( dataslot_update ),
+    .dataslot_update_id     ( dataslot_update_id ),
+    .dataslot_update_size   ( dataslot_update_size ),
+
     .savestate_supported    ( savestate_supported ),
     .savestate_addr         ( savestate_addr ),
     .savestate_size         ( savestate_size ),
@@ -427,13 +434,36 @@ core_bridge_cmd icb (
     .target_dataslot_read       ( target_dataslot_read ),
     .target_dataslot_ack        ( target_dataslot_ack ),
     .target_dataslot_done       ( target_dataslot_done ),
-    .target_dataslot_err        ( ),
-    .target_dataslot_id         ( 16'd1 ),                 // CD image slot
-    .target_dataslot_slotoffset ( cd_req_offset ),
-    .target_dataslot_bridgeaddr ( {19'h38000, cd_req_buf, 12'h000} ), // 0x7000_0000 / 0x7000_1000
-    .target_dataslot_length     ( 32'd2352 )
+    .target_dataslot_err        ( target_dataslot_err ),
+    .target_dataslot_id         ( tds_id ),
+    .target_dataslot_slotoffset ( tds_offset ),
+    .target_dataslot_bridgeaddr ( tds_bridgeaddr ),
+    .target_dataslot_length     ( tds_length ),
+
+    .target_dataslot_getfile    ( target_dataslot_getfile ),
+    .target_dataslot_openfile   ( target_dataslot_openfile ),
+    .target_dataslot_file_done  ( target_dataslot_file_done ),
+    .fbuf_addr                  ( fbuf_addr ),
+    .fbuf_wr                    ( fbuf_wr ),
+    .fbuf_di                    ( fbuf_di ),
+    .fbuf_q                     ( fbuf_q ),
+
+    .dbg_target_0               ( dbg_target_0 ),
+    .dbg_tstate                 ( dbg_tstate )
 
 );
+
+    wire    [31:0]  dbg_target_0;
+    wire    [3:0]   dbg_tstate;
+    wire    [2:0]   target_dataslot_err;
+    reg     [15:0]  tds_id;
+    reg     [31:0]  tds_offset, tds_bridgeaddr, tds_length;
+    reg             target_dataslot_getfile = 0, target_dataslot_openfile = 0;
+    wire            target_dataslot_file_done;
+    reg     [7:0]   fbuf_addr;
+    reg             fbuf_wr = 0;
+    reg     [31:0]  fbuf_di;
+    wire    [31:0]  fbuf_q;
 
 ///////////////////////////////////////////////
 // CD sector fetch: the drive (clk_sys) requests a 2352-byte sector; a
@@ -450,12 +480,48 @@ core_bridge_cmd icb (
     wire        cd_req_buf;
     reg         cd_ack = 0;         // clk_74a; synced back inside the drive
 
+    // mount FSM read channel (level-held request, same clk_74a domain)
+    reg         mnt_rd = 0;
+    reg  [31:0] mnt_offset;
+    reg  [31:0] mnt_len;      // clamped to the file: reads past EOF are an
+                              // APF "out of range" error on real firmware
+    reg         mnt_rd_done = 0;
+
     reg  [2:0]  cdreq_s = 0;
     reg  [1:0]  cdf_st = 0;
+    reg         cdf_src = 0;        // 0 = drive sector fetch, 1 = mount read
+    // multi-bin: a fetch whose track lives in another file first asks the
+    // mount FSM to openfile it (reopen_req is level-held until the file
+    // matches). cd_req_file is clk_sys but stable while cd_req is held.
+    reg         reopen_req = 0;
+    reg  [4:0]  reopen_file = 0;
+    wire [6:0]  cd_req_file;
+    // 2FF + stability filter: cur_file comes from the clk_sys track search
+    // and can change while a request is pending
+    reg  [6:0]  crf_s1, crf_s2, crf_stable;
 always @(posedge clk_74a) begin
     cdreq_s <= {cdreq_s[1:0], cd_req};
+    crf_s1 <= cd_req_file;
+    crf_s2 <= crf_s1;
+    if (crf_s1 == crf_s2) crf_stable <= crf_s2;
+    if (reopen_req && {2'd0, opened_file} == crf_stable) reopen_req <= 0;
     case (cdf_st)
-    2'd0: if (cdreq_s[1]) begin
+    2'd0: if (cdreq_s[1] && (!mount_use_slot2
+                             || crf_stable == {2'd0, opened_file})) begin
+        tds_offset     <= cd_req_offset;
+        tds_bridgeaddr <= {19'h38000, cd_req_buf, 12'h000}; // 0x7000_0000/1000
+        tds_length     <= 32'd2352;
+        cdf_src <= 0;
+        target_dataslot_read <= 1;
+        cdf_st <= 2'd1;
+    end else if (cdreq_s[1] && mount_use_slot2) begin
+        reopen_file <= crf_stable[4:0];
+        reopen_req <= 1;
+    end else if (mnt_rd && !mnt_rd_done) begin
+        tds_offset     <= mnt_offset;
+        tds_bridgeaddr <= 32'h7200_0000;         // parse buffer window
+        tds_length     <= mnt_len;
+        cdf_src <= 1;
         target_dataslot_read <= 1;
         cdf_st <= 2'd1;
     end
@@ -464,12 +530,16 @@ always @(posedge clk_74a) begin
         cdf_st <= 2'd2;
     end
     2'd2: if (target_dataslot_done) begin
-        cd_ack <= 1;
+        if (cdf_src) mnt_rd_done <= 1;
+        else         cd_ack <= 1;
         cdf_st <= 2'd3;
     end
-    2'd3: if (!cdreq_s[1]) begin
-        cd_ack <= 0;
-        cdf_st <= 2'd0;
+    2'd3: begin
+        if (cdf_src ? !mnt_rd : !cdreq_s[1]) begin
+            cd_ack <= 0;
+            mnt_rd_done <= 0;
+            cdf_st <= 2'd0;
+        end
     end
     endcase
 end
@@ -481,12 +551,589 @@ reg [31:0] cd_buf [0:2047];
 wire [31:0] cd_buf_wd = bridge_endian_little ? bridge_wr_data :
     {bridge_wr_data[7:0], bridge_wr_data[15:8], bridge_wr_data[23:16], bridge_wr_data[31:24]};
 always @(posedge clk_74a) begin
-    if (bridge_wr && bridge_addr[31:28] == 4'h7)
+    if (bridge_wr && bridge_addr[31:24] == 8'h70)
         cd_buf[bridge_addr[12:2]] <= cd_buf_wd;
+end
+
+// mount parse buffer: 4KB at bridge 0x7200_0000, raw big-endian packing
+// (byte 0 of the file in bits [31:24]); written by the host during the
+// mount sniff read, read by the cue parser
+reg [31:0] parse_buf [0:1023];
+always @(posedge clk_74a) begin
+    if (bridge_wr && bridge_addr[31:24] == 8'h72)
+        parse_buf[bridge_addr[11:2]] <= bridge_endian_little ?
+            {bridge_wr_data[7:0], bridge_wr_data[15:8], bridge_wr_data[23:16], bridge_wr_data[31:24]} :
+            bridge_wr_data;
+end
+reg [9:0]  pbuf_addr;
+reg [31:0] pbuf_q;
+always @(posedge clk_74a) pbuf_q <= parse_buf[pbuf_addr];
+
+///////////////////////////////////////////////
+// CD mount controller + cue parser (clk_74a)
+//
+// On a CD-slot mount: sniff the file. Raw MODE1 sector sync -> direct BIN
+// (single data track, as before). ASCII -> cue sheet: parse TRACK/INDEX
+// lines into the track table, getfile the cue's path, swap the extension
+// to .bin/.BIN (same-basename convention), openfile it into slot 2 and
+// stream sectors from there.
+///////////////////////////////////////////////
+reg        mount_ready = 0;
+reg        mount_use_slot2 = 0;
+reg [31:0] mount_eff_size = 0;
+reg [31:0] mounted_size = 0;
+reg [6:0]  toc_track_count = 0;
+
+// track table: written by the mount FSM (74a), read by the drive
+// (clk_sys) and by the layout pass (74a) — duplicated RAMs, one write.
+// Entry [55:0] = {audio(1), pregap[7:0], file[6:0], delta[19:0],
+// disc_start[19:0]}: disc_start is INDEX 01 in DISC LBAs; delta maps a
+// disc LBA back to a file LBA (disc - delta = file); pregap is the
+// virtual (not-in-file) gap length before this track's INDEX 01.
+reg [65:0] toc_ram_a [0:127];                              // rd: layout
+reg [65:0] toc_ram_b [0:127] /* verilator public_flat_rd */; // rd: drive
+reg  [6:0]  toc_wr_addr;
+reg  [65:0] toc_wr_data;
+reg         toc_wr_en = 0;
+reg  [6:0]  toc_a_addr;
+reg  [65:0] toc_a_q;
+always @(posedge clk_74a) begin
+    if (toc_wr_en) begin
+        toc_ram_a[toc_wr_addr] <= toc_wr_data;
+        toc_ram_b[toc_wr_addr] <= toc_wr_data;
+    end
+    toc_a_q <= toc_ram_a[toc_a_addr];
+end
+wire [6:0]  toc_rd_addr;
+reg  [65:0] toc_rd_q;
+always @(posedge clk_sys) toc_rd_q <= toc_ram_b[toc_rd_addr];
+
+// file table: up to 32 FILE entries per cue. Names live in parse_buf
+// (resident after mount) as {offset, length} pointers.
+reg [19:0] files_nm  [0:31];   // {name_off[11:0], name_len[7:0]}
+reg [19:0] files_secs[0:31];   // file length in 2352-byte sectors
+reg [4:0]  files_addr;
+reg [19:0] files_nm_q, files_secs_q;
+always @(posedge clk_74a) begin
+    files_nm_q   <= files_nm[files_addr];
+    files_secs_q <= files_secs[files_addr];
+end
+
+localparam M_IDLE     = 4'd0,  M_SNIFF    = 4'd1,  M_SNIFF_W  = 4'd2,
+           M_EVAL     = 4'd3,  M_PARSE    = 4'd4,  M_GETFILE  = 4'd5,
+           M_DIRSCAN  = 4'd6,  M_BPATH_TAB= 4'd7,  M_BPATH    = 4'd8,
+           M_BTAIL    = 4'd9,  M_OPENFILE = 4'd10, M_FSIZE    = 4'd11,
+           M_FDIV     = 4'd12, M_LAYOUT   = 4'd13, M_READY    = 4'd14,
+           M_FAIL     = 4'd15;
+reg [3:0]  mnt_st = M_IDLE;
+reg [3:0]  mnt_term = 0;   // overlay: 1=started, B=READY reached, C=FAILED
+
+// cue parser state
+localparam CP_FETCH=3'd0, CP_FETCH_W=3'd1, CP_EVAL=3'd2, CP_DONE=3'd3;
+reg [2:0]  cp_st;
+reg [11:0] cp_p;          // byte pointer into parse_buf
+reg [7:0]  cp_ch;
+// line scanner: 0=at line start (skip ws, collect 2-char key), then per-key
+localparam LN_START=4'd0, LN_KEY2=4'd1, LN_SKIP=4'd2,
+           LN_TNUM_WS=4'd3, LN_TNUM=4'd4, LN_TTYPE_WS=4'd5,
+           LN_INUM_WS=4'd6, LN_INUM=4'd7, LN_MSF_WS=4'd8, LN_MSF=4'd9,
+           LN_PGAP_WS=4'd10, LN_FQUOTE=4'd11, LN_FNAME=4'd12;
+reg [3:0]  cp_ln;
+reg [7:0]  cp_key0;
+reg [6:0]  cp_num;
+reg [6:0]  cp_track;      // current TRACK number
+reg [6:0]  cp_tmax;       // highest TRACK seen (published at READY)
+reg        cp_audio;      // current track type
+reg [6:0]  cp_idx;        // INDEX number
+reg [6:0]  cp_mm, cp_ss, cp_ff;
+reg [1:0]  cp_msf_pos;    // 0=mm 1=ss 2=ff
+reg [24:0] mnt_tmo;       // per-file size watchdog (~0.45s @74MHz)
+reg        cp_is_pgap;    // current MSF belongs to a PREGAP directive
+reg [11:0] cp_pend_pgap;  // PREGAP seen for the current track
+reg [5:0]  cp_files;      // FILE entries seen (file index = cp_files-1)
+reg [11:0] cp_fname_off;  // name capture: offset of first char
+reg [7:0]  cp_fname_len;
+reg [19:0] cp_i00;        // INDEX 00 (in-file gap start), file-relative
+reg        cp_i00_v;      // INDEX 00 seen for the current track
+// path/dir scan shared counters
+reg [7:0]  mp_w;
+reg [1:0]  mp_ph;
+reg [9:0]  mp_nul;        // NUL byte index in the getfile response
+reg [9:0]  mp_dirlen;     // bytes of the path up to and incl. last '/'
+reg        mp_found;
+// path builder
+reg [9:0]  bp_o;          // output byte index in the openfile param area
+reg [2:0]  bp_ph;
+reg [7:0]  bp_src;
+reg [4:0]  mnt_file;      // file being opened (phase B / reopen)
+reg        mnt_reopen = 0;
+reg [4:0]  opened_file = 0;
+reg [11:0] bp_nm_off;
+reg [7:0]  bp_nm_len;
+// per-file size divider + layout pass
+reg [31:0] fdiv_rem;
+reg [19:0] fdiv_q;
+reg [5:0]  fdiv_bit;
+reg [31:0] fsize_prev;
+reg [6:0]  lay_t;
+reg [2:0]  lay_ph;
+reg [19:0] lay_delta, lay_disc_end;
+reg [6:0]  lay_prev_file;
+reg [65:0] lay_e;
+
+wire [7:0] pbuf_byte = (cp_p[1:0]==2'd0) ? pbuf_q[31:24] :
+                       (cp_p[1:0]==2'd1) ? pbuf_q[23:16] :
+                       (cp_p[1:0]==2'd2) ? pbuf_q[15:8]  : pbuf_q[7:0];
+// parsed MSF as raw sectors. Cue INDEX times are FILE-relative: 00:00:00
+// is file offset 0 = LBA 0 (the 150-sector lead-in pregap is NOT included
+// in cue times — only REPORTS add it, as +150 when forming disc MSF).
+wire [31:0] cp_raw = ({25'd0,cp_mm}*32'd60 + {25'd0,cp_ss})*32'd75
+                     + {25'd0,cp_ff};
+wire [7:0] cp_pgap8 = (cp_pend_pgap > 12'd255) ? 8'd255 : cp_pend_pgap[7:0];
+// in-file gap before INDEX 01 (INDEX 00 region), clamped to 10 bits
+wire [19:0] cp_gap_raw = cp_raw[19:0] - cp_i00;
+wire [9:0]  cp_pre01 = (!cp_i00_v || cp_raw[19:0] < cp_i00) ? 10'd0 :
+                       (cp_gap_raw > 20'd1023) ? 10'd1023 : cp_gap_raw[9:0];
+
+always @(posedge clk_74a) begin
+    target_dataslot_getfile <= 0;
+    target_dataslot_openfile <= 0;
+    fbuf_wr <= 0;
+    toc_wr_en <= 0;
+
+    case (mnt_st)
+    M_IDLE: begin
+        // tds_id owned here: reads target the mounted data slot; the
+        // mount sequence overrides it per-operation below
+        tds_id <= mount_use_slot2 ? 16'd2 : 16'd1;
+        // mount on the firmware's explicit deferload notification (host
+        // command 0x008A carries slot id + size). Polling the datatable
+        // instead is a trap: its layout is firmware-defined and a stale
+        // nonzero word both false-mounts at boot and masks real mounts.
+        if (dataslot_update && dataslot_update_id == 16'd1
+            && dataslot_update_size != 32'd0) begin
+            mounted_size <= dataslot_update_size;
+            mount_ready <= 0;
+            mount_use_slot2 <= 0;
+            toc_track_count <= 0;
+            mnt_offset <= 0;
+            // round DOWN to a whole word: a read past EOF (even one byte,
+            // from rounding up an unaligned cue size) is a firmware error
+            mnt_len <= (dataslot_update_size < 32'd4096)
+                       ? {dataslot_update_size[31:2], 2'b00} : 32'd4096;
+            mnt_rd <= 1;
+            tds_id <= 16'd1;         // sniff reads the CD slot itself
+            mnt_term <= 4'h1;
+            mnt_reopen <= 0;
+            mnt_st <= M_SNIFF;
+        end else if (reopen_req && mount_ready
+                     && reopen_file != opened_file) begin
+            // playback crossed into a track stored in another bin: build
+            // that file's path and openfile it into slot 2. The
+            // opened_file guard kills a one-cycle race that double-ran
+            // the reopen (its openfile then collided with the next
+            // sector read's handshake)
+            mnt_file <= reopen_file;
+            mnt_reopen <= 1;
+            files_addr <= reopen_file;
+            mnt_st <= M_BPATH_TAB;
+        end
+    end
+    M_SNIFF: if (mnt_rd_done) begin
+        mnt_rd <= 0;
+        pbuf_addr <= 0;
+        mnt_st <= M_SNIFF_W;
+    end
+    M_SNIFF_W: mnt_st <= M_EVAL;   // one cycle for pbuf_q
+    M_EVAL: begin
+        // raw sector: 00 FF FF FF...; anything printable-ASCII = cue text
+        if (pbuf_q[31:24]==8'h00 && pbuf_q[23:16]==8'hFF) begin
+            mount_eff_size <= mounted_size;     // direct BIN/ISO mount
+            mnt_st <= M_READY;
+        end else if (pbuf_q[31:24]>=8'h20 && pbuf_q[31:24]<=8'h7E) begin
+            cp_p <= 0; cp_st <= CP_FETCH; cp_ln <= LN_START;
+            cp_track <= 0; cp_tmax <= 0; cp_audio <= 0;
+            cp_pend_pgap <= 0; cp_is_pgap <= 0; cp_files <= 0;
+            mnt_st <= M_PARSE;
+        end else begin
+            mount_eff_size <= mounted_size;     // unknown: treat as BIN
+            mnt_st <= M_READY;
+        end
+    end
+    M_PARSE: begin
+        case (cp_st)
+        CP_FETCH: begin pbuf_addr <= cp_p[11:2]; cp_st <= CP_FETCH_W; end
+        CP_FETCH_W: cp_st <= CP_EVAL;
+        CP_EVAL: begin
+            if (pbuf_byte==8'h00 || cp_p==12'hFFF ||
+                {20'd0,cp_p} >= mnt_len) cp_st <= CP_DONE;
+            else begin
+                cp_p <= cp_p + 1'b1;
+                cp_st <= CP_FETCH;
+                case (cp_ln)
+                LN_START:
+                    if (pbuf_byte==8'h0A || pbuf_byte==8'h0D ||
+                        pbuf_byte==8'h20 || pbuf_byte==8'h09) ; // stay
+                    else begin cp_key0 <= pbuf_byte; cp_ln <= LN_KEY2; end
+                LN_KEY2: begin
+                    if (cp_key0=="T" && pbuf_byte=="R") cp_ln <= LN_TNUM_WS;
+                    else if (cp_key0=="I" && pbuf_byte=="N") cp_ln <= LN_INUM_WS;
+                    else if (cp_key0=="P" && pbuf_byte=="R") cp_ln <= LN_PGAP_WS;
+                    else if (cp_key0=="F" && pbuf_byte=="I") cp_ln <= LN_FQUOTE;
+                    else cp_ln <= LN_SKIP;
+                end
+                // FILE "name.bin" BINARY — record a pointer into parse_buf
+                LN_FQUOTE:
+                    if (pbuf_byte==8'h22) begin
+                        cp_fname_off <= cp_p + 1'b1;
+                        cp_fname_len <= 0;
+                        cp_ln <= LN_FNAME;
+                    end else if (pbuf_byte==8'h0A) cp_ln <= LN_START;
+                LN_FNAME:
+                    if (pbuf_byte==8'h22) begin
+                        if (cp_files < 6'd32) begin
+                            files_nm[cp_files[4:0]] <= {cp_fname_off, cp_fname_len};
+                            cp_files <= cp_files + 1'b1;
+                        end
+                        cp_ln <= LN_SKIP;
+                    end else if (pbuf_byte==8'h0A) cp_ln <= LN_START;
+                    else cp_fname_len <= cp_fname_len + 1'b1;
+                // PREGAP mm:ss:ff — skip to the first digit, then MSF
+                LN_PGAP_WS:
+                    if (pbuf_byte>=8'h30 && pbuf_byte<=8'h39) begin
+                        cp_mm <= pbuf_byte[6:0]-7'h30;
+                        cp_ss <= 0; cp_ff <= 0; cp_msf_pos <= 0;
+                        cp_is_pgap <= 1;
+                        cp_ln <= LN_MSF;
+                    end else if (pbuf_byte==8'h0A) cp_ln <= LN_START;
+                LN_SKIP: if (pbuf_byte==8'h0A) cp_ln <= LN_START;
+                // TRACK nn TYPE
+                LN_TNUM_WS:
+                    if (pbuf_byte>=8'h30 && pbuf_byte<=8'h39) begin
+                        cp_num <= pbuf_byte[6:0]-7'h30; cp_ln <= LN_TNUM;
+                    end else if (pbuf_byte==8'h0A) cp_ln <= LN_START;
+                LN_TNUM:
+                    if (pbuf_byte>=8'h30 && pbuf_byte<=8'h39)
+                        cp_num <= cp_num*7'd10 + (pbuf_byte[6:0]-7'h30);
+                    else begin
+                        cp_track <= cp_num;
+                        cp_i00_v <= 0;           // fresh track: no INDEX 00 yet
+                        cp_ln <= LN_TTYPE_WS;
+                    end
+                LN_TTYPE_WS:
+                    if (pbuf_byte=="A") begin cp_audio <= 1; cp_ln <= LN_SKIP; end
+                    else if (pbuf_byte=="M") begin cp_audio <= 0; cp_ln <= LN_SKIP; end
+                    else if (pbuf_byte==8'h0A) cp_ln <= LN_START;
+                // INDEX nn mm:ss:ff
+                LN_INUM_WS:
+                    if (pbuf_byte>=8'h30 && pbuf_byte<=8'h39) begin
+                        cp_num <= pbuf_byte[6:0]-7'h30; cp_ln <= LN_INUM;
+                    end else if (pbuf_byte==8'h0A) cp_ln <= LN_START;
+                LN_INUM:
+                    if (pbuf_byte>=8'h30 && pbuf_byte<=8'h39)
+                        cp_num <= cp_num*7'd10 + (pbuf_byte[6:0]-7'h30);
+                    else begin
+                        cp_idx <= cp_num;
+                        cp_mm <= 0; cp_ss <= 0; cp_ff <= 0; cp_msf_pos <= 0;
+                        cp_ln <= LN_MSF;
+                    end
+                LN_MSF: begin
+                    if (pbuf_byte>=8'h30 && pbuf_byte<=8'h39) begin
+                        case (cp_msf_pos)
+                        2'd0: cp_mm <= cp_mm*7'd10 + (pbuf_byte[6:0]-7'h30);
+                        2'd1: cp_ss <= cp_ss*7'd10 + (pbuf_byte[6:0]-7'h30);
+                        default: cp_ff <= cp_ff*7'd10 + (pbuf_byte[6:0]-7'h30);
+                        endcase
+                    end else if (pbuf_byte==":") begin
+                        cp_msf_pos <= cp_msf_pos + 1'b1;
+                    end else begin
+                        // end of MSF
+                        if (cp_is_pgap) begin
+                            // PREGAP: virtual sectors, accumulate only
+                            cp_pend_pgap <= cp_pend_pgap + cp_raw[11:0];
+                        end else if (cp_idx==7'd0 && cp_track!=0) begin
+                            // INDEX 00: remember the in-file gap start
+                            cp_i00 <= cp_raw[19:0];
+                            cp_i00_v <= 1;
+                        end else if (cp_idx==7'd1 && cp_track!=0
+                                     && cp_files!=0) begin
+                            // INDEX 01: store a PRE-LAYOUT entry — the
+                            // disc field temporarily holds the FILE lba;
+                            // M_LAYOUT rewrites it once sizes are known
+                            toc_wr_addr <= cp_track;
+                            toc_wr_data <= {cp_audio, cp_pgap8, cp_pre01,
+                                            {2'd0, cp_files[4:0]-5'd1},
+                                            20'd0, cp_raw[19:0]};
+                            toc_wr_en <= 1;
+                            cp_pend_pgap <= 0;
+                            cp_i00_v <= 0;
+                            if (cp_track > cp_tmax) cp_tmax <= cp_track;
+                        end
+                        cp_is_pgap <= 0;
+                        cp_ln <= (pbuf_byte==8'h0A) ? LN_START : LN_SKIP;
+                    end
+                end
+                default: cp_ln <= LN_SKIP;
+                endcase
+            end
+        end
+        CP_DONE: begin
+            if (cp_tmax == 0 || cp_files == 0) begin
+                mount_eff_size <= mounted_size; // not a usable cue: raw mount
+                mnt_st <= M_READY;
+            end else begin
+                tds_id <= 16'd1;
+                target_dataslot_getfile <= 1;
+                mnt_st <= M_GETFILE;
+            end
+        end
+        endcase
+    end
+    M_GETFILE: if (target_dataslot_file_done) begin
+        // scan the returned path: find the NUL and the last '/' — the
+        // directory prefix is reused for every bin the cue references
+        mp_w <= 0; mp_ph <= 0; mp_found <= 0; mp_dirlen <= 0;
+        mnt_st <= M_DIRSCAN;
+    end
+    M_DIRSCAN: begin
+        case (mp_ph)
+        2'd0: begin fbuf_addr <= {2'd0, mp_w[7:2]}; mp_ph <= 2'd1; end
+        2'd1: mp_ph <= 2'd2;
+        2'd2: begin : dirscan
+            reg [7:0] b;
+            b = (mp_w[1:0]==2'd0) ? fbuf_q[31:24] :
+                (mp_w[1:0]==2'd1) ? fbuf_q[23:16] :
+                (mp_w[1:0]==2'd2) ? fbuf_q[15:8]  : fbuf_q[7:0];
+            if (b == 8'h00) begin
+                // no separator at all -> dirlen 0: pass bare names and let
+                // the firmware resolve them (fails at openfile if it can't)
+                mp_found <= 1;
+                mnt_file <= 0;
+                files_addr <= 0;
+                mnt_st <= M_BPATH_TAB;
+            end else begin
+                if (b == 8'h2F || b == 8'h5C)            // '/' or '\'
+                    mp_dirlen <= {2'd0, mp_w} + 10'd1;
+                if (mp_w == 8'd255) mnt_st <= M_FAIL;    // no NUL: malformed
+                mp_w <= mp_w + 1'b1;
+                mp_ph <= 2'd0;
+            end
+        end
+        default: mp_ph <= 0;
+        endcase
+    end
+    M_BPATH_TAB: begin
+        // files_nm_q latency, then latch the name pointer
+        mp_ph <= mp_ph + 1'b1;
+        if (mp_ph == 2'd2) begin
+            bp_nm_off <= files_nm_q[19:8];
+            bp_nm_len <= files_nm_q[7:0];
+            bp_o <= 0; bp_ph <= 0;
+            mp_ph <= 0;
+            mnt_st <= M_BPATH;
+        end
+    end
+    M_BPATH: begin
+        // build "<dir><name>\0" into the openfile param area, byte-serial:
+        // fetch source byte (dir from fbuf, name from parse_buf), then RMW
+        // it into the destination fbuf word
+        case (bp_ph)
+        3'd0: begin
+            if (bp_o >= mp_dirlen + {2'd0, bp_nm_len} + 10'd1) begin
+                bp_ph <= 0; mp_w <= 0;
+                mnt_st <= M_BTAIL;
+            end else begin
+                fbuf_addr <= {2'd0, bp_o[7:2]};           // dir source word
+                pbuf_addr <= (bp_nm_off + {2'd0, bp_o - mp_dirlen}) >> 2;
+                bp_ph <= 3'd1;
+            end
+        end
+        3'd1: bp_ph <= 3'd2;
+        3'd2: begin : bpsrc
+            reg [11:0] nidx;
+            nidx = bp_nm_off + {2'd0, bp_o - mp_dirlen};
+            if (bp_o >= mp_dirlen + {2'd0, bp_nm_len})
+                bp_src <= 8'h00;                          // terminator
+            else if (bp_o < mp_dirlen)
+                bp_src <= (bp_o[1:0]==2'd0) ? fbuf_q[31:24] :
+                          (bp_o[1:0]==2'd1) ? fbuf_q[23:16] :
+                          (bp_o[1:0]==2'd2) ? fbuf_q[15:8]  : fbuf_q[7:0];
+            else
+                bp_src <= (nidx[1:0]==2'd0) ? pbuf_q[31:24] :
+                          (nidx[1:0]==2'd1) ? pbuf_q[23:16] :
+                          (nidx[1:0]==2'd2) ? pbuf_q[15:8]  : pbuf_q[7:0];
+            fbuf_addr <= 8'd128 + {1'd0, bp_o[8:2]};      // dest word
+            bp_ph <= 3'd3;
+        end
+        3'd3: bp_ph <= 3'd4;
+        3'd4: begin : bpdst
+            reg [31:0] w;
+            w = fbuf_q;
+            case (bp_o[1:0])
+            2'd0: w[31:24] = bp_src;
+            2'd1: w[23:16] = bp_src;
+            2'd2: w[15:8]  = bp_src;
+            2'd3: w[7:0]   = bp_src;
+            endcase
+            fbuf_di <= w;
+            fbuf_wr <= 1;
+            bp_o <= bp_o + 1'b1;
+            bp_ph <= 3'd0;
+        end
+        default: bp_ph <= 0;
+        endcase
+    end
+    M_BTAIL: begin
+        // flags (word 192) = 0, then size (word 193) = 0, then openfile
+        fbuf_addr <= 8'd192 + {7'd0, mp_w[0]};
+        fbuf_di <= 32'd0;
+        fbuf_wr <= 1;
+        if (mp_w[0]) begin
+            mp_w <= 0;
+            tds_id <= 16'd2;
+            fsize_prev <= cd_bin_size;
+            target_dataslot_openfile <= 1;
+            mnt_st <= M_OPENFILE;
+        end else mp_w <= 8'd1;
+    end
+    M_OPENFILE: if (target_dataslot_file_done) begin
+        // result 0 = opened, 1 = created(+opened); anything else = missing bin
+        if (target_dataslot_err <= 3'd1) begin
+            if (mnt_reopen) begin
+                opened_file <= mnt_file;
+                mnt_reopen <= 0;
+                mnt_st <= M_IDLE;
+            end else begin
+                mnt_tmo <= 25'd1;
+                mnt_st <= M_FSIZE;
+            end
+        end else begin
+            mnt_reopen <= 0;
+            mnt_st <= M_FAIL;
+        end
+    end
+    M_FSIZE: begin
+        // the firmware refreshes the opened slot's size in the datatable
+        // (word 7 in its layout as we read it). Wait for a change; on
+        // timeout accept an unchanged value (equal-size files) if sane,
+        // else mark the size unknown (0) — the layout pass falls back to
+        // "last track's file lba + margin" so the mount NEVER hard-fails
+        // just because the firmware's table layout differs.
+        mnt_tmo <= mnt_tmo + 1'b1;
+        if (cd_bin_size >= 32'd2352 && cd_bin_size != fsize_prev) begin
+            fdiv_rem <= 0; fdiv_q <= 0; fdiv_bit <= 6'd32;
+            mnt_st <= M_FDIV;
+        end else if (mnt_tmo == 25'd0) begin
+            if (cd_bin_size >= 32'd2352) begin
+                fdiv_rem <= 0; fdiv_q <= 0; fdiv_bit <= 6'd32;
+                mnt_st <= M_FDIV;
+            end else begin
+                files_secs[mnt_file] <= 20'd0;   // unknown: layout fallback
+                if ({1'd0, mnt_file} + 6'd1 < cp_files) begin
+                    mnt_file <= mnt_file + 1'b1;
+                    files_addr <= mnt_file + 1'b1;
+                    mnt_st <= M_BPATH_TAB;
+                end else begin
+                    lay_t <= 7'd1; lay_ph <= 0;
+                    lay_delta <= 0; lay_disc_end <= 0;
+                    lay_prev_file <= 7'h7F;
+                    mnt_st <= M_LAYOUT;
+                end
+            end
+        end
+    end
+    M_FDIV: begin : fdiv
+        // sectors = size / 2352, restoring divider
+        reg [31:0] r;
+        if (fdiv_bit == 0) begin
+            files_secs[mnt_file] <= fdiv_q;
+            if ({1'd0, mnt_file} + 6'd1 < cp_files) begin
+                mnt_file <= mnt_file + 1'b1;
+                files_addr <= mnt_file + 1'b1;
+                mnt_st <= M_BPATH_TAB;
+            end else begin
+                lay_t <= 7'd1; lay_ph <= 0;
+                lay_delta <= 0; lay_disc_end <= 0;
+                lay_prev_file <= 7'h7F;
+                mnt_st <= M_LAYOUT;
+            end
+        end else begin
+            r = {fdiv_rem[30:0], cd_bin_size[fdiv_bit-1]};
+            if (r >= 32'd2352) begin
+                fdiv_rem <= r - 32'd2352;
+                fdiv_q   <= {fdiv_q[18:0], 1'b1};
+            end else begin
+                fdiv_rem <= r;
+                fdiv_q   <= {fdiv_q[18:0], 1'b0};
+            end
+            fdiv_bit <= fdiv_bit - 1'b1;
+        end
+    end
+    M_LAYOUT: begin
+        // place every track on the disc now that file sizes are known:
+        // delta(t) = disc base of its file + accumulated pregaps; the
+        // final cursor is the true disc leadout
+        case (lay_ph)
+        3'd0: begin toc_a_addr <= lay_t; lay_ph <= 3'd1; end
+        3'd1: lay_ph <= 3'd2;
+        3'd2: begin
+            lay_e <= toc_a_q;
+            files_addr <= toc_a_q[44:40];
+            lay_ph <= 3'd3;
+        end
+        3'd3: lay_ph <= 3'd4;
+        3'd4: begin : layw
+            reg [19:0] d;
+            d = (lay_e[46:40] != lay_prev_file) ? lay_disc_end : lay_delta;
+            d = d + {12'd0, lay_e[64:57]};        // + this track's pregap
+            toc_wr_addr <= lay_t;
+            toc_wr_data <= {lay_e[65:40], d, lay_e[19:0] + d};
+            toc_wr_en <= 1;
+            lay_delta <= d;
+            // unknown file size (0): approximate its extent as the last
+            // track's start + ~6 minutes, recomputed each track so the
+            // value consumed at the next file boundary uses the file's
+            // final track
+            lay_disc_end <= d + ((files_secs_q != 0) ? files_secs_q
+                                 : (lay_e[19:0] + 20'd27000));
+            lay_prev_file <= lay_e[46:40];
+            if (lay_t == cp_tmax) lay_ph <= 3'd5;
+            else begin
+                lay_t <= lay_t + 1'b1;
+                lay_ph <= 3'd0;
+            end
+        end
+        3'd5: begin
+            mount_eff_size <= {12'd0, lay_disc_end} * 32'd2352;
+            toc_track_count <= cp_tmax;
+            mount_use_slot2 <= 1;
+            opened_file <= mnt_file;   // last file opened in phase B
+            mnt_st <= M_READY;
+        end
+        default: lay_ph <= 0;
+        endcase
+    end
+    M_READY: begin
+        mount_ready <= 1;
+        mnt_term <= 4'hB;
+        mnt_st <= M_IDLE;
+    end
+    M_FAIL: begin
+        // leave unmounted (drive keeps reporting NO_DISC)
+        mnt_term <= 4'hC;
+        mnt_st <= M_IDLE;
+    end
+    endcase
 end
 wire [10:0] cd_buf_addr;    // clk_sys
 reg  [31:0] cd_buf_q;
 always @(posedge clk_sys) cd_buf_q <= cd_buf[cd_buf_addr];
+
+// overlay debug shadow: sector-buffer word 4 = file bytes 16..19; for a
+// data sector 0 this is "SEGA" -> shows 41474553 when byte order is right
+reg [31:0] dbg_cd_word4 = 0;
+always @(posedge clk_74a)
+    if (bridge_wr && bridge_addr == 32'h70000010) dbg_cd_word4 <= cd_buf_wd;
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Core Settings
@@ -517,6 +1164,7 @@ reg cs_m30_map_enable            = 0;
 reg lightgun_enabled             = 0;
 reg show_crosshair               = 1;
 reg [7:0] dpad_aim_speed         = 4;
+reg cs_debug_overlay             = 0;
 
 always @(posedge clk_74a) begin
     reset_counter = reset_counter + 1;
@@ -547,6 +1195,7 @@ always @(posedge clk_74a) begin
         32'h00000100: lightgun_enabled          <= bridge_wr_data[0];
         32'h00000104: show_crosshair            <= bridge_wr_data[0];
         32'h00000108: dpad_aim_speed            <= bridge_wr_data[7:0];
+        32'h00000110: cs_debug_overlay          <= bridge_wr_data[0];
       endcase
     end
 end
@@ -573,37 +1222,44 @@ reg [ 2:0] datatable_div = 0;
 reg [31:0] rom_file_size = 0;
 reg [31:0] cd_img_size = 0;   // clk_74a; quasi-static once mounted
 
+reg [31:0] cd_bin_size = 0;   // CD Data slot (index 3) size after openfile
+// continuous scan of datatable words 0..7 (2 cycles per address, capture
+// one phase later) + a shadow copy for the debug overlay; the save-size
+// write is appended at the end of each sweep
+reg [4:0]  dt_scan = 0;
+reg [31:0] dbg_dtable [0:7];
 always @(posedge clk_74a or negedge pll_core_locked) begin
 	if (~pll_core_locked) begin
 		datatable_addr <= 0;
 		datatable_data <= 0;
 		datatable_wren <= 0;
+		dt_scan <= 0;
 	end else begin
-		if (datatable_div > 4) begin
+		if (dt_scan[4:1] <= 4'd7) begin
+			datatable_wren <= 0;
+			datatable_addr <= {6'd0, dt_scan[4:1]};      // words 0..7
+			if (dt_scan[0] && dt_scan[4:1] != 0) begin
+				// q now reflects the PREVIOUS address (held 2 cycles)
+				dbg_dtable[dt_scan[4:1] - 1] <= datatable_q;
+				case (dt_scan[4:1] - 1)
+				4'd1: rom_file_size <= datatable_q;
+				4'd5: cd_img_size   <= datatable_q;
+				4'd7: cd_bin_size   <= datatable_q;
+				default: ;
+				endcase
+			end
+		end else if (dt_scan == 5'd16) begin
+			dbg_dtable[7] <= datatable_q;
+			cd_bin_size <= datatable_q;
 			// DEBUG DUMP: advertise the save slot as 512KB = full PRG-RAM
 			datatable_wren <= 1;
 			datatable_data <= 32'd524288;
-			// Data slot index 1, not id 1
-			datatable_addr <= 1 * 2 + 1;
-		end else if (datatable_div > 2) begin
-			datatable_wren <= 0;
-			// Read ROM size
-			datatable_addr <= 1;
-
-			if (datatable_div == 4) begin
-				rom_file_size <= datatable_q;
-			end
+			datatable_addr <= 1 * 2 + 1;          // data slot index 1, not id 1
 		end else begin
 			datatable_wren <= 0;
-			// Read CD image size (slot index 2 = id 1, listed after Save)
-			datatable_addr <= 2 * 2 + 1;
-
-			if (datatable_div == 2) begin
-				cd_img_size <= datatable_q;
-			end
 		end
 
-		datatable_div <= datatable_div + 1;
+		dt_scan <= (dt_scan == 5'd17) ? 5'd0 : dt_scan + 1'b1;
 	end
 end
 
@@ -858,14 +1514,16 @@ wire [31:0] dbg_hexval = {dbg_gfx_rate, dbg_glen,
 wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
                          (dbg_y < 10'd54) ? {dbg_wracc_rate, dbg_m68k_smp} :
                          (dbg_y < 10'd66) ? {dbg_wrbusy_duty, dbg_s68k_smp} :
-                         (dbg_y < 10'd78) ? dbg_prg_data[255:224] :
-                         (dbg_y < 10'd90) ? dbg_prg_data[223:192] :
-                         (dbg_y < 10'd102) ? dbg_prg_data[191:160] :
-                         (dbg_y < 10'd114) ? dbg_prg_data[159:128] :
-                         (dbg_y < 10'd126) ? dbg_prg_data[127:96] :
-                         (dbg_y < 10'd138) ? dbg_prg_data[95:64] :
-                         (dbg_y < 10'd150) ? dbg_prg_data[63:32] :
-                                             dbg_prg_data[31:0];
+                         // datatable dump: rows 4..11 = raw words 0..7 of
+                         // the APF data slot id/size table
+                         (dbg_y < 10'd78)  ? dbg_dtable[0] :
+                         (dbg_y < 10'd90)  ? dbg_dtable[1] :
+                         (dbg_y < 10'd102) ? dbg_dtable[2] :
+                         (dbg_y < 10'd114) ? dbg_dtable[3] :
+                         (dbg_y < 10'd126) ? dbg_dtable[4] :
+                         (dbg_y < 10'd138) ? dbg_dtable[5] :
+                         (dbg_y < 10'd150) ? dbg_dtable[6] :
+                                             dbg_dtable[7];
 wire [3:0] dbg_dv = dbg_hexrow[((3'd7 - dbg_x[6:4])*4) +: 4];
 reg [23:0] dbg_glyph;
 always @* case (dbg_dv)
@@ -931,7 +1589,10 @@ always @(posedge current_pix_clk) begin
         video_rgb_reg[15:8]  <= (lg_target && lightgun_enabled && show_crosshair) ? {8{lg_target[1]}} : green;
         video_rgb_reg[7:0]   <= (lg_target && lightgun_enabled && show_crosshair) ? {8{lg_target[2]}} : blue;
 
-        // bring-up debug: 4 blocks top-left — sub-CPU alive, CDD command
+        // bring-up debug overlay, gated behind the "Debug Overlay" core
+        // setting (0x110); quasi-static config bit, safe to sample here
+        if (cs_debug_overlay) begin
+        // 4 blocks top-left — sub-CPU alive, CDD command
         // seen, word-RAM requested, word-RAM completed (green=yes, red=no)
         if (dbg_y < 10'd10) begin
             case (dbg_x[9:4])
@@ -981,6 +1642,7 @@ always @(posedge current_pix_clk) begin
                     video_rgb_reg <= 24'h000000;
             end
         end
+        end // cs_debug_overlay
     end
 
     // count ACTIVE lines only — dbg_y counted blanking lines before, which
@@ -1914,7 +2576,7 @@ MCD MCD
 	.CDC_DATA(CD_CDC_DATA),
 	.CDC_DAT_WR(CD_CDC_DAT_WR),
 	.CDC_SC_WR(1'b0),
-	.CDC_CDDA_WR(1'b0),
+	.CDC_CDDA_WR(CD_CDC_CDDA_WR),
 	.CDDA_WR_READY(MCD_CDDA_WR_READY),
 
 	.PCM_SL(MCD_PCM_SL),
@@ -2185,12 +2847,17 @@ end
 // CDD drive stub (M1): "no disc" responder; the real drive MPU lands in M2
 wire [39:0] cdd_stat /* verilator public_flat_rd */, cdd_comm /* verilator public_flat_rd */;
 wire        cdd_send /* verilator public_flat_rd */, cdd_rec /* verilator public_flat_rd */, cdd_dm;
-// CD image size crosses from clk_74a as a quasi-static value: sample it
-// through a 2FF-deep pipe and only accept when stable
+// Effective CD size (bin size for cue mounts, 0 until the mount FSM is
+// done) crosses from clk_74a as a quasi-static value: sample through a
+// 2FF-deep pipe and only accept when stable. Track count likewise.
+wire [31:0] cd_mount_size = mount_ready ? mount_eff_size : 32'd0;
 reg [31:0] cd_img_size_s1, cd_img_size_sys = 0;
+reg [6:0]  toc_count_s1, toc_count_sys = 0;
 always @(posedge clk_sys) begin
-	cd_img_size_s1 <= cd_img_size;
-	if (cd_img_size_s1 == cd_img_size) cd_img_size_sys <= cd_img_size_s1;
+	cd_img_size_s1 <= cd_mount_size;
+	if (cd_img_size_s1 == cd_mount_size) cd_img_size_sys <= cd_img_size_s1;
+	toc_count_s1 <= toc_track_count;
+	if (toc_count_s1 == toc_track_count) toc_count_sys <= toc_count_s1;
 end
 
 wire [15:0] CD_CDC_DATA;
@@ -2218,8 +2885,46 @@ megacd_cdd_drive cdd_drive
 	.cd_buf_q(cd_buf_q),
 
 	.cdc_data(CD_CDC_DATA),
-	.cdc_dat_wr(CD_CDC_DAT_WR)
+	.cdc_dat_wr(CD_CDC_DAT_WR),
+	.cdc_cdda_wr(CD_CDC_CDDA_WR),
+	.cdda_wr_ready(MCD_CDDA_WR_READY),
+
+	.track_count(toc_count_sys),
+	.toc_addr(toc_rd_addr),
+	.toc_q(toc_rd_q),
+	.cd_req_file(cd_req_file),
+
+	.dbg_state(cdd_dbg_state),
+	.dbg_sector_done(cdd_dbg_secdone)
 );
+wire CD_CDC_CDDA_WR;
+
+// CD fetch-path counters for the hardware overlay (debug only, loose CDC)
+wire [15:0] cdd_dbg_state;
+wire        cdd_dbg_secdone;
+reg  [7:0]  dbg_cdreq_cnt = 0, dbg_cdack_cnt = 0;
+// last CDD command word + counter (rightmost hex digit of the low word is
+// c0, the command nibble — e.g. xxxxxxxD = OPEN TRAY)
+reg [39:0]  dbg_cdd_lastcomm = 0;
+reg  [7:0]  dbg_cdd_cmd_cnt = 0;
+always @(posedge clk_sys) begin : cddcmdcnt
+	reg send_d;
+	send_d <= cdd_send;
+	if (cdd_send && !send_d) begin
+		dbg_cdd_lastcomm <= cdd_comm;
+		dbg_cdd_cmd_cnt  <= dbg_cdd_cmd_cnt + 1'b1;
+	end
+end
+always @(posedge clk_sys) begin : cdreqcnt
+	reg req_d;
+	req_d <= cd_req;
+	if (cd_req && !req_d) dbg_cdreq_cnt <= dbg_cdreq_cnt + 1'b1;
+end
+always @(posedge clk_74a) begin : cdackcnt
+	reg ack_d;
+	ack_d <= cd_ack;
+	if (cd_ack && !ack_d) dbg_cdack_cnt <= dbg_cdack_cnt + 1'b1;
+end
 
 ///////////////////////////////////////////////
 // Cart slot: empty (MegaCD boot mode)
