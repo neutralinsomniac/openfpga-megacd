@@ -33,7 +33,7 @@
                 "name": "CD Data",
                 "required": false,
                 "deferload": true,
-                "parameters": "0x8",
+                "parameters": "0x9",
                 "extensions": ["bin"]
             }
         ]

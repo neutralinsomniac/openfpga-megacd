@@ -103,6 +103,20 @@ int main(int argc,char**argv){
                            f1?"":" -- OPEN FAILED");
                 }
             }
+            // TOCPOST_AT=<cycle>: extra TOC snapshot once the mount is done
+            static long tocpost_at = -1;
+            { static bool tpi=false; if(!tpi){ tpi=true;
+                const char* e=getenv("TOCPOST_AT"); if(e) tocpost_at=atol(e); } }
+            if(c==tocpost_at){
+                for(int t=1;t<=30;t++){
+                    auto& w=dut->rootp->core_top__DOT__toc_ram_b[t];
+                    uint64_t lo=((uint64_t)w[1]<<32)|w[0]; uint32_t hi=w[2];
+                    printf("  TOCAT[%d]: audio=%d pgap=%d pre01=%d file=%d delta=%d disc_lba=%d\n",
+                           t,(int)((hi>>1)&1),(int)((((uint64_t)(hi&1)<<7)|(lo>>57))&0xFF),
+                           (int)((lo>>47)&0x3FF),(int)((lo>>40)&0x7F),
+                           (int)((lo>>20)&0xFFFFF),(int)(lo&0xFFFFF));
+                }
+            }
             if(c==60000){   // post-layout TOC snapshot
                 for(int t=1;t<=4;t++){
                     auto& w=dut->rootp->core_top__DOT__toc_ram_b[t];
@@ -130,6 +144,19 @@ int main(int argc,char**argv){
                 }
                 if(q.empty() && (c&63)==0){
                     uint32_t t0 = dut->rootp->core_top__DOT__icb__DOT__target_0;
+                    // HOST_LATENCY=<half-cycles>: hold every pending target
+                    // command for this long before serving it, modeling the
+                    // real Pocket host's SD-card latency (instant by default).
+                    // ~150K half-cycles = 1ms of emulated time.
+                    { static long host_lat = getenv("HOST_LATENCY")?atol(getenv("HOST_LATENCY")):0;
+                      static long cmd_seen = -1;
+                      bool is_cmd = t0==0x636D0140u || t0==0x636D0180u ||
+                                    t0==0x636D0190u || t0==0x636D0192u;
+                      if(is_cmd && host_lat>0){
+                          if(cmd_seen<0) cmd_seen=c;
+                          if(c-cmd_seen<host_lat) t0=0;   // still "in flight"
+                          else cmd_seen=-1;               // serve it now
+                      } }
                     if(t0==0x636D0140u){                  // Ready To Run
                         q.push_back({0xF8001000u,0x6F6B0000u});
                     } else if(t0==0x636D0180u){           // dataslot read
@@ -190,8 +217,25 @@ int main(int argc,char**argv){
                         printf("[%ld] CD openfile slot2: '%s' (%u bytes)%s\n",
                                c,path,size2,f2?"":" -- OPEN FAILED");
 
-                        if(f2) q.push_back({0xF800201Cu,size2}); // datatable idx 3 size
+                        // NO_DTABLE=1: model a firmware whose datatable row
+                        // order differs from our guess (the real-hardware
+                        // failure mode) — only the 008A path carries the size
+                        static bool no_dtable = getenv("NO_DTABLE")!=nullptr;
+                        if(f2 && !no_dtable) q.push_back({0xF800201Cu,size2}); // datatable idx 3 size
                         q.push_back({0xF8001000u,(uint32_t)(f2?0x6F6B0000u:0x6F6B0003u)});
+                        // user-reloadable slot: firmware follows the openfile
+                        // with a 008A "slot updated" notification carrying the
+                        // new size (this is the layout-independent size path
+                        // the core prefers; the datatable write above is the
+                        // row-order-dependent fallback)
+                        // NO_008A=1: real firmware (observed): core-initiated
+                        // openfile produces NO size notification at all
+                        static bool no_008a = getenv("NO_008A")!=nullptr;
+                        if(f2 && !no_008a){
+                            q.push_back({0xF8000020u, 2u});
+                            q.push_back({0xF8000024u, size2});
+                            q.push_back({0xF8000000u, 0x434D008Au});
+                        }
                     }
                 }
                 if(!q.empty()){

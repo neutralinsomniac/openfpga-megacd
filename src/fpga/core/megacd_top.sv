@@ -530,8 +530,10 @@ always @(posedge clk_74a) begin
         cdf_st <= 2'd2;
     end
     2'd2: if (target_dataslot_done) begin
-        if (cdf_src) mnt_rd_done <= 1;
-        else         cd_ack <= 1;
+        if (cdf_src) begin
+            mnt_rd_done <= 1;
+            mnt_rd_err  <= (target_dataslot_err != 0);
+        end else cd_ack <= 1;
         cdf_st <= 2'd3;
     end
     2'd3: begin
@@ -619,13 +621,14 @@ always @(posedge clk_74a) begin
     files_secs_q <= files_secs[files_addr];
 end
 
-localparam M_IDLE     = 4'd0,  M_SNIFF    = 4'd1,  M_SNIFF_W  = 4'd2,
-           M_EVAL     = 4'd3,  M_PARSE    = 4'd4,  M_GETFILE  = 4'd5,
-           M_DIRSCAN  = 4'd6,  M_BPATH_TAB= 4'd7,  M_BPATH    = 4'd8,
-           M_BTAIL    = 4'd9,  M_OPENFILE = 4'd10, M_FSIZE    = 4'd11,
-           M_FDIV     = 4'd12, M_LAYOUT   = 4'd13, M_READY    = 4'd14,
-           M_FAIL     = 4'd15;
-reg [3:0]  mnt_st = M_IDLE;
+localparam M_IDLE     = 5'd0,  M_SNIFF    = 5'd1,  M_SNIFF_W  = 5'd2,
+           M_EVAL     = 5'd3,  M_PARSE    = 5'd4,  M_GETFILE  = 5'd5,
+           M_DIRSCAN  = 5'd6,  M_BPATH_TAB= 5'd7,  M_BPATH    = 5'd8,
+           M_BTAIL    = 5'd9,  M_OPENFILE = 5'd10, M_FSIZE    = 5'd11,
+           M_FDIV     = 5'd12, M_LAYOUT   = 5'd13, M_READY    = 5'd14,
+           M_FAIL     = 5'd15, M_PROBE_GO = 5'd16, M_PROBE_WT = 5'd17,
+           M_PROBE_EV = 5'd18;
+reg [4:0]  mnt_st = M_IDLE;
 reg [3:0]  mnt_term = 0;   // overlay: 1=started, B=READY reached, C=FAILED
 
 // cue parser state
@@ -671,10 +674,19 @@ reg [4:0]  opened_file = 0;
 reg [11:0] bp_nm_off;
 reg [7:0]  bp_nm_len;
 // per-file size divider + layout pass
+reg [31:0] fdiv_in;       // dividend: size from 008A or the datatable
 reg [31:0] fdiv_rem;
 reg [19:0] fdiv_q;
 reg [5:0]  fdiv_bit;
 reg [31:0] fsize_prev;
+reg [31:0] of_size = 0;   // size from the 008A slot-2 update notification
+reg        of_size_new = 0;
+// firmware-agnostic size probe: binary-search the opened file's sector
+// count with 4-byte reads (reads past EOF fail with a nonzero result
+// code on real firmware — the one size signal every firmware provides)
+reg [20:0] pr_n, pr_lo, pr_hi;   // sector-count probe cursor / bounds
+reg        pr_ok;
+reg        mnt_rd_err = 0;       // result of the last mount-channel read
 reg [6:0]  lay_t;
 reg [2:0]  lay_ph;
 reg [19:0] lay_delta, lay_disc_end;
@@ -700,6 +712,16 @@ always @(posedge clk_74a) begin
     target_dataslot_openfile <= 0;
     fbuf_wr <= 0;
     toc_wr_en <= 0;
+
+    // slot-2 openfile size: user-reloadable slots (data.json parameters
+    // bit 0) get a 008A "slot updated" notification carrying the new size
+    // after every openfile — layout-independent, unlike the datatable poll
+    // below, which depends on the firmware's table row order. Stale
+    // captures are cleared when the next openfile is issued (M_BTAIL).
+    if (dataslot_update && dataslot_update_id == 16'd2) begin
+        of_size <= dataslot_update_size;
+        of_size_new <= 1;
+    end
 
     case (mnt_st)
     M_IDLE: begin
@@ -992,6 +1014,7 @@ always @(posedge clk_74a) begin
             mp_w <= 0;
             tds_id <= 16'd2;
             fsize_prev <= cd_bin_size;
+            of_size_new <= 0;
             target_dataslot_openfile <= 1;
             mnt_st <= M_OPENFILE;
         end else mp_w <= 8'd1;
@@ -1013,33 +1036,67 @@ always @(posedge clk_74a) begin
         end
     end
     M_FSIZE: begin
-        // the firmware refreshes the opened slot's size in the datatable
-        // (word 7 in its layout as we read it). Wait for a change; on
-        // timeout accept an unchanged value (equal-size files) if sane,
-        // else mark the size unknown (0) — the layout pass falls back to
-        // "last track's file lba + margin" so the mount NEVER hard-fails
-        // just because the firmware's table layout differs.
+        // learn the opened file's size. Primary: the 008A notification
+        // captured above (of_size_new) — real firmware sends it for
+        // user-reloadable slots and it carries the size directly.
+        // Secondary: the datatable poll (word 7 = slot 2's row in our
+        // data.json order). On timeout accept an unchanged value
+        // (equal-size files) if sane, else mark the size unknown (0) —
+        // the layout pass falls back to "last track's file lba + margin"
+        // so the mount NEVER hard-fails just because the firmware's
+        // table layout differs.
         mnt_tmo <= mnt_tmo + 1'b1;
-        if (cd_bin_size >= 32'd2352 && cd_bin_size != fsize_prev) begin
+        if (of_size_new && of_size >= 32'd2352) begin
+            fdiv_in <= of_size;
             fdiv_rem <= 0; fdiv_q <= 0; fdiv_bit <= 6'd32;
             mnt_st <= M_FDIV;
-        end else if (mnt_tmo == 25'd0) begin
-            if (cd_bin_size >= 32'd2352) begin
-                fdiv_rem <= 0; fdiv_q <= 0; fdiv_bit <= 6'd32;
-                mnt_st <= M_FDIV;
+        end else if (cd_bin_size >= 32'd2352 && cd_bin_size != fsize_prev) begin
+            fdiv_in <= cd_bin_size;
+            fdiv_rem <= 0; fdiv_q <= 0; fdiv_bit <= 6'd32;
+            mnt_st <= M_FDIV;
+        end else if (mnt_tmo == 25'd150000) begin
+            // ~2ms grace passed with no size notification: real firmware
+            // does not publish sizes for core-initiated openfiles (verified
+            // on hardware — not even with the slot user-reloadable). Probe
+            // the sector count directly: a 4-byte read at n*2352-4 succeeds
+            // iff the file holds >= n whole sectors; exponential doubling,
+            // then binary search. ~30 host round-trips per file, exact on
+            // any firmware.
+            pr_n  <= 21'd1;
+            pr_lo <= 0;
+            pr_hi <= 0;                  // 0 = no upper bound found yet
+            mnt_st <= M_PROBE_GO;
+        end
+    end
+    M_PROBE_GO: if (!mnt_rd_done) begin
+        mnt_offset <= ({11'd0, pr_n} << 11) + ({11'd0, pr_n} << 8)
+                    + ({11'd0, pr_n} << 5)  + ({11'd0, pr_n} << 4) - 32'd4;
+        mnt_len <= 32'd4;
+        mnt_rd <= 1;
+        mnt_st <= M_PROBE_WT;
+    end
+    M_PROBE_WT: if (mnt_rd_done) begin
+        mnt_rd <= 0;
+        pr_ok  <= !mnt_rd_err;
+        mnt_st <= M_PROBE_EV;
+    end
+    M_PROBE_EV: begin : probe_ev
+        reg [20:0] nlo, nhi;
+        nlo = pr_ok ? pr_n : pr_lo;
+        nhi = pr_ok ? pr_hi : pr_n;
+        pr_lo <= nlo; pr_hi <= nhi;
+        if (nhi == 0) begin
+            if (pr_n == 21'h100000) begin
+                // >=2.4GB claimed: impossible for a CD image, clamp.
+                // fdiv_bit==0 drops straight into M_FDIV's store+advance.
+                fdiv_q <= 20'hFFFFF; fdiv_bit <= 0; mnt_st <= M_FDIV;
             end else begin
-                files_secs[mnt_file] <= 20'd0;   // unknown: layout fallback
-                if ({1'd0, mnt_file} + 6'd1 < cp_files) begin
-                    mnt_file <= mnt_file + 1'b1;
-                    files_addr <= mnt_file + 1'b1;
-                    mnt_st <= M_BPATH_TAB;
-                end else begin
-                    lay_t <= 7'd1; lay_ph <= 0;
-                    lay_delta <= 0; lay_disc_end <= 0;
-                    lay_prev_file <= 7'h7F;
-                    mnt_st <= M_LAYOUT;
-                end
+                pr_n <= pr_n << 1; mnt_st <= M_PROBE_GO;
             end
+        end else if (nhi - nlo <= 21'd1) begin
+            fdiv_q <= nlo[19:0]; fdiv_bit <= 0; mnt_st <= M_FDIV;
+        end else begin
+            pr_n <= (nlo + nhi) >> 1; mnt_st <= M_PROBE_GO;
         end
     end
     M_FDIV: begin : fdiv
@@ -1058,7 +1115,7 @@ always @(posedge clk_74a) begin
                 mnt_st <= M_LAYOUT;
             end
         end else begin
-            r = {fdiv_rem[30:0], cd_bin_size[fdiv_bit-1]};
+            r = {fdiv_rem[30:0], fdiv_in[fdiv_bit-1]};
             if (r >= 32'd2352) begin
                 fdiv_rem <= r - 32'd2352;
                 fdiv_q   <= {fdiv_q[18:0], 1'b1};
@@ -1520,9 +1577,11 @@ wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
                          (dbg_y < 10'd90)  ? dbg_dtable[1] :
                          (dbg_y < 10'd102) ? dbg_dtable[2] :
                          (dbg_y < 10'd114) ? dbg_dtable[3] :
-                         (dbg_y < 10'd126) ? dbg_dtable[4] :
-                         (dbg_y < 10'd138) ? dbg_dtable[5] :
-                         (dbg_y < 10'd150) ? dbg_dtable[6] :
+                         // CD-path debug: drive/fetch state, bridge FSMs,
+                         // host round-trip counters (see dbg_cdpath packing)
+                         (dbg_y < 10'd126) ? cdd_dbg_state :
+                         (dbg_y < 10'd138) ? dbg_cdpath :
+                         (dbg_y < 10'd150) ? dbg_cdcnt :
                                              dbg_dtable[7];
 wire [3:0] dbg_dv = dbg_hexrow[((3'd7 - dbg_x[6:4])*4) +: 4];
 reg [23:0] dbg_glyph;
@@ -2900,7 +2959,30 @@ megacd_cdd_drive cdd_drive
 wire CD_CDC_CDDA_WR;
 
 // CD fetch-path counters for the hardware overlay (debug only, loose CDC)
-wire [15:0] cdd_dbg_state;
+wire [31:0] cdd_dbg_state;
+
+// CD-path debug counters for the overlay (clk_74a): every host round-trip
+// and error, plus a snapshot of the fetch/reopen/mount state machines
+reg [15:0] dbg_rd_cnt = 0;   // dataslot reads completed
+reg  [7:0] dbg_of_cnt = 0;   // openfile round-trips completed
+reg  [7:0] dbg_err_cnt = 0;  // reads/openfiles that returned err != 0
+reg        tds_done_d = 0, tds_fdone_d = 0;
+always @(posedge clk_74a) begin
+    tds_done_d  <= target_dataslot_done;
+    tds_fdone_d <= target_dataslot_file_done;
+    if (target_dataslot_done & ~tds_done_d) begin
+        dbg_rd_cnt <= dbg_rd_cnt + 1'b1;
+        if (target_dataslot_err != 0) dbg_err_cnt <= dbg_err_cnt + 1'b1;
+    end
+    if (target_dataslot_file_done & ~tds_fdone_d) begin
+        dbg_of_cnt <= dbg_of_cnt + 1'b1;
+        if (target_dataslot_err != 0) dbg_err_cnt <= dbg_err_cnt + 1'b1;
+    end
+end
+wire [31:0] dbg_cdpath = {2'b0, cdf_st, 3'b0, reopen_req,
+                          mnt_st[3:0], dbg_tstate,
+                          3'b0, opened_file, 1'b0, crf_stable};
+wire [31:0] dbg_cdcnt  = {dbg_of_cnt, dbg_err_cnt, dbg_rd_cnt};
 wire        cdd_dbg_secdone;
 reg  [7:0]  dbg_cdreq_cnt = 0, dbg_cdack_cnt = 0;
 // last CDD command word + counter (rightmost hex digit of the low word is

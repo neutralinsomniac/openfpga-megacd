@@ -60,7 +60,7 @@ module megacd_cdd_drive
     output wire [6:0] cd_req_file,
 
     // hardware-overlay debug: {status, fetch_st, dlv_st, head[7:0]}
-    output wire [15:0] dbg_state,
+    output wire [31:0] dbg_state,
     output wire        dbg_sector_done
 );
 
@@ -417,7 +417,10 @@ always @(posedge clk) begin
     endcase
 end
 
-assign dbg_state = {drv_status, fetch_st, dlv_st, head[7:0]};
+// hex readout: digit0=drv_status digit1={fetch_st,dlv_st}
+// digit2={cd_req,buf_valid,dlv_kick} digits3-7=head LBA
+assign dbg_state = {drv_status, fetch_st, dlv_st,
+                    cd_req, buf_valid, dlv_kick, head[19:0]};
 assign dbg_sector_done = dlv_advance;
 
 ///////////////////////////////////////////////
