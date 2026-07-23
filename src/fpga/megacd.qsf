@@ -804,8 +804,8 @@ set_global_assignment -name VHDL_FILE core/rtl/mcd/CDDA.vhd
 set_global_assignment -name VHDL_FILE core/rtl/mcd/PCM.vhd
 set_global_assignment -name VHDL_FILE core/rtl/mcd/MCD.vhd
 
-# Placement seed: at 97% ALM utilization a marginal fast-corner hold on
-# an internal counter (gen|ZCLKCNT) came and went with placement churn;
-# this seed lands a fit with zero timing violations. Bump if a future
-# change reintroduces a marginal path.
-set_global_assignment -name SEED 3
+# Placement seed: at 97%+ ALM utilization a marginal fast-corner hold on
+# an internal counter (gen|ZCLKCNT / jt12 integ_data) comes and goes with
+# placement churn; the seed is chosen to land a fit with zero timing
+# violations. Bump if a future change reintroduces a marginal path.
+set_global_assignment -name SEED 5

@@ -32,11 +32,12 @@ module megacd_cdd_drive
     // clk_74a-domain and synchronized here
     output reg        cd_req,
     output reg [31:0] cd_req_offset,
-    output reg        cd_req_buf,
+    output reg  [1:0] cd_req_slot,   // which of the 4 bank slots to fill
     input             cd_ack_74a,
 
-    // double sector buffer read port (32-bit, 1 clk latency, byte0 in [7:0])
-    output reg [10:0] cd_buf_addr,
+    // 4-sector prefetch bank read port (32-bit, 1 clk latency, byte0 [7:0]).
+    // 4 slots x 1024 words: addr = {slot[1:0], word[9:0]}
+    output reg [11:0] cd_buf_addr,
     input      [31:0] cd_buf_q,
 
     // CDC host feed: one 16-bit word per cdc_dat_wr rising edge
@@ -61,7 +62,11 @@ module megacd_cdd_drive
 
     // hardware-overlay debug: {status, fetch_st, dlv_st, head[7:0]}
     output wire [31:0] dbg_state,
-    output wire        dbg_sector_done
+    output wire        dbg_sector_done,
+    // audio-path diagnostics: {cmd_cnt[8], seek_cnt[8], backseek_cnt[8],
+    // last command c0[4], drv_status[4]}. backseek_cnt = SEEKs whose target is
+    // BEHIND the current head (a resync-seek = an audible CDDA replay).
+    output wire [31:0] dbg_cmds
 );
 
 localparam [3:0] STAT_STOP    = 4'h0;
@@ -91,12 +96,20 @@ reg [19:0] ms_tick = 0;
 reg  [3:0] latency = 4'd10;
 
 // playback state
-reg [31:0] head = 0;          // current LBA
+reg [31:0] head /*verilator public_flat_rd*/ = 0;  // current LBA
 reg [31:0] seek_target = 0;
 reg  [3:0] seek_cnt = 0;      // beats remaining in seek
 reg        seek_to_play = 0;  // arrive in PLAY (else PAUSE)
 reg  [3:0] rs_type = 4'hF;    // latched report type (F = none/status only)
 reg  [6:0] rs_track = 1;      // track # latched with a REQUEST 5
+// instrumentation: last CDD command word + counters (sim log + hw overlay)
+reg [39:0] dbg_last_comm /*verilator public_flat_rd*/ = 0;
+reg  [7:0] dbg_cmd_cnt   /*verilator public_flat_rd*/ = 0;
+reg  [7:0] dbg_seek_cnt  /*verilator public_flat_rd*/ = 0;  // SEEK cmds
+reg  [7:0] dbg_backseek_cnt /*verilator public_flat_rd*/ = 0; // backward SEEKs
+reg  [3:0] dbg_last_c0   = 0;
+assign dbg_cmds = {dbg_cmd_cnt, dbg_seek_cnt, dbg_backseek_cnt,
+                   dbg_last_c0, drv_status};
 
 ///////////////////////////////////////////////
 // current-track tracker: linear search of the TOC whenever the head
@@ -104,7 +117,7 @@ reg  [6:0] rs_track = 1;      // track # latched with a REQUEST 5
 // cue (track_count==0) the disc is one data track.
 ///////////////////////////////////////////////
 reg  [6:0] cur_track = 1;
-reg        cur_audio = 0;
+reg        cur_audio /*verilator public_flat_rd*/ = 0;
 reg [19:0] cur_delta = 0;     // disc->file offset for the current track
 reg  [6:0] cur_file = 0;      // which bin holds the current track
 reg [19:0] cur_start = 0;     // current track's disc start
@@ -287,10 +300,18 @@ always @(posedge clk) begin
 end
 
 ///////////////////////////////////////////////
-// sector fetch engine: keep buffer halves holding head and head+1
+// sector fetch engine: keep a 4-sector bank holding head_file .. head_file+3
+// (slot = file_lba[1:0]). The extra read-ahead depth rides out SD read-latency
+// spikes during continuous CDDA (delivery still meters to the DAC at 1x; the
+// bank just buffers ahead). Deep look-ahead (k>=2) is confined to clean
+// mid-track streaming so every banked sector shares the current cur_delta.
 ///////////////////////////////////////////////
-reg [31:0] buf_lba [0:1];
-reg  [1:0] buf_valid = 0;
+// buf_lba is the FILE LBA held in each slot. A CD never reaches 2^20 sectors,
+// so 21 bits fully distinguish sectors -- narrower than the 32-bit head lets
+// the 4 "is it banked?" comparators cost far fewer ALMs (this design fits at
+// ~98% util, so the prefetch scan is kept lean).
+reg [20:0] buf_lba [0:3];
+reg  [3:0] buf_valid = 0;
 reg  [1:0] cdack_s = 0;
 reg  [1:0] fetch_st = 0;
 reg [31:0] fetch_lba;
@@ -300,11 +321,26 @@ wire       fetch_wanted = disc_present &&
 // LBAs are signed: seeks into the track-1 pregap (down to -150) are part
 // of the BIOS boot flow. Negative and virtual-pregap sectors are never
 // fetched from the file; all real fetches use FILE LBAs (disc - delta).
-wire       want_head  = !head[31] && !in_pregap &&
-                        !(buf_valid[head_file[0]] && buf_lba[head_file[0]] == head_file);
-wire [31:0] head1 = head_file + 1'b1;
-wire       want_next  = !head1[31] && !in_pregap &&
-                        !(buf_valid[head1[0]] && buf_lba[head1[0]] == head1);
+wire [31:0] hf0 = head_file;
+wire [31:0] hf1 = head_file + 32'd1;
+wire [31:0] hf2 = head_file + 32'd2;
+wire [31:0] hf3 = head_file + 32'd3;
+wire       want_head = !head[31] && !in_pregap &&
+                       !(buf_valid[hf0[1:0]] && buf_lba[hf0[1:0]] == hf0[20:0]);
+wire       want_next = !hf1[31] && !in_pregap &&
+                       !(buf_valid[hf1[1:0]] && buf_lba[hf1[1:0]] == hf1[20:0]);
+// deep look-ahead only when head is positive, not in a pregap window, and the
+// whole [head, head+3] window sits before the next track's pregap start (so
+// cur_delta is valid for hf2/hf3). Near a boundary this falls back to head+1.
+wire       deep_ok   = !head[31] && !in_pregap && (head[31:20] == 12'd0) &&
+                       ((head[19:0] + 20'd4) < pgap_lo);
+wire       want_d2   = deep_ok &&
+                       !(buf_valid[hf2[1:0]] && buf_lba[hf2[1:0]] == hf2[20:0]);
+wire       want_d3   = deep_ok &&
+                       !(buf_valid[hf3[1:0]] && buf_lba[hf3[1:0]] == hf3[20:0]);
+wire       any_want  = want_head || want_next || want_d2 || want_d3;
+// nearest-to-head wanted sector wins (keeps head itself highest priority)
+wire [31:0] fetch_pick = want_head ? hf0 : want_next ? hf1 : want_d2 ? hf2 : hf3;
 always @(posedge clk) begin
     cdack_s <= {cdack_s[0], cd_ack_74a};
     if (reset | ~mcd_rst_n) begin
@@ -312,23 +348,23 @@ always @(posedge clk) begin
         fetch_st <= 0;
         buf_valid <= 0;
     end else case (fetch_st)
-    2'd0: if (fetch_wanted && (want_head || want_next)) begin
-        fetch_lba <= want_head ? head_file : head1;
+    2'd0: if (fetch_wanted && any_want) begin
+        fetch_lba <= fetch_pick;
         fetch_st  <= 2'd1;
     end
     2'd1: begin
         // offset = lba * 2352 (2048 + 256 + 32 + 16)
         cd_req_offset <= (fetch_lba << 11) + (fetch_lba << 8) +
                          (fetch_lba << 5)  + (fetch_lba << 4);
-        cd_req_buf    <= fetch_lba[0];
-        buf_valid[fetch_lba[0]] <= 0;
+        cd_req_slot   <= fetch_lba[1:0];
+        buf_valid[fetch_lba[1:0]] <= 0;
         cd_req <= 1;
         fetch_st <= 2'd2;
     end
     2'd2: if (cdack_s[1]) begin
         cd_req <= 0;
-        buf_lba[fetch_lba[0]]   <= fetch_lba;
-        buf_valid[fetch_lba[0]] <= 1;
+        buf_lba[fetch_lba[1:0]]   <= fetch_lba[20:0];
+        buf_valid[fetch_lba[1:0]] <= 1;
         fetch_st <= 2'd3;
     end
     2'd3: if (!cdack_s[1]) fetch_st <= 2'd0;
@@ -342,10 +378,19 @@ end
 reg  [1:0] dlv_st = 0;
 reg [10:0] dlv_w;       // word index 0..1175
 reg  [3:0] dlv_ph;
-reg        dlv_half;    // buffer half latched at delivery start
+reg  [1:0] dlv_slot;    // bank slot (file_lba[1:0]) latched at delivery start
 reg        dlv_neg;     // pregap sector: synthesize sync+header, zero payload
-reg        dlv_kick = 0;
-reg        dlv_advance = 0;
+// sectors owed to the delivery FSM: +1 per PLAY beat, -1 per delivered
+// sector (saturating). A COUNTER, not a level flag: the old dlv_kick level
+// was raised on the beat and lowered on completion in the same always-block,
+// so a beat landing on the same clock as a completion was silently dropped.
+// During CDDA the FIFO backpressure stretches each sector's delivery to
+// nearly a full beat, so completion sat right on the next beat boundary and
+// that collision recurred every few beats -> dropped sectors -> FIFO
+// underrun -> audible skips. The counter never loses a beat and lets the
+// engine burst-catch-up after a stall (the CDDA FIFO / CDC ring absorb it).
+reg  [3:0] dlv_owed = 0;
+reg        dlv_advance /*verilator public_flat_rd*/ = 0;
 // pregap header MSF digits (valid for head in -150..-1): abs = head+150
 wire [7:0] pre_v   = head[7:0] + 8'd150;
 wire       pre_s   = (pre_v >= 8'd75);
@@ -372,16 +417,16 @@ always @(posedge clk) begin
         cdc_dat_wr <= 0;
         cdc_cdda_wr <= 0;
     end else case (dlv_st)
-    2'd0: if (dlv_kick && (head[31] || !want_head)) begin
+    2'd0: if (dlv_owed != 0 && (head[31] || !want_head)) begin
         dlv_w  <= 0;
-        dlv_half <= head_file[0];
+        dlv_slot <= head_file[1:0];
         dlv_neg  <= head[31];
         dlv_pgap <= in_pregap && !head[31];   // virtual pregap: silence
         dlv_aud  <= (cur_audio || in_pregap) && !head[31];
         dlv_st <= 2'd1;
     end
     2'd1: begin // present address, wait RAM latency
-        cd_buf_addr <= {dlv_half, dlv_w[10:1]};
+        cd_buf_addr <= {dlv_slot, dlv_w[10:1]};
         dlv_ph <= 0;
         dlv_st <= 2'd2;
     end
@@ -409,18 +454,18 @@ always @(posedge clk) begin
             end
         end
     end
-    // wait for the beat engine to consume dlv_advance and drop dlv_kick:
-    // without this the level-held kick restarts delivery immediately
-    // (head not yet advanced -> stale/duplicated sectors, >75Hz rate)
-    2'd3: if (!dlv_kick) dlv_st <= 2'd0;
+    // one-cycle drain: hold here while dlv_advance propagates so the report
+    // block advances head and decrements dlv_owed before state 0 re-arms
+    // (else delivery could restart on the not-yet-advanced head)
+    2'd3: dlv_st <= 2'd0;
     default: dlv_st <= 0;
     endcase
 end
 
 // hex readout: digit0=drv_status digit1={fetch_st,dlv_st}
-// digit2={cd_req,buf_valid,dlv_kick} digits3-7=head LBA
+// digit2={cd_req,buf_valid,owed!=0} digits3-7=head LBA
 assign dbg_state = {drv_status, fetch_st, dlv_st,
-                    cd_req, buf_valid, dlv_kick, head[19:0]};
+                    cd_req, buf_valid[1:0], (dlv_owed != 0), head[19:0]};
 assign dbg_sector_done = dlv_advance;
 
 ///////////////////////////////////////////////
@@ -430,6 +475,15 @@ assign dbg_sector_done = dlv_advance;
 reg  [2:0] rpt_st = 0;
 reg        frame_go = 0;
 reg        rpt_trk_audio = 0;
+
+// a delivery is owed for each beat spent in PLAY with a disc present.
+// NOTE: paced off ms_tick==TICK_13MS (698010 cyc = 76.9Hz, ~2.5% fast vs true
+// 1x). Retiming this to wdog==BEAT (75Hz) BROKE the BIOS disc-check handshake
+// (stuck at CHECKING DISC every boot) — the boot header capture depends on the
+// delivery beat being on ms_tick, decoupled from the 75Hz status frame. The
+// FMV audio glitch is a PCM UNDERRUN (sub can't refill in time), so a slower
+// delivery would not fix it anyway; left on ms_tick to preserve boot.
+wire owe_inc = (ms_tick == TICK_13MS) && (drv_status == STAT_PLAY) && disc_present;
 // REQUEST 5 track number from the command's c4/c5 BCD digits
 wire [6:0] req_track = {3'd0,c4}*7'd10 + {3'd0,c5};
 
@@ -455,11 +509,18 @@ always @(posedge clk) begin
         rpt_toc_use <= 0;
         frame_go <= 0;
         msf_start <= 0;
-        dlv_kick <= 0;
+        dlv_owed <= 0;
     end else begin
         send_d <= cdd_send;
         wdog   <= wdog + 1'b1;
         msf_start <= 0;
+
+        // sectors owed to the delivery FSM. Increment and decrement are
+        // combined into ONE assignment so a beat that lands on the same clock
+        // as a completion is not lost (the bug the old dlv_kick level had).
+        dlv_owed <= dlv_owed
+                  + ((owe_inc && dlv_owed != 4'hF) ? 4'd1 : 4'd0)
+                  - ((dlv_advance && dlv_owed != 4'd0) ? 4'd1 : 4'd0);
 
         // 13.3ms state tick
         if (ms_tick == TICK_13MS) begin
@@ -498,8 +559,8 @@ always @(posedge clk) begin
                 cdd_dm <= ~cur_audio;           // data/music flag per track
                 // pregap sectors (negative LBA) are synthesized by the
                 // delivery FSM: the BIOS parks at 00:01:73 and watches the
-                // pregap headers roll by to arm its capture window
-                dlv_kick <= 1;
+                // pregap headers roll by to arm its capture window.
+                // The beat is accounted by owe_inc -> dlv_owed above.
             end
         end else begin
             ms_tick <= ms_tick + 1'b1;
@@ -513,7 +574,6 @@ always @(posedge clk) begin
         // sector delivered: advance the head (the consumed half is naturally
         // refetched: after head++ the lba->half mapping asks it for head+1)
         if (dlv_advance) begin
-            dlv_kick <= 0;
             if (head != leadout_lba) head <= head + 1'b1;
             else drv_status <= STAT_PAUSE;  // ran into leadout
         end
@@ -580,6 +640,16 @@ always @(posedge clk) begin
 
         // command handling: immediate reply nibbles per megacdd.cpp/GPGX
         if (cdd_send & ~send_d) begin
+            dbg_last_comm <= cdd_comm;      // instrumentation
+            dbg_cmd_cnt   <= dbg_cmd_cnt + 1'b1;
+            dbg_last_c0   <= c0;
+            if (c0 == 4'h3 || c0 == 4'h4) begin       // SEEK+PLAY / SEEK+PAUSE
+                dbg_seek_cnt <= dbg_seek_cnt + 1'b1;
+                // target behind the current head = a backward resync-seek,
+                // which replays audio (the CDDA "repeat" the user hears)
+                if (disc_present && !head[31] && comm_lba < head)
+                    dbg_backseek_cnt <= dbg_backseek_cnt + 1'b1;
+            end
             case (c0)
                 4'h0: begin                   // DRIVE STATUS (IDLE)
                     n0 <= drv_status;

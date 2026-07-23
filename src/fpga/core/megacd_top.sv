@@ -477,7 +477,7 @@ core_bridge_cmd icb (
 
     wire        cd_req;             // clk_sys, level-held until cd_ack
     wire [31:0] cd_req_offset;      // stable while cd_req held
-    wire        cd_req_buf;
+    wire  [1:0] cd_req_slot;   // which of the 4 bank slots the drive is filling
     reg         cd_ack = 0;         // clk_74a; synced back inside the drive
 
     // mount FSM read channel (level-held request, same clk_74a domain)
@@ -510,7 +510,7 @@ always @(posedge clk_74a) begin
                              || crf_stable == {2'd0, opened_file})) begin
         // drive fetch, its bin already open: serve it (top priority)
         tds_offset     <= cd_req_offset;
-        tds_bridgeaddr <= {19'h38000, cd_req_buf, 12'h000}; // 0x7000_0000/1000
+        tds_bridgeaddr <= {18'h1C000, cd_req_slot, 12'h000}; // 0x7000_{slot}000
         tds_length     <= 32'd2352;
         cdf_src <= 0;
         target_dataslot_read <= 1;
@@ -557,15 +557,15 @@ always @(posedge clk_74a) begin
     endcase
 end
 
-// double sector buffer: host writes 32-bit words at 0x7000_0000/0x7000_1000,
-// drive reads on clk_sys (contents race-free: only read after cd_ack).
-// Normalize packing so file byte 0 always lands in bits [7:0].
-reg [31:0] cd_buf [0:2047];
+// 4-sector prefetch bank: host writes 32-bit words at 0x7000_{0,1,2,3}000
+// (one 4KB window per slot), drive reads on clk_sys (contents race-free: only
+// read after cd_ack). Normalize packing so file byte 0 always lands in [7:0].
+reg [31:0] cd_buf [0:4095];
 wire [31:0] cd_buf_wd = bridge_endian_little ? bridge_wr_data :
     {bridge_wr_data[7:0], bridge_wr_data[15:8], bridge_wr_data[23:16], bridge_wr_data[31:24]};
 always @(posedge clk_74a) begin
     if (bridge_wr && bridge_addr[31:24] == 8'h70)
-        cd_buf[bridge_addr[12:2]] <= cd_buf_wd;
+        cd_buf[bridge_addr[13:2]] <= cd_buf_wd;   // {slot[1:0], word[9:0]}
 end
 
 // mount parse buffer: 4KB at bridge 0x7200_0000, raw big-endian packing
@@ -1119,12 +1119,17 @@ always @(posedge clk_74a) begin
             // does not publish sizes for core-initiated openfiles (verified
             // on hardware — not even with the slot user-reloadable). Probe
             // the sector count directly: a 4-byte read at n*2352-4 succeeds
-            // iff the file holds >= n whole sectors; exponential doubling,
-            // then binary search. ~30 host round-trips per file, exact on
-            // any firmware.
-            pr_n  <= 21'd1;
-            pr_lo <= 0;
-            pr_hi <= 0;                  // 0 = no upper bound found yet
+            // iff the file holds >= n whole sectors. The upper bound is known
+            // a priori (a Red Book CD can't reach 2^20 sectors), so seed
+            // [floor, ceiling] and binary-search from the start — the old
+            // exponential-doubling phase to discover a ceiling was pure
+            // overhead. ~20 host round-trips/file, constant regardless of
+            // size, vs ~30 that grew with it. (MiSTer skips this probe
+            // entirely by stat()ing the bin on its Linux host; APF exposes no
+            // file size for core openfiles, so read-past-EOF is all we have.)
+            pr_lo <= 21'd0;              // known-good floor (>=0 sectors; never tested)
+            pr_hi <= 21'h100000;         // known-bad ceiling: no CD reaches 2^20 sectors
+            pr_n  <= 21'h080000;         // first probe = midpoint of [0, 2^20]
             mnt_st <= M_PROBE_GO;
         end
     end
@@ -1152,19 +1157,17 @@ always @(posedge clk_74a) begin
         mnt_st <= M_IDLE;
     end
     M_PROBE_EV: if (pb_yield) mnt_st <= M_IDLE; else begin : probe_ev
+        // pr_lo = largest sector count known to fit; pr_hi = smallest known
+        // NOT to fit. Both seeded in M_FSIZE, so pr_hi is never 0 and this is
+        // a pure binary search (no ceiling-discovery branch). A file that
+        // actually reaches 2^20 sectors converges to nlo == 0xFFFFF — the
+        // same clamp the old exponential path applied at its 2^20 ceiling.
         reg [20:0] nlo, nhi;
         nlo = pr_ok ? pr_n : pr_lo;
         nhi = pr_ok ? pr_hi : pr_n;
         pr_lo <= nlo; pr_hi <= nhi;
-        if (nhi == 0) begin
-            if (pr_n == 21'h100000) begin
-                // >=2.4GB claimed: impossible for a CD image, clamp.
-                // fdiv_bit==0 drops straight into M_FDIV's store+advance.
-                fdiv_q <= 20'hFFFFF; fdiv_bit <= 0; mnt_st <= M_FDIV;
-            end else begin
-                pr_n <= pr_n << 1; mnt_st <= M_PROBE_GO;
-            end
-        end else if (nhi - nlo <= 21'd1) begin
+        if (nhi - nlo <= 21'd1) begin
+            // fdiv_bit==0 drops straight into M_FDIV's store+advance.
             fdiv_q <= nlo[19:0]; fdiv_bit <= 0; mnt_st <= M_FDIV;
         end else begin
             pr_n <= (nlo + nhi) >> 1; mnt_st <= M_PROBE_GO;
@@ -1284,7 +1287,7 @@ always @(posedge clk_74a) begin
     end
     endcase
 end
-wire [10:0] cd_buf_addr;    // clk_sys
+wire [11:0] cd_buf_addr;    // clk_sys ({slot[1:0], word[9:0]})
 reg  [31:0] cd_buf_q;
 always @(posedge clk_sys) cd_buf_q <= cd_buf[cd_buf_addr];
 
@@ -1684,7 +1687,9 @@ wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
                          (dbg_y < 10'd126) ? cdd_dbg_state :
                          (dbg_y < 10'd138) ? dbg_cdpath :
                          (dbg_y < 10'd150) ? dbg_cdcnt :
-                                             dbg_dtable[7];
+                         // audio diagnostics: CCSSBBLD = cmd_cnt, seek_cnt,
+                         // backSEEK_cnt (the CDDA-replay counter), last c0, status
+                                             cdd_dbg_cmds;
 wire [3:0] dbg_dv = dbg_hexrow[((3'd7 - dbg_x[6:4])*4) +: 4];
 reg [23:0] dbg_glyph;
 always @* case (dbg_dv)
@@ -3039,7 +3044,7 @@ megacd_cdd_drive cdd_drive
 
 	.cd_req(cd_req),
 	.cd_req_offset(cd_req_offset),
-	.cd_req_buf(cd_req_buf),
+	.cd_req_slot(cd_req_slot),
 	.cd_ack_74a(cd_ack),
 
 	.cd_buf_addr(cd_buf_addr),
@@ -3056,8 +3061,10 @@ megacd_cdd_drive cdd_drive
 	.cd_req_file(cd_req_file),
 
 	.dbg_state(cdd_dbg_state),
-	.dbg_sector_done(cdd_dbg_secdone)
+	.dbg_sector_done(cdd_dbg_secdone),
+	.dbg_cmds(cdd_dbg_cmds)
 );
+wire [31:0] cdd_dbg_cmds;   // {cmd_cnt, seek_cnt, backseek_cnt, last_c0, status}
 wire CD_CDC_CDDA_WR;
 
 // CD fetch-path counters for the hardware overlay (debug only, loose CDC)

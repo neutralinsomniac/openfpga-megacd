@@ -395,6 +395,35 @@ int main(int argc,char**argv){
                      c, mr, ds, dr, mpc);
               mr_prev=mr; ds_prev=ds; dr_prev=dr;
           } }
+        // CDDATRACE=1: during CDDA playback, log every CDD command the game
+        // issues (skipping the frequent DRIVE STATUS poll c0=0) and flag any
+        // stall in head advancement (a delivery hitch). This is to catch the
+        // deterministic Sonic-CD intro skip.
+        { static bool on = getenv("CDDATRACE")!=nullptr;
+          if(on){
+            int ca  = r->core_top__DOT__cdd_drive__DOT__cur_audio;
+            int ds2 = r->core_top__DOT__cdd_drive__DOT__drv_status;
+            unsigned head = r->core_top__DOT__cdd_drive__DOT__head;
+            static int cmd_prev=-1;
+            int cmdc = r->core_top__DOT__cdd_drive__DOT__dbg_cmd_cnt;
+            if(cmdc != cmd_prev){
+              cmd_prev = cmdc;
+              unsigned long long cm = r->core_top__DOT__cdd_drive__DOT__dbg_last_comm;
+              int c0 = cm & 0xF;
+              if(c0!=0)   // non-poll command
+                printf("CDD [%ld] comm=%010llX c0=%d status=%d audio=%d head=%u\n",
+                       c, cm, c0, ds2, ca, head&0xFFFFF);
+            }
+            // head-stall detector during PLAY on an audio track
+            static unsigned head_prev=0; static long head_last_move=0;
+            if(head!=head_prev){ head_prev=head; head_last_move=c; }
+            static long last_report=0;
+            if(ca && ds2==1 && (c-head_last_move)>1500000 && (c-last_report)>500000){
+              printf("CDDA-STALL [%ld] head frozen at %u for %ld cyc\n",
+                     c, head&0xFFFFF, c-head_last_move);
+              last_report=c;
+            }
+          } }
         static uint32_t last=0xFFFFFFFF; static long stuck=0;
         static int vint_prev=0; static long vint_cnt=0, cepix_cnt=0, vbl_cnt=0;
         static int cepix_prev=0, vbl_prev=0;

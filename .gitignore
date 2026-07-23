@@ -23,3 +23,4 @@
 .DS_Store
 *~
 *.sw?
+sim/drive/obj_dir/
