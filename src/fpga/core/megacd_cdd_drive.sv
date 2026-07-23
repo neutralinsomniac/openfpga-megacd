@@ -78,11 +78,11 @@ localparam [19:0] TICK_13MS = 20'd698010; // no-disc drain tick
 wire disc_present = (img_size >= 32'd2352);
 wire [31:0] leadout_lba = img_lba;        // computed at mount
 
-reg  [3:0] drv_status = STAT_STOP;
+reg  [3:0] drv_status /*verilator public_flat_rd*/ = STAT_STOP;
 reg  [3:0] n0, n1, n2, n3, n4, n5, n6, n7, n8;
 wire [3:0] csum = ~(n0 + n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8) & 4'hF;
 
-reg        door = 0;
+reg        door /*verilator public_flat_rd*/ = 0;
 reg  [5:0] ins_cnt = 0;   // insertion tray-open pulse, in beats
 reg [25:0] wdog = 0;
 reg        send_d = 0;

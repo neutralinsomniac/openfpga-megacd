@@ -319,9 +319,11 @@ int main(int argc,char**argv){
             if(on && hn && c-hlast>400000) hflush();
             wr_p=wr; rd_p=rd; hrd_p=hrd; dten_p=dten; int_p=intn;
             if(c==crd){
-                FILE*fp=fopen("cdcram_dump.bin","wb");
-                if(fp){ for(int i=0;i<16384;i++) fputc(rr->core_top__DOT__MCD__DOT__cdc_ram__DOT__mem[i],fp); fclose(fp); }
-                printf("[%ld] wrote cdcram_dump.bin\n",c);
+                // cdc_ram dump retired: its mem is a converted-VHDL inferred
+                // RAM with no public handle after core_top stopped inlining
+                // into the root. Reinstate by annotating the dpram mem in
+                // mcd.v with /*verilator public_flat_rd*/ if needed again.
+                printf("[%ld] cdcram_dump skipped (see tb note)\n",c);
             }
         }
 
@@ -380,6 +382,19 @@ int main(int argc,char**argv){
                 printf("\n");
             }
         }
+        // MOUNT/DRIVE trace: mount_ready, drv_status, door — correlate the
+        // moment the disc becomes "present" (mount_ready) and the drive's
+        // NO_DISC->OPEN->TOC insertion dance with the main-CPU boot PC. This
+        // is what the BIOS watches to decide CHECKING DISC vs its idle panel.
+        { static int mr_prev=-1, ds_prev=-1, dr_prev=-1;
+          int mr = r->core_top__DOT__mount_ready;
+          int ds = r->core_top__DOT__cdd_drive__DOT__drv_status;
+          int dr = r->core_top__DOT__cdd_drive__DOT__door;
+          if(mr!=mr_prev || ds!=ds_prev || dr!=dr_prev){
+              printf("MNT [%ld] mount_ready=%d drv_status=%d door=%d main=%06X\n",
+                     c, mr, ds, dr, mpc);
+              mr_prev=mr; ds_prev=ds; dr_prev=dr;
+          } }
         static uint32_t last=0xFFFFFFFF; static long stuck=0;
         static int vint_prev=0; static long vint_cnt=0, cepix_cnt=0, vbl_cnt=0;
         static int cepix_prev=0, vbl_prev=0;
@@ -608,9 +623,9 @@ int main(int argc,char**argv){
         printf("%04X ", dut->rootp->core_top__DOT__sdram__DOT__mem[w] & 0xFFFF);
 #endif
     printf("\n");
-    {   // end-of-run CDC buffer + PRG RAM dumps for offline inspection
-        FILE*fp=fopen("cdcram_end.bin","wb");
-        if(fp){ for(int i=0;i<16384;i++) fputc(dut->rootp->core_top__DOT__MCD__DOT__cdc_ram__DOT__mem[i],fp); fclose(fp); }
+    {   // end-of-run PRG RAM dump for offline inspection (cdc_ram dump
+        // retired — see the CDCRAMDUMP note above)
+        FILE*fp;
 #ifndef REALSD
         fp=fopen("prgram_end.bin","wb");
         if(fp){ for(uint32_t w=0x800000;w<0x840000;w++){
@@ -618,7 +633,7 @@ int main(int argc,char**argv){
                     fputc(v>>8,fp); fputc(v&0xFF,fp); }
                 fclose(fp); }
 #endif
-        printf("wrote cdcram_end.bin + prgram_end.bin\n");
+        printf("wrote prgram_end.bin\n");
     }
     printf("ST2 word-RAM selftest: ph=%d err=%d\n",
            dut->rootp->core_top__DOT__st2_ph, dut->rootp->core_top__DOT__st2_err);

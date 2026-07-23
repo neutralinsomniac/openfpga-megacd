@@ -803,3 +803,9 @@ set_global_assignment -name VERILOG_FILE core/rtl/mcd/CDDA_FIFO.v
 set_global_assignment -name VHDL_FILE core/rtl/mcd/CDDA.vhd
 set_global_assignment -name VHDL_FILE core/rtl/mcd/PCM.vhd
 set_global_assignment -name VHDL_FILE core/rtl/mcd/MCD.vhd
+
+# Placement seed: at 97% ALM utilization a marginal fast-corner hold on
+# an internal counter (gen|ZCLKCNT) came and went with placement churn;
+# this seed lands a fit with zero timing violations. Bump if a future
+# change reintroduces a marginal path.
+set_global_assignment -name SEED 3

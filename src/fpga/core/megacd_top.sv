@@ -508,22 +508,33 @@ always @(posedge clk_74a) begin
     case (cdf_st)
     2'd0: if (cdreq_s[1] && (!mount_use_slot2
                              || crf_stable == {2'd0, opened_file})) begin
+        // drive fetch, its bin already open: serve it (top priority)
         tds_offset     <= cd_req_offset;
         tds_bridgeaddr <= {19'h38000, cd_req_buf, 12'h000}; // 0x7000_0000/1000
         tds_length     <= 32'd2352;
         cdf_src <= 0;
         target_dataslot_read <= 1;
         cdf_st <= 2'd1;
-    end else if (cdreq_s[1] && mount_use_slot2) begin
-        reopen_file <= crf_stable[4:0];
-        reopen_req <= 1;
-    end else if (mnt_rd && !mnt_rd_done) begin
-        tds_offset     <= mnt_offset;
-        tds_bridgeaddr <= 32'h7200_0000;         // parse buffer window
-        tds_length     <= mnt_len;
-        cdf_src <= 1;
-        target_dataslot_read <= 1;
-        cdf_st <= 2'd1;
+    end else begin
+        // drive fetch needs a different bin: flag the reopen — but a
+        // BLOCKED fetch must NOT also starve a pending mount (probe) read.
+        // Serving the read anyway lets the mount finish and reach M_IDLE,
+        // where the reopen is serviced. Without this, the drive-fetch
+        // priority above wedged the probe read forever (mnt_rd_done never
+        // came) so the mount never serviced the reopen — the CHECKING-DISC
+        // deadlock. This makes forward progress structural, not timing-luck.
+        if (cdreq_s[1] && mount_use_slot2) begin
+            reopen_file <= crf_stable[4:0];
+            reopen_req <= 1;
+        end
+        if (mnt_rd && !mnt_rd_done) begin
+            tds_offset     <= mnt_offset;
+            tds_bridgeaddr <= 32'h7200_0000;     // parse buffer window
+            tds_length     <= mnt_len;
+            cdf_src <= 1;
+            target_dataslot_read <= 1;
+            cdf_st <= 2'd1;
+        end
     end
     2'd1: if (target_dataslot_ack) begin
         target_dataslot_read <= 0;
@@ -580,7 +591,7 @@ always @(posedge clk_74a) pbuf_q <= parse_buf[pbuf_addr];
 // to .bin/.BIN (same-basename convention), openfile it into slot 2 and
 // stream sectors from there.
 ///////////////////////////////////////////////
-reg        mount_ready = 0;
+reg        mount_ready /*verilator public_flat_rd*/ = 0;
 reg        mount_use_slot2 = 0;
 reg [31:0] mount_eff_size = 0;
 reg [31:0] mounted_size = 0;
@@ -616,6 +627,29 @@ reg [19:0] files_nm  [0:31];   // {name_off[11:0], name_len[7:0]}
 reg [19:0] files_secs[0:31];   // file length in 2352-byte sectors
 reg [4:0]  files_addr;
 reg [19:0] files_nm_q, files_secs_q;
+// Two-phase mount: the per-file size probe is ~30 host round-trips per
+// file, so on real hardware a multi-bin cue takes seconds before the
+// whole TOC is known. Disc-present must NOT wait for all of that or the
+// BIOS boots to its no-disc idle panel ("PRESS START") before the disc
+// appears, and only sees it via the late-insertion path. Instead: probe
+// only file 0 (track 1 / the data track the boot reads), lay out a
+// PRELIMINARY TOC (file 0 exact, the rest fallback) and assert the disc
+// present-at-boot; then probe files 1..N-1 in the background and refine
+// the TOC. Background probing yields slot 2 to drive fetches via M_IDLE
+// (reopen_req has priority), so track-1 reads are never starved.
+reg [31:0] fsecs_valid = 0;    // per-file "size probed" mask (else fallback)
+reg        lay_prelim = 0;     // current layout is preliminary (more to come)
+reg        pb_active = 0;      // background phase-2 probe running
+reg [5:0]  pb_next = 0;        // next file index to background-probe
+// Background probing must never starve the drive: the BIOS reads track 1
+// (file 0) throughout CHECKING DISC and boot, and openfiling an audio bin
+// to probe it swaps file 0 out of the single slot. So phase 2 only starts
+// a probe after the drive fetch path has been idle a while (pb_idle), and
+// ABORTS instantly (pb_yield) if a real fetch needs a different file — the
+// drive then reopens within one openfile instead of stalling a full probe.
+reg [21:0] pb_idle = 0;        // clk_74a cycles since the last drive fetch
+wire       pb_yield = pb_active && reopen_req && (reopen_file != opened_file);
+wire       pb_ready = pb_idle[21];   // drive idle long enough to slip a probe in
 always @(posedge clk_74a) begin
     files_nm_q   <= files_nm[files_addr];
     files_secs_q <= files_secs[files_addr];
@@ -713,6 +747,13 @@ always @(posedge clk_74a) begin
     fbuf_wr <= 0;
     toc_wr_en <= 0;
 
+    // drive-idle timer for background probing: cleared on every drive fetch
+    // request, saturates at bit 21 (~28ms @74MHz). pb_idle[21] means the
+    // drive has read nothing for well over one sector period, so slipping a
+    // probe in won't collide with an active read burst (CHECKING DISC/boot).
+    if (cdreq_s[1]) pb_idle <= 0;
+    else if (!pb_idle[21]) pb_idle <= pb_idle + 1'b1;
+
     // slot-2 openfile size: user-reloadable slots (data.json parameters
     // bit 0) get a 008A "slot updated" notification carrying the new size
     // after every openfile — layout-independent, unlike the datatable poll
@@ -747,6 +788,9 @@ always @(posedge clk_74a) begin
             tds_id <= 16'd1;         // sniff reads the CD slot itself
             mnt_term <= 4'h1;
             mnt_reopen <= 0;
+            pb_active <= 0;          // cancel any prior background probe
+            lay_prelim <= 0;
+            fsecs_valid <= 0;        // all file sizes unknown until probed
             mnt_st <= M_SNIFF;
         end else if (reopen_req && mount_ready
                      && reopen_file != opened_file) begin
@@ -754,10 +798,22 @@ always @(posedge clk_74a) begin
             // that file's path and openfile it into slot 2. The
             // opened_file guard kills a one-cycle race that double-ran
             // the reopen (its openfile then collided with the next
-            // sector read's handshake)
+            // sector read's handshake). Higher priority than background
+            // probing so a real drive fetch is never starved.
             mnt_file <= reopen_file;
             mnt_reopen <= 1;
             files_addr <= reopen_file;
+            mnt_st <= M_BPATH_TAB;
+        end else if (pb_active && !reopen_req && pb_ready) begin
+            // phase-2 background probe: size the next audio-track bin, but
+            // only once the drive has been idle a while (pb_idle) so we don't
+            // swap file 0 out from under an active read. It opens pb_next
+            // into slot 2 (opened_file follows); if the drive then needs
+            // file 0 back mid-probe, pb_yield aborts us straight back here
+            // and the reopen above wins.
+            mnt_file <= pb_next[4:0];
+            files_addr <= pb_next[4:0];
+            mnt_reopen <= 0;
             mnt_st <= M_BPATH_TAB;
         end
     end
@@ -1027,6 +1083,10 @@ always @(posedge clk_74a) begin
                 mnt_reopen <= 0;
                 mnt_st <= M_IDLE;
             end else begin
+                // slot 2 now physically holds this file; keep opened_file
+                // in step so the drive's reopen logic is accurate even
+                // while we probe in the background (mount_ready already up)
+                opened_file <= mnt_file;
                 mnt_tmo <= 25'd1;
                 mnt_st <= M_FSIZE;
             end
@@ -1035,7 +1095,7 @@ always @(posedge clk_74a) begin
             mnt_st <= M_FAIL;
         end
     end
-    M_FSIZE: begin
+    M_FSIZE: if (pb_yield) mnt_st <= M_IDLE; else begin
         // learn the opened file's size. Primary: the 008A notification
         // captured above (of_size_new) — real firmware sends it for
         // user-reloadable slots and it carries the size directly.
@@ -1068,7 +1128,8 @@ always @(posedge clk_74a) begin
             mnt_st <= M_PROBE_GO;
         end
     end
-    M_PROBE_GO: if (!mnt_rd_done) begin
+    M_PROBE_GO: if (pb_yield) mnt_st <= M_IDLE;
+        else if (!mnt_rd_done) begin
         mnt_offset <= ({11'd0, pr_n} << 11) + ({11'd0, pr_n} << 8)
                     + ({11'd0, pr_n} << 5)  + ({11'd0, pr_n} << 4) - 32'd4;
         mnt_len <= 32'd4;
@@ -1079,8 +1140,18 @@ always @(posedge clk_74a) begin
         mnt_rd <= 0;
         pr_ok  <= !mnt_rd_err;
         mnt_st <= M_PROBE_EV;
+    end else if (pb_yield) begin
+        // THE deadlock: the drive needs file 0 but a probe opened another
+        // bin, so the cdf arbiter (drive-fetch priority) refuses to serve
+        // our probe read while the drive's blocked fetch is pending —
+        // mnt_rd_done never comes and we'd wait here forever, never
+        // reaching M_IDLE to service the reopen. Drop the probe read and
+        // bail so the reopen runs and the drive gets file 0 back; retry
+        // pb_next later.
+        mnt_rd <= 0;
+        mnt_st <= M_IDLE;
     end
-    M_PROBE_EV: begin : probe_ev
+    M_PROBE_EV: if (pb_yield) mnt_st <= M_IDLE; else begin : probe_ev
         reg [20:0] nlo, nhi;
         nlo = pr_ok ? pr_n : pr_lo;
         nhi = pr_ok ? pr_hi : pr_n;
@@ -1104,11 +1175,25 @@ always @(posedge clk_74a) begin
         reg [31:0] r;
         if (fdiv_bit == 0) begin
             files_secs[mnt_file] <= fdiv_q;
-            if ({1'd0, mnt_file} + 6'd1 < cp_files) begin
-                mnt_file <= mnt_file + 1'b1;
-                files_addr <= mnt_file + 1'b1;
-                mnt_st <= M_BPATH_TAB;
+            fsecs_valid[mnt_file] <= 1'b1;
+            if (!mount_ready) begin
+                // PHASE 1: file 0 (track 1 / the data track boot reads) is
+                // now sized. Lay out a preliminary TOC — file 0 exact, the
+                // rest fallback — and assert the disc present-at-boot. If
+                // this is the only file, the preliminary layout is final.
+                lay_prelim <= (cp_files > 6'd1);
+                lay_t <= 7'd1; lay_ph <= 0;
+                lay_delta <= 0; lay_disc_end <= 0;
+                lay_prev_file <= 7'h7F;
+                mnt_st <= M_LAYOUT;
+            end else if (pb_next + 6'd1 < cp_files) begin
+                // PHASE 2: more audio bins to size — yield through M_IDLE
+                pb_next <= pb_next + 1'b1;
+                mnt_st <= M_IDLE;
             end else begin
+                // PHASE 2 done: refine the TOC now every file size is known
+                pb_active <= 0;
+                lay_prelim <= 0;
                 lay_t <= 7'd1; lay_ph <= 0;
                 lay_delta <= 0; lay_disc_end <= 0;
                 lay_prev_file <= 7'h7F;
@@ -1140,18 +1225,27 @@ always @(posedge clk_74a) begin
         end
         3'd3: lay_ph <= 3'd4;
         3'd4: begin : layw
-            reg [19:0] d;
+            reg [19:0] d, foff;
             d = (lay_e[46:40] != lay_prev_file) ? lay_disc_end : lay_delta;
             d = d + {12'd0, lay_e[64:57]};        // + this track's pregap
+            // recover the in-FILE lba (disc - delta) so this pass is
+            // idempotent: the two-phase mount lays the TOC out twice (a
+            // preliminary pass to make the disc present-at-boot, then a
+            // refine once every bin's size is probed), and the disc field
+            // holds the absolute lba after the first pass, not the file lba
+            foff = lay_e[19:0] - lay_e[39:20];
             toc_wr_addr <= lay_t;
-            toc_wr_data <= {lay_e[65:40], d, lay_e[19:0] + d};
+            toc_wr_data <= {lay_e[65:40], d, foff + d};
             toc_wr_en <= 1;
             lay_delta <= d;
             // unknown file size (0): approximate its extent as the last
             // track's start + ~6 minutes, recomputed each track so the
             // value consumed at the next file boundary uses the file's
             // final track
-            lay_disc_end <= d + ((files_secs_q != 0) ? files_secs_q
+            // exact size once the file is probed; until then (preliminary
+            // layout, or a background-probe still pending) fall back to
+            // "this track's start + ~6 min" so the disc has a usable extent
+            lay_disc_end <= d + (fsecs_valid[lay_e[44:40]] ? files_secs_q
                                  : (lay_e[19:0] + 20'd27000));
             lay_prev_file <= lay_e[46:40];
             if (lay_t == cp_tmax) lay_ph <= 3'd5;
@@ -1164,8 +1258,16 @@ always @(posedge clk_74a) begin
             mount_eff_size <= {12'd0, lay_disc_end} * 32'd2352;
             toc_track_count <= cp_tmax;
             mount_use_slot2 <= 1;
-            opened_file <= mnt_file;   // last file opened in phase B
-            mnt_st <= M_READY;
+            opened_file <= mnt_file;   // file open in slot 2 right now
+            mount_ready <= 1;          // present-at-boot: disc appears now
+            mnt_term <= 4'hB;
+            if (lay_prelim) begin
+                // preliminary layout done — boot can read track 1; size
+                // the remaining bins in the background and refine later
+                pb_active <= 1;
+                pb_next  <= 6'd1;
+            end
+            mnt_st <= M_IDLE;
         end
         default: lay_ph <= 0;
         endcase
