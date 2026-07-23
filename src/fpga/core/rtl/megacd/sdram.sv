@@ -94,6 +94,7 @@ localparam [2:0] FSM_ACT  = 3'd2;
 localparam [2:0] FSM_CAS  = 3'd3;
 localparam [2:0] FSM_PALL = 3'd4;
 localparam [2:0] FSM_REF  = 3'd5;
+localparam [2:0] FSM_GRANT= 3'd6;
 
 // init-sequence cycle counter (MODE_RESET/LDM/PRE phases only)
 localparam STATE_IDLE  = 4'd0;
@@ -113,8 +114,22 @@ reg  [2:0] ram_req = 0;
 reg [12:0] open_row [0:3];
 reg  [3:0] row_open = 0;
 
-wire [2:0] wr = {wrl2|wrh2,wrl1|wrh1,wrl0|wrh0};
-wire [2:0] rd = {rd2,rd1,rd0};
+// Strobe retiming: the request strobes come from the half-rate system
+// clock and are edge-detected here; the address/data they qualify launch
+// in the same system cycle, so grant() must never fire off the very first
+// RAM-clock edge after a strobe changes (the address may still be in
+// flight — this was a real -1.9ns setup violation and the source of the
+// random boot-time corruption). One capture stage delays edge detection a
+// full RAM cycle; addr/din stay direct and are covered by the sys->ram
+// multicycle-2 constraint in core_constraints.sdc.
+reg [2:0] rd_q = 0, wrl_q = 0, wrh_q = 0;
+always @(posedge clk) begin
+	rd_q  <= {rd2,  rd1,  rd0};
+	wrl_q <= {wrl2, wrl1, wrl0};
+	wrh_q <= {wrh2, wrh1, wrh0};
+end
+wire [2:0] wr = wrl_q | wrh_q;
+wire [2:0] rd = rd_q;
 
 // per-port read-data latches: a single shared dout register let any later
 // port's completion clobber a value before its requester consumed it
@@ -195,21 +210,19 @@ begin
 end
 endtask
 
+// grant only LATCHES the winning request; the first SDRAM command is
+// issued from the registered copy one cycle later (FSM_GRANT). Keeping
+// the strobe edge-detect + 3-port priority + row compare + command mux
+// out of a single cycle is what closes timing to the pin-bound IOE
+// registers at high device utilization (was -0.45ns reg->pin).
 task grant(input [2:0] idx, input [24:1] taddr, input [15:0] tdin, input twr, input [1:0] tmask);
-	reg [1:0] gdqm;
 begin
 	{ba, a} <= taddr;
 	data <= tdin;
 	we   <= twr;
-	gdqm = twr ? ~tmask : 2'b00;
-	dqm  <= gdqm;
+	dqm  <= twr ? ~tmask : 2'b00;
 	ram_req <= idx;
-	if (row_open[taddr[24:23]] && open_row[taddr[24:23]] == taddr[13:1])
-		do_cas(taddr[24:23], taddr[22:1], tdin, twr, gdqm);
-	else if (row_open[taddr[24:23]])
-		do_pre(taddr[24:23]);
-	else
-		do_act(taddr[24:23], taddr[22:1]);
+	fsm <= FSM_GRANT;
 end
 endtask
 
@@ -271,19 +284,27 @@ always @(posedge clk) begin
 			else if ((~old_rd[0] && rd[0]) || (~old_wr[0] && wr[0])) begin
 				old_rd[0] <= rd[0];
 				old_wr[0] <= wr[0];
-				grant(3'b001, addr0, din0, wr[0], {wrh0,wrl0});
+				grant(3'b001, addr0, din0, wr[0], {wrh_q[0],wrl_q[0]});
 			end
 			else if ((~old_rd[1] && rd[1]) || (~old_wr[1] && wr[1])) begin
 				old_rd[1] <= rd[1];
 				old_wr[1] <= wr[1];
-				grant(3'b010, addr1, din1, wr[1], {wrh1,wrl1});
+				grant(3'b010, addr1, din1, wr[1], {wrh_q[1],wrl_q[1]});
 			end
 			else if ((~old_rd[2] && rd[2]) || (~old_wr[2] && wr[2])) begin
 				old_rd[2] <= rd[2];
 				old_wr[2] <= wr[2];
-				grant(3'b100, addr2, din2, wr[2], {wrh2,wrl2});
+				grant(3'b100, addr2, din2, wr[2], {wrh_q[2],wrl_q[2]});
 			end
 		end
+
+		FSM_GRANT:
+			if (row_open[ba] && open_row[ba] == a[13:1])
+				do_cas(ba, a[22:1], data, we, dqm);
+			else if (row_open[ba])
+				do_pre(ba);
+			else
+				do_act(ba, a[22:1]);
 
 		FSM_PRE:
 			if (dly) dly <= dly - 1'd1;
