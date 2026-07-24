@@ -23,6 +23,10 @@
 .DS_Store
 *~
 *.sw?
-sim/drive/obj_dir/
+# Verilator build output (any sim subdir)
+sim/*/obj_dir/
 sim/full/*.hex
 sim/full/bios_*.hex
+
+# Claude Code per-user local settings
+.claude/settings.local.json
