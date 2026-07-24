@@ -24,3 +24,5 @@
 *~
 *.sw?
 sim/drive/obj_dir/
+sim/full/*.hex
+sim/full/bios_*.hex

@@ -489,8 +489,13 @@ wire [6:0] req_track = {3'd0,c4}*7'd10 + {3'd0,c5};
 
 always @(posedge clk) begin
     if (reset | ~mcd_rst_n) begin
-        drv_status <= STAT_STOP;
-        n0 <= STAT_STOP; n1 <= 0;
+        // Come up disc-ready (TOC) if a disc is present. A real CDD keeps its
+        // disc knowledge across sub-CPU/MCD resets; the BIOS pulses the MCD
+        // reset during boot, and resetting the drive to STOP left it stuck
+        // (STOP+disc has no path to TOC) -> CHECKING DISC forever. TOC is the
+        // "disc ready" state the BIOS idle screen polls for.
+        drv_status <= disc_present ? STAT_TOC : STAT_STOP;
+        n0 <= disc_present ? STAT_TOC : STAT_STOP; n1 <= 0;
         n2 <= 0; n3 <= 0; n4 <= 0; n5 <= 0; n6 <= 0; n7 <= 0; n8 <= 0;
         cdd_stat <= {4'hF, 36'h0};
         cdd_dm   <= 0;
@@ -530,12 +535,10 @@ always @(posedge clk) begin
                 if (latency != 0) latency <= latency - 1'b1;
                 else drv_status <= door ? STAT_OPEN : STAT_NO_DISC;
             end
-            // disc inserted while empty: emulate a real insertion — tray
-            // OPEN for ~0.5s, then closed-with-media (STOP). The bare
-            // NO_DISC->STOP nudge was sometimes ignored by the BIOS; the
-            // OPEN phase makes it drop its cached no-disc state, and the
-            // pulse only fires once the mount is actually complete (which
-            // also removes the "reset before the mount finished" race)
+            // disc inserted mid-session (drive was NO_DISC): emulate a real
+            // insertion — tray OPEN ~0.5s then closed-with-media, landing in
+            // TOC(9). (Present-at-boot and post-MCD-reset are handled by the
+            // reset block bringing the drive up disc-ready, see below.)
             if (drv_status == STAT_NO_DISC && disc_present && !door) begin
                 drv_status <= STAT_OPEN;
                 ins_cnt <= 6'd38;
