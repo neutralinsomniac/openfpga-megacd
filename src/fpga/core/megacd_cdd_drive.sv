@@ -98,8 +98,29 @@ reg  [3:0] latency = 4'd10;
 // playback state
 reg [31:0] head /*verilator public_flat_rd*/ = 0;  // current LBA
 reg [31:0] seek_target = 0;
-reg  [3:0] seek_cnt = 0;      // beats remaining in seek
+reg  [7:0] seek_cnt = 0;      // beats remaining in seek (1 beat ~= 13.3ms)
 reg        seek_to_play = 0;  // arrive in PLAY (else PAUSE)
+
+// distance-proportional seek latency, matching GPGX/MiSTer cdd_t::SeekToLBA:
+//   frames = (play ? 11 : 0) + |Δlba| * 120 / 270000
+// The distance term is |Δlba|/2250; done here as *7457>>24 (7457/2^24 =
+// 1/2249.7, which reproduces MiSTer's truncated integer result to the frame
+// across the whole disc). 1 beat (frame) ~= 13.3ms (the ms_tick period below).
+// Full-disc play seek ~= 11 + 146 = 157 frames ~= 2.1s; base play ~= 0.15s.
+// MiSTer applies no cap (bounded by disc size); SEEK_CAP is only an 8-bit
+// overflow guard past that natural max.
+localparam [12:0] SEEK_MULT      = 13'd7457; // 7457/2^24 ~= 1/2250
+localparam [4:0]  SEEK_RSHIFT    = 5'd24;
+localparam [7:0]  SEEK_PLAY_BASE = 8'd11;    // +11 frames on PLAY only
+localparam [7:0]  SEEK_CAP       = 8'd200;   // overflow guard (MiSTer: uncapped)
+// resume/spin-up latency. RESUME (PAUSE->PLAY) is instant on a paused disc in
+// both GPGX/MiSTer and here, but a real drive that was paused has spun down
+// and must spin the media back up before audio flows (~1-2s). Games that
+// pre-seek paused, buffer FMV video, then RESUME the CDDA rely on that delay;
+// without it the audio comes in ~1.5-2s early. Modelled as a resume-in-place
+// seek of SPINUP_BEATS beats (1 beat ~= 13.3ms). Tune live.
+localparam [7:0] SPINUP_BEATS = 8'd120;   // ~1.6s full spin-up ceiling
+reg  [7:0] pause_ticks = 0;   // beats spent in PAUSE (saturating)
 reg  [3:0] rs_type = 4'hF;    // latched report type (F = none/status only)
 reg  [6:0] rs_track = 1;      // track # latched with a REQUEST 5
 // instrumentation: last CDD command word + counters (sim log + hw overlay)
@@ -156,6 +177,27 @@ wire [7:0]  m_bcd_in = c2*4'd10 + c3;
 wire [7:0]  s_bcd_in = c4*4'd10 + c5;
 wire [7:0]  f_bcd_in = c6*4'd10 + c7;
 wire [31:0] comm_lba = m_bcd_in*32'd4500 + s_bcd_in*32'd75 + f_bcd_in - 32'd150;
+
+// seek stroke = |target - head| in sectors. Both are signed LBAs (pregap
+// sectors are small negatives), so signed subtraction keeps boot-pregap
+// parks (head~0 -> ~-2) a short hop rather than a full-stroke seek.
+wire signed [31:0] seek_diff = $signed(comm_lba) - $signed(head);
+wire [31:0] seek_dist = seek_diff[31] ? (~seek_diff + 32'd1) : seek_diff;
+// distance term = |Δlba| * 7457 >> 24  (== MiSTer's |Δlba|/2250)
+wire [44:0] seek_scaled = seek_dist * SEEK_MULT;
+wire [31:0] seek_dterm  = seek_scaled >> SEEK_RSHIFT;
+// SEEK+PLAY carries the +11 base; SEEK+PAUSE has none (MiSTer play flag)
+wire [31:0] play_beats_raw  = {24'd0, SEEK_PLAY_BASE} + seek_dterm;
+wire [31:0] pause_beats_raw = seek_dterm;
+wire [7:0]  play_beats  = (play_beats_raw  > {24'd0, SEEK_CAP})
+                          ? SEEK_CAP : play_beats_raw[7:0];
+wire [7:0]  pause_beats = (pause_beats_raw > {24'd0, SEEK_CAP})
+                          ? SEEK_CAP : pause_beats_raw[7:0];
+
+// RESUME spin-up: from PAUSE, scale with how long we sat paused (capped at the
+// full spin-up); from a fully-stopped state (STOP/TOC) use the full ceiling.
+wire [7:0]  pause_spin  = (pause_ticks > SPINUP_BEATS) ? SPINUP_BEATS : pause_ticks;
+wire [7:0]  resume_spin = (drv_status == STAT_PAUSE) ? pause_spin : SPINUP_BEATS;
 
 task zeros; begin
     n2 <= 0; n3 <= 0; n4 <= 0; n5 <= 0; n6 <= 0; n7 <= 0; n8 <= 0;
@@ -565,6 +607,13 @@ always @(posedge clk) begin
                 // pregap headers roll by to arm its capture window.
                 // The beat is accounted by owe_inc -> dlv_owed above.
             end
+            // track how long the disc has been paused so RESUME can scale its
+            // spin-up: a brief pause barely spins down (near-instant resume),
+            // a long one (FMV video buffering) spins down fully.
+            if (drv_status == STAT_PAUSE)
+                pause_ticks <= (pause_ticks == 8'hFF) ? 8'hFF : pause_ticks + 1'b1;
+            else
+                pause_ticks <= 0;
         end else begin
             ms_tick <= ms_tick + 1'b1;
         end
@@ -661,7 +710,7 @@ always @(posedge clk) begin
                     // flips it to a live absolute-position report — that
                     // F->0 transition is the BIOS's seek-done signal
                     if (rs_type == 4'hF &&
-                        (drv_status != STAT_SEEK || seek_cnt <= 4'd3)) begin
+                        (drv_status != STAT_SEEK || seek_cnt <= 8'd3)) begin
                         rs_type <= 4'h0;
                         rpt_st <= 3'd1;
                     end
@@ -695,7 +744,7 @@ always @(posedge clk) begin
                     if (disc_present) begin
                         seek_target <= comm_lba;
                         seek_to_play <= 1;
-                        seek_cnt <= 4'd10;
+                        seek_cnt <= play_beats;
                         drv_status <= STAT_SEEK;
                         rs_type <= 4'hF;      // busy until an IDLE poll near done
                         n0 <= STAT_SEEK; n1 <= 4'hF; zeros;
@@ -707,7 +756,7 @@ always @(posedge clk) begin
                     if (disc_present) begin
                         seek_target <= comm_lba;
                         seek_to_play <= 0;
-                        seek_cnt <= 4'd10;
+                        seek_cnt <= pause_beats;
                         drv_status <= STAT_SEEK;
                         rs_type <= 4'hF;      // busy until an IDLE poll near done
                         n0 <= STAT_SEEK; n1 <= 4'hF; zeros;
@@ -719,9 +768,27 @@ always @(posedge clk) begin
                     if (disc_present) drv_status <= STAT_PAUSE;
                     n0 <= disc_present ? STAT_PAUSE : drv_status;
                 end
-                4'h7: begin                   // RESUME
-                    if (disc_present) drv_status <= STAT_PLAY;
-                    n0 <= disc_present ? STAT_PLAY : drv_status;
+                4'h7: begin                   // RESUME (PAUSE->PLAY)
+                    if (disc_present) begin
+                        if (drv_status != STAT_PLAY) begin
+                            // spun-down disc: model spin-up as a resume-in-
+                            // place seek so delivery is gated until PLAY, and
+                            // the BIOS sees a busy->done transition like a real
+                            // drive coming back up. seek_target = head keeps
+                            // the position; arrive in PLAY.
+                            seek_target <= head;
+                            seek_to_play <= 1;
+                            seek_cnt <= resume_spin;
+                            drv_status <= STAT_SEEK;
+                            rs_type <= 4'hF;
+                            n0 <= STAT_SEEK; n1 <= 4'hF; zeros;
+                        end else begin
+                            // already spinning: resume is instant
+                            n0 <= STAT_PLAY;
+                        end
+                    end else begin
+                        n0 <= drv_status;
+                    end
                 end
                 4'hD: begin                   // OPEN TRAY
                     door <= 1;
