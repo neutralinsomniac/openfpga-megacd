@@ -181,18 +181,30 @@ wire [31:0] comm_lba = m_bcd_in*32'd4500 + s_bcd_in*32'd75 + f_bcd_in - 32'd150;
 // seek stroke = |target - head| in sectors. Both are signed LBAs (pregap
 // sectors are small negatives), so signed subtraction keeps boot-pregap
 // parks (head~0 -> ~-2) a short hop rather than a full-stroke seek.
-wire signed [31:0] seek_diff = $signed(comm_lba) - $signed(head);
-wire [31:0] seek_dist = seek_diff[31] ? (~seek_diff + 32'd1) : seek_diff;
+// --- seek-latency pipeline -------------------------------------------------
+// This distance math is two chained multiplies (comm_lba's BCD*constants, then
+// |Δlba|*7457) plus the cap adders — as a single combinational cone from
+// cdd_comm/head into seek_cnt it was ~32ns and failed setup on the 107MHz
+// clock by ~14ns (TNS -358): the boot-corruption regression. cdd_comm and head
+// are stable for thousands of clk cycles before the cdd_send strobe or the
+// 13.3ms tick that consume the result, so these free-running stages have long
+// settled by the time a command latches seek_cnt. Same operations and
+// bit-exact values as the old single-cycle path — only pipelined off it.
+reg  [31:0] comm_lba_r   = 0;   // stage 0: BCD*const multiplies resolved
+reg  [31:0] head_r       = 0;
+reg  [31:0] seek_dist_r  = 0;   // stage 1: |target - head|
+reg  [31:0] seek_dterm_r = 0;   // stage 2: distance term (the *7457 multiply)
+reg   [7:0] play_beats_r  = 0;  // stage 3: distance term + PLAY base, capped
+reg   [7:0] pause_beats_r = 0;  // stage 3: distance term (PAUSE), capped
+
+wire signed [31:0] seek_diff = $signed(comm_lba_r) - $signed(head_r);
+wire [31:0] seek_dist   = seek_diff[31] ? (~seek_diff + 32'd1) : seek_diff;
 // distance term = |Δlba| * 7457 >> 24  (== MiSTer's |Δlba|/2250)
-wire [44:0] seek_scaled = seek_dist * SEEK_MULT;
+wire [44:0] seek_scaled = seek_dist_r * SEEK_MULT;
 wire [31:0] seek_dterm  = seek_scaled >> SEEK_RSHIFT;
 // SEEK+PLAY carries the +11 base; SEEK+PAUSE has none (MiSTer play flag)
-wire [31:0] play_beats_raw  = {24'd0, SEEK_PLAY_BASE} + seek_dterm;
-wire [31:0] pause_beats_raw = seek_dterm;
-wire [7:0]  play_beats  = (play_beats_raw  > {24'd0, SEEK_CAP})
-                          ? SEEK_CAP : play_beats_raw[7:0];
-wire [7:0]  pause_beats = (pause_beats_raw > {24'd0, SEEK_CAP})
-                          ? SEEK_CAP : pause_beats_raw[7:0];
+wire [31:0] play_beats_raw  = {24'd0, SEEK_PLAY_BASE} + seek_dterm_r;
+wire [31:0] pause_beats_raw = seek_dterm_r;
 
 // RESUME spin-up: from PAUSE, scale with how long we sat paused (capped at the
 // full spin-up); from a fully-stopped state (STOP/TOC) use the full ceiling.
@@ -550,6 +562,8 @@ always @(posedge clk) begin
         door     <= 0;
         head     <= 0;
         seek_cnt <= 0;
+        comm_lba_r <= 0; head_r <= 0; seek_dist_r <= 0; seek_dterm_r <= 0;
+        play_beats_r <= 0; pause_beats_r <= 0;
         rs_type  <= 4'hF;
         rs_track <= 7'd1;
         rpt_st   <= 0;
@@ -561,6 +575,17 @@ always @(posedge clk) begin
         send_d <= cdd_send;
         wdog   <= wdog + 1'b1;
         msf_start <= 0;
+
+        // seek-latency pipeline advance (free-running; see the wire block
+        // above). Inputs are stable long before a command reads the result.
+        comm_lba_r   <= comm_lba;
+        head_r       <= head;
+        seek_dist_r  <= seek_dist;
+        seek_dterm_r <= seek_dterm;
+        play_beats_r  <= (play_beats_raw  > {24'd0, SEEK_CAP})
+                         ? SEEK_CAP : play_beats_raw[7:0];
+        pause_beats_r <= (pause_beats_raw > {24'd0, SEEK_CAP})
+                         ? SEEK_CAP : pause_beats_raw[7:0];
 
         // sectors owed to the delivery FSM. Increment and decrement are
         // combined into ONE assignment so a beat that lands on the same clock
@@ -744,7 +769,7 @@ always @(posedge clk) begin
                     if (disc_present) begin
                         seek_target <= comm_lba;
                         seek_to_play <= 1;
-                        seek_cnt <= play_beats;
+                        seek_cnt <= play_beats_r;
                         drv_status <= STAT_SEEK;
                         rs_type <= 4'hF;      // busy until an IDLE poll near done
                         n0 <= STAT_SEEK; n1 <= 4'hF; zeros;
@@ -756,7 +781,7 @@ always @(posedge clk) begin
                     if (disc_present) begin
                         seek_target <= comm_lba;
                         seek_to_play <= 0;
-                        seek_cnt <= pause_beats;
+                        seek_cnt <= pause_beats_r;
                         drv_status <= STAT_SEEK;
                         rs_type <= 4'hF;      // busy until an IDLE poll near done
                         n0 <= STAT_SEEK; n1 <= 4'hF; zeros;
