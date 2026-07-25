@@ -1677,18 +1677,47 @@ reg video_hs_reg;
 reg video_vs_reg;
 reg [23:0] video_rgb_reg;
 
-reg current_pix_clk;
-reg current_pix_clk_90;
+wire current_pix_clk;
+wire current_pix_clk_90;
 
-always @(*) begin
-    if(resolution == 2'b00) begin
-        current_pix_clk <= clk_vid_256;
-        current_pix_clk_90 <= clk_vid_256_90deg;
-    end else begin
-        current_pix_clk <= clk_vid_320;
-        current_pix_clk_90 <= clk_vid_320_90deg;
-    end
-end
+// Pixel clock: pinned, deliberately NOT multiplexed.
+//
+// This used to be a combinational mux in soft logic, selected directly by
+// `resolution` -- an unsynchronized 2-bit signal from the VDP in clk_sys:
+//
+//     always @(*) if (resolution == 2'b00) current_pix_clk = clk_vid_256;
+//                 else                     current_pix_clk = clk_vid_320;
+//
+// current_pix_clk_90 is forwarded straight out as scal_clk, the clock the
+// Pocket's scaler uses to latch our video (apf_top.v:271-277). So when the
+// two select bits failed to settle together, the comparator could chatter
+// and put a RUNT PULSE on the scaler's own clock input. The scaler loses
+// lock and holds its last frame -- the observed failure: frozen picture and
+// frozen debug overlay, while audio and input keep working because the VDP
+// and clk_sys are entirely healthy. It fires at boot because the Mega CD
+// BIOS changes resolution between the boot animation and the CD player.
+//
+// The pixel clock is therefore PINNED and never switches. Measured on
+// hardware, in this order:
+//
+//   original combinational mux  -- switches with runt pulses  -> ~1/3 boots freeze
+//   pinned to the 320 clock     -- never switches             -> stable
+//   cross-inhibited glitch-free -- clean switch, brief stop   -> glitches on reset
+//
+// The third result is the important one: a textbook glitch-free mux, whose
+// whole purpose is to make runt pulses unconstructible, still fails. Any
+// handover between two asynchronous clocks costs either a runt pulse or a
+// momentary stop, and the scaler tolerates neither. So the answer is not a
+// better mux -- scal_clk simply has to be free-running.
+//
+// Consequence: 256-wide modes are clocked at the 320 rate. The correct way
+// to reconcile that is video_skip, which the APF interface provides for
+// exactly this purpose and which is currently hardwired to 0 (see
+// `assign video_skip = 0;` below) -- run permanently at the 320 clock and
+// skip every 5th pixel for an effective 256 rate, with a clock that never
+// switches. Until that is done the pinned clock is the stable option.
+assign current_pix_clk    = clk_vid_320;
+assign current_pix_clk_90 = clk_vid_320_90deg;
 
 assign video_rgb_clock = current_pix_clk;
 assign video_rgb_clock_90 = current_pix_clk_90;
@@ -1697,7 +1726,41 @@ assign video_de = video_de_reg;
 assign video_hs = video_hs_reg;
 assign video_vs = video_vs_reg;
 assign video_rgb = video_rgb_reg;
-assign video_skip = 0;
+
+// video_skip: reconciles the pinned 320 pixel clock with 256-wide modes.
+//
+// The pixel clock no longer switches (see above), so a 256-wide mode is
+// sampled at the 320 rate -- clk_sys/8 sampling a VDP emitting one pixel
+// every clk_sys/10, i.e. 5 samples per 4 real pixels, every 5th sample a
+// duplicate of the one before it. Without this the scaler latched all 320
+// samples and the picture came out horizontally stretched.
+//
+// APF provides SKIP for exactly this case: it "may be asserted while DE is
+// high to prevent latching the pixel for that cycle". Marking the duplicates
+// delivers 256 real pixels from a clock that never switches, which is what
+// the scaler needs (see the pinned-clock note above for why any clock
+// handover is fatal).
+//
+// Alignment is taken from the VDP's own pixel enable rather than a fixed 5:4
+// pattern, because the phase of the duplicate within each group of five
+// depends on where the active region starts relative to a clk_sys/8 boundary
+// and is not statically known -- guessing it would drop real pixels and keep
+// duplicates. ce_pix toggles vdp_pix_tog once per emitted pixel, and the
+// video block samples that toggle on the SAME edge that latches
+// red/green/blue, so "toggle unchanged this cycle" is precisely "this sample
+// is a duplicate". In 320-wide modes ce_pix runs at the pixel-clock rate, so
+// nothing is ever skipped and behaviour is unchanged.
+//
+// vdp_pix_tog crosses clk_sys -> pixel clock exactly as red/green/blue
+// already do in that block; the two are integer-related outputs of one PLL
+// (clk_vid_320 = clk_sys/8), and the toggle runs at most half the sample
+// rate, so each state is sampled at least twice.
+reg vdp_pix_tog = 0;
+always @(posedge clk_sys) if (ce_pix) vdp_pix_tog <= ~vdp_pix_tog;
+
+reg vdp_pix_tog_d = 0;
+reg video_skip_reg = 0;
+assign video_skip = video_skip_reg;
 
 reg hs_prev;
 reg vs_prev;
@@ -1772,6 +1835,10 @@ synch_3 sv4(field, field_s, current_pix_clk);
 always @(posedge current_pix_clk) begin
     reg vblank_line = 0;
     video_de_reg <= 0;
+    video_skip_reg <= 0;
+    // sampled on the same edge that latches red/green/blue below, so the
+    // comparison against the previous cycle identifies duplicate samples
+    vdp_pix_tog_d <= vdp_pix_tog;
 
 	if (vs_c) begin
 		video_rgb_reg[23:3] <= 'd0;
@@ -1792,6 +1859,9 @@ always @(posedge current_pix_clk) begin
 
     if (~(vblank_line || hblank_c)) begin
         video_de_reg <= 1;
+        // no new VDP pixel since the last sample => this one repeats the
+        // previous pixel; tell the scaler not to latch it
+        video_skip_reg <= (vdp_pix_tog == vdp_pix_tog_d);
         video_rgb_reg[23:16] <= (lg_target && lightgun_enabled && show_crosshair) ? {8{lg_target[0]}} : red;
         video_rgb_reg[15:8]  <= (lg_target && lightgun_enabled && show_crosshair) ? {8{lg_target[1]}} : green;
         video_rgb_reg[7:0]   <= (lg_target && lightgun_enabled && show_crosshair) ? {8{lg_target[2]}} : blue;
