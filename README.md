@@ -18,10 +18,12 @@ Copyright (c) 2010-2013 Gregory Estrade (greg@torlus.com)
 All rights reserved
 
 # Disclaimer
-I'm a programmer, but I don't know a lick of Verilog. This was created solely through Claude with a ludicrous amount of
-debugging cycles and personal intuition. The code is most likely terrible to read, and I apologize profusely for anyone
-curious and knowledgeable enough to dig into it. The SegaCD/MegaCD was one of my favorite gaming systems growing up and
-I just wanted it on the pocket dangit. So again, sorry for whatever abomination I've brought into the world here.
+I'm a programmer, but I don't write Verilog. This was created solely through Claude with a ludicrous amount of
+debugging cycles, two decades of general software engineering experience, and personal intuition. I had the AI write a
+complete simulator for running the core and the simulated cd drive (albeit *very* slowly) on PC so that issues could be
+fully traced, diagnosed and fixed. I can't speak to the quality of the code because I don't write Verilog, but I can
+say that the end result was heavily tested and the result of a ton of my time and effort, so try to be kind even if you
+disagree with the methods that produced this.
 
 # Setup
 - Download the latest [release](https://github.com/neutralinsomniac/openfpga-megacd/releases) and extract it to the root of your Pocket's SD card
@@ -33,8 +35,6 @@ I just wanted it on the pocket dangit. So again, sorry for whatever abomination 
 - Subsequent boots: just hit start after the CHECKING DISC phase completes
 
 # Known issues
-## General
-- Occasionally the BIOS will boot to a red/black/garbled screen. If this happens, choose Reset Core from the Core Settings menu until it boots clean
 
 ## Lunar Eternal Blue
 - FMV audio isn't perfectly synced - this issue exists in the MiSTer upstream core as well
