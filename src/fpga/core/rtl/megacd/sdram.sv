@@ -85,8 +85,22 @@ localparam MODE = { 3'b000, NO_WRITE_BURST, OP_MODE, CAS_LATENCY, ACCESS_TYPE, B
 // CL=3, tRP=3, tRFC via DLY_REF.
 localparam [3:0] DLY_RP  = 4'd2;  // PRECHARGE -> ACTIVATE
 localparam [3:0] DLY_RCD = 4'd2;  // ACTIVATE -> CAS
-localparam [3:0] DLY_CL  = 4'd3;  // CAS -> data latch
 localparam [3:0] DLY_REF = 4'd8;  // AUTO_REFRESH recovery (tRFC)
+
+// CAS -> data latch. Reads now land in the IOE capture register dq_in one
+// RAM edge before the FSM consumes it (see dq_in below), so DLY_CL is one
+// higher than it used to be purely to keep the *pin* sampling edge where it
+// already was -- effective read latency at the pad is unchanged, the extra
+// count just pays for the added pipeline stage. Writes keep the old count;
+// they never look at the DQ bus on the way back.
+// DLY_CL is 5, not 4: with the interface finally constrained, STA measured
+// the read capture short by 7.515ns against a 9.312ns period -- i.e. by
+// exactly one RAM cycle. The controller had been latching DQ one edge before
+// the SDRAM reliably drives it (CL3 plus the off-chip clock round trip), on
+// every read since the open-row engine landed. Works on a fast part at room
+// temperature, corrupts otherwise.
+localparam [3:0] DLY_CL  = 4'd5;  // CAS -> data latch (read)
+localparam [3:0] DLY_WR  = 4'd3;  // CAS -> done (write), unchanged
 
 localparam [2:0] FSM_IDLE = 3'd0;
 localparam [2:0] FSM_PRE  = 3'd1;
@@ -114,6 +128,11 @@ reg  [2:0] ram_req = 0;
 reg [12:0] open_row [0:3];
 reg  [3:0] row_open = 0;
 
+// row decision for the pending grant, resolved a cycle early so it does not
+// sit in the DQ tristate-enable cone -- see grant()
+reg        row_hit  = 0;
+reg        row_busy = 0;
+
 // Strobe retiming: the request strobes come from the half-rate system
 // clock and are edge-detected here; the address/data they qualify launch
 // in the same system cycle, so grant() must never fire off the very first
@@ -140,6 +159,22 @@ reg [15:0] dout0_r, dout1_r, dout2_r;
 assign dout0 = dout0_r;
 assign dout1 = dout1_r;
 assign dout2 = dout2_r;
+
+// IOE read-capture stage. The three dout*_r latches above are *conditional*
+// (if(ram_req[n])), so none of them can pack into the single IOE input
+// register — which meant the FAST_INPUT_REGISTER ON -to dram_dq[*] in the
+// qsf had never actually taken effect, and the DQ pins reached the fabric
+// through 6.474ns of interconnect (measured: dram_dq[9] -> dout2_r[9]).
+// That, plus the -4.0ns skew inherent to clocking the SDRAM off-chip, is
+// why the read path missed the default capture edge by 13.5ns once the
+// interface was finally constrained.
+//
+// A single unconditional register can pack into the IOE, so DQ now lands
+// one edge early right at the pad and the FSM selects from it. Must stay
+// unconditional and reset-free — adding an enable or a clear pushes it back
+// into the fabric and silently undoes this.
+reg [15:0] dq_in;
+always @(posedge clk) dq_in <= SDRAM_DQ;
 
 localparam [9:0] RFS_CNT = 766;
 
@@ -183,7 +218,7 @@ begin
 	if (twe) SDRAM_DQ <= tdin;
 	SDRAM_BA <= tba;
 	SDRAM_A  <= {tdqm, 2'b00, ta[22:14]};
-	dly <= DLY_CL;
+	dly <= twe ? DLY_WR : DLY_CL;
 	fsm <= FSM_CAS;
 end
 endtask
@@ -212,9 +247,26 @@ endtask
 
 // grant only LATCHES the winning request; the first SDRAM command is
 // issued from the registered copy one cycle later (FSM_GRANT). Keeping
-// the strobe edge-detect + 3-port priority + row compare + command mux
-// out of a single cycle is what closes timing to the pin-bound IOE
-// registers at high device utilization (was -0.45ns reg->pin).
+// the strobe edge-detect + 3-port priority + command mux out of a single
+// cycle is what closes timing to the pin-bound IOE registers at high
+// device utilization (was -0.45ns reg->pin).
+//
+// The row compare now lives here too, which reverses part of that split on
+// purpose. It used to sit in FSM_GRANT, where it landed in the cone of the
+// DQ tristate enable: a 4-entry x 13-bit array read indexed by ba, plus a
+// 13-bit comparator, feeding SDRAM_DQ[*]~en. That was the single worst path
+// in the whole design (ba[0] -> SDRAM_DQ[5]~en, 9.470ns against a 9.312ns
+// period) and it gates bus turnaround -- late OE means the FPGA fights the
+// SDRAM on a read or misses the window on a write, either of which reads
+// back as garbage.
+//
+// Precomputing it into row_hit/row_busy leaves FSM_GRANT driven entirely by
+// registers, so the enable cone collapses to we & fsm & row_hit. The cost
+// is that this cycle gains the array read + comparator -- but it terminates
+// in fabric here, versus terminating at a pin there, which is the trade
+// that matters. Safe because FSM_IDLE's refresh branch and its grant
+// branches are mutually exclusive: nothing writes row_open/open_row on the
+// cycle grant() runs, nor between here and FSM_GRANT.
 task grant(input [2:0] idx, input [24:1] taddr, input [15:0] tdin, input twr, input [1:0] tmask);
 begin
 	{ba, a} <= taddr;
@@ -222,6 +274,8 @@ begin
 	we   <= twr;
 	dqm  <= twr ? ~tmask : 2'b00;
 	ram_req <= idx;
+	row_hit  <= row_open[taddr[24:23]] && (open_row[taddr[24:23]] == taddr[13:1]);
+	row_busy <= row_open[taddr[24:23]];
 	fsm <= FSM_GRANT;
 end
 endtask
@@ -299,9 +353,10 @@ always @(posedge clk) begin
 		end
 
 		FSM_GRANT:
-			if (row_open[ba] && open_row[ba] == a[13:1])
+			// register-only decision; see grant() for why it is precomputed
+			if (row_hit)
 				do_cas(ba, a[22:1], data, we, dqm);
-			else if (row_open[ba])
+			else if (row_busy)
 				do_pre(ba);
 			else
 				do_act(ba, a[22:1]);
@@ -317,9 +372,13 @@ always @(posedge clk) begin
 		FSM_CAS:
 			if (dly) dly <= dly - 1'd1;
 			else begin
-				if(ram_req[0]) dout0_r <= SDRAM_DQ;
-				if(ram_req[1]) dout1_r <= SDRAM_DQ;
-				if(ram_req[2]) dout2_r <= SDRAM_DQ;
+				// dq_in holds the pad value sampled on the previous RAM
+				// edge; DLY_CL absorbs that stage, so this lands on the
+				// same edge as ram_req clears — the "requesters sample
+				// 1-2 clocks after busy falls" contract above is unchanged.
+				if(ram_req[0]) dout0_r <= dq_in;
+				if(ram_req[1]) dout1_r <= dq_in;
+				if(ram_req[2]) dout2_r <= dq_in;
 				ram_req <= 0;
 				fsm <= FSM_IDLE;
 			end

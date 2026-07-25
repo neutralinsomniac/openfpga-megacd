@@ -154,10 +154,44 @@ wire in_pregap = !head[31] && (head[19:0] >= pgap_lo) && (head[19:0] < pgap_hi)
 // disc LBA -> file LBA for fetch/delivery
 wire [31:0] head_file = head - {12'd0, cur_delta};
 
-wire [3:0] curtrk_bcd10 = cur_track / 7'd10;
-wire [3:0] curtrk_bcd1  = cur_track % 7'd10;
-wire [3:0] last_bcd10   = (track_count==0) ? 4'd0 : track_count / 7'd10;
-wire [3:0] last_bcd1    = (track_count==0) ? 4'd1 : track_count % 7'd10;
+// Constant divide/modulo by 10, by reciprocal multiply.
+//
+// Every `/ 10` and `% 10` in this file is BCD digit-splitting of track
+// numbers and MSF timecode, but Quartus was inferring a full lpm_divide
+// block for each: 13 of them, ~275 ALMs, on a design sitting at 99% ALM
+// utilization. This is the same trick the seek math above already uses
+// (SEEK_MULT), just applied to the BCD conversions as well.
+//
+// (v * 205) >> 11 == v/10 exactly for v <= 1023: the error term is v/10240,
+// and the tightest case is v = 9 (mod 10), where the fractional part is 0.9,
+// so it stays below the next integer while v < 1024. Every caller here is
+// 7 or 8 bits (<= 255), so there is ample margin.
+//
+// Callers assign into 4-bit fields and therefore truncate exactly as the
+// original `/` and `%` did -- these functions return the full value and
+// deliberately do not change that behaviour.
+function [7:0] div10;
+    input [7:0] v;
+    reg [15:0] p;
+    begin
+        p     = v * 16'd205;
+        div10 = {3'd0, p[15:11]};
+    end
+endfunction
+
+function [7:0] mod10;
+    input [7:0] v;
+    reg [7:0] q;
+    begin
+        q     = div10(v);
+        mod10 = v - {q[4:0], 3'd0} - {q[6:0], 1'd0};   // v - q*10
+    end
+endfunction
+
+wire [3:0] curtrk_bcd10 = div10(cur_track);
+wire [3:0] curtrk_bcd1  = mod10(cur_track);
+wire [3:0] last_bcd10   = (track_count==0) ? 4'd0 : div10(track_count);
+wire [3:0] last_bcd1    = (track_count==0) ? 4'd1 : mod10(track_count);
 
 // command nibbles
 wire [3:0] c0 = cdd_comm[3:0],   c1 = cdd_comm[7:4],   c2 = cdd_comm[11:8];
@@ -270,9 +304,9 @@ always @(posedge clk) begin
         end
     end
     2'd3: begin // BCD split
-        msf_m10 <= msf_m / 10; msf_m1 <= msf_m % 10;
-        msf_s10 <= msf_s / 10; msf_s1 <= msf_s % 10;
-        msf_f10 <= msf_f / 10; msf_f1 <= msf_f % 10;
+        msf_m10 <= div10(msf_m); msf_m1 <= mod10(msf_m);
+        msf_s10 <= div10(msf_s); msf_s1 <= mod10(msf_s);
+        msf_f10 <= div10(msf_f); msf_f1 <= mod10(msf_f);
         msf_done <= 1;
         msf_st <= 2'd0;
     end
@@ -436,8 +470,8 @@ reg        dlv_advance /*verilator public_flat_rd*/ = 0;
 wire [7:0] pre_v   = head[7:0] + 8'd150;
 wire       pre_s   = (pre_v >= 8'd75);
 wire [6:0] pre_f   = pre_s ? (pre_v - 8'd75) : pre_v[6:0];
-wire [3:0] pre_f10 = pre_f / 7'd10;
-wire [3:0] pre_f1  = pre_f % 7'd10;
+wire [3:0] pre_f10 = div10(pre_f);
+wire [3:0] pre_f1  = mod10(pre_f);
 reg [15:0] dlv_synth;
 always @* begin
     case (dlv_w)
@@ -535,6 +569,13 @@ always @(posedge clk) begin
         // reset during boot, and resetting the drive to STOP left it stuck
         // (STOP+disc has no path to TOC) -> CHECKING DISC forever. TOC is the
         // "disc ready" state the BIOS idle screen polls for.
+        //
+        // Do NOT replace this with a timed transition (e.g. NO_DISC -> OPEN
+        // -> TOC) to give the BIOS an edge to observe: that was tried and is
+        // strictly worse. The BIOS pulses this reset repeatedly, so a ~0.5s
+        // dance never completes -- the drive just oscillates NO_DISC(B) <->
+        // OPEN(5) forever and never reaches disc-ready. Landing directly in
+        // TOC is what makes the state survive the pulsing.
         drv_status <= disc_present ? STAT_TOC : STAT_STOP;
         n0 <= disc_present ? STAT_TOC : STAT_STOP; n1 <= 0;
         n2 <= 0; n3 <= 0; n4 <= 0; n5 <= 0; n6 <= 0; n7 <= 0; n8 <= 0;
@@ -592,7 +633,8 @@ always @(posedge clk) begin
             // disc inserted mid-session (drive was NO_DISC): emulate a real
             // insertion — tray OPEN ~0.5s then closed-with-media, landing in
             // TOC(9). (Present-at-boot and post-MCD-reset are handled by the
-            // reset block bringing the drive up disc-ready, see below.)
+            // reset block bringing the drive up disc-ready, see above -- this
+            // path is too slow to survive the BIOS's reset pulsing.)
             if (drv_status == STAT_NO_DISC && disc_present && !door) begin
                 drv_status <= STAT_OPEN;
                 ins_cnt <= 6'd38;
@@ -680,7 +722,7 @@ always @(posedge clk) begin
             n2 <= msf_m10; n3 <= msf_m1;
             n4 <= msf_s10; n5 <= msf_s1;
             n6 <= msf_f10 | (rpt_trk_audio ? 4'h0 : 4'h8); n7 <= msf_f1;
-            n8 <= rs_track % 7'd10;   // track number (BCD units)
+            n8 <= mod10(rs_track);   // track number (BCD units)
             rpt_st <= 3'd4;
         end
         3'd4: begin frame_go <= 1; rpt_st <= 3'd0; end

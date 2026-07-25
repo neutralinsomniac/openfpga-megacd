@@ -733,7 +733,20 @@ wire [7:0] pbuf_byte = (cp_p[1:0]==2'd0) ? pbuf_q[31:24] :
 // parsed MSF as raw sectors. Cue INDEX times are FILE-relative: 00:00:00
 // is file offset 0 = LBA 0 (the 150-sector lead-in pregap is NOT included
 // in cue times — only REPORTS add it, as +150 when forming disc MSF).
-wire [31:0] cp_raw = ({25'd0,cp_mm}*32'd60 + {25'd0,cp_ss})*32'd75
+// Flattened from ((mm*60 + ss)*75 + ff) to (mm*4500 + ss*75 + ff). These are
+// algebraically identical (60*75 = 4500), but the original chained
+// multiply -> add -> multiply -> add into a single combinational path: 12.8ns
+// of logic in a 13.468ns clk_74a period, i.e. under 1ns of margin. It sat on
+// whichever side of zero the placer happened to land, and blocked a build at
+// -0.154ns. This form computes the two constant multiplies INDEPENDENTLY and
+// sums once, roughly halving the depth. Both constants are cheap shift-adds
+// (4500 = 4096+256+128+16+4, 75 = 64+8+2+1).
+//
+// Bit-exact: cp_mm/cp_ss/cp_ff are all 7-bit, so the widest term is
+// 127*4500 = 571500 and the total cannot exceed 581152 -- no truncation or
+// overflow in 32 bits, and no change to the parser state machine or latency.
+wire [31:0] cp_raw = {25'd0,cp_mm}*32'd4500
+                     + {25'd0,cp_ss}*32'd75
                      + {25'd0,cp_ff};
 wire [7:0] cp_pgap8 = (cp_pend_pgap > 12'd255) ? 8'd255 : cp_pend_pgap[7:0];
 // in-file gap before INDEX 01 (INDEX 00 region), clamped to 10 bits
@@ -1304,6 +1317,15 @@ always @(posedge clk_74a)
 // System
 reg [11:0] reset_counter 		 = 0;
 reg [15:0] reset_delay			 = 0;
+// Registered zero-detect for reset_delay. reset_delay lives in clk_74a but
+// gates the reset release of gen/MCD/CART, all of which run on clk_sys -- a
+// different, asynchronous domain. Letting the raw 16-bit compare cross meant
+// (a) the combinational zero-detect could glitch mid-decrement, when many
+// bits flip at once (0x0100 -> 0x00FF), and (b) with no synchronizer, the
+// destination flops could latch the release on different clk_sys edges, so
+// parts of the design left reset a cycle before others. Reduce it to one
+// registered bit here, then synchronize it once (reset_delay_done below).
+reg        reset_delay_zero	 = 1;
 reg [1:0] cs_cpu_turbo			 = 0;
 reg cs_multitap_enable			 = 0;
 reg cs_menu_pause_enable		 = 0;
@@ -1332,6 +1354,7 @@ always @(posedge clk_74a) begin
     reset_counter = reset_counter + 1;
     if (~osnotify_inmenu && reset_delay > 0) begin
       reset_delay <= reset_delay - 1;
+      if (reset_delay == 1) reset_delay_zero <= 1;
     end
 
 	if (bridge_wr) begin
@@ -1350,7 +1373,10 @@ always @(posedge clk_74a) begin
         32'h00000050: cs_psg_enable 			<= bridge_wr_data[0];
         32'h00000060: cs_hifi_pcm_enable 		<= bridge_wr_data[0];
         32'h00000070: begin
-            if (bridge_wr_data[31:0] > 0) reset_delay <= {reset_counter, 4'b1111};
+            if (bridge_wr_data[31:0] > 0) begin
+              reset_delay <= {reset_counter, 4'b1111};
+              reset_delay_zero <= 0;   // assert immediately; this branch wins over the decrement above
+            end
           end
 		32'h00000080: cs_m30_map_enable         <= bridge_wr_data[0];
 		32'h00000090: cs_menu_pause_enable      <= bridge_wr_data[0];
@@ -2632,7 +2658,26 @@ synch_3 pause_s (
 	clk_sys
 );
 
-wire reset = ~reset_n | cart_download | region_set;
+// Both of these cross clk_74a -> clk_sys and were previously consumed raw.
+// reset_n comes straight from the APF host; reset_delay_zero is the
+// registered zero-detect built above. Synchronizing them makes the reset
+// release atomic across the emulated system -- every clk_sys flop now sees
+// the same edge, instead of the release rippling out unsynchronized over a
+// high-fanout net on a 99%-full die.
+//
+// This matters because the reset duration is deliberately randomized at
+// megacd_top.sv:1353 ({reset_counter, 4'b1111}, reset_counter free-running),
+// so the phase between release and clk_sys was a fresh dice roll on every
+// boot -- which is why "Reset Core until it boots clean" worked at all.
+wire reset_n_sync;
+synch_3 reset_n_s (reset_n, reset_n_sync, clk_sys);
+
+wire reset_delay_done;
+synch_3 reset_delay_done_s (reset_delay_zero, reset_delay_done, clk_sys);
+
+// cart_download is already synchronized (synch_3 cart_download_s) and
+// region_set is generated in clk_sys, so both are safe to use directly.
+wire reset = ~reset_n_sync | cart_download | region_set;
 
 wire bios_download = cart_download;
 
@@ -2653,7 +2698,7 @@ wire        GEN_CE;
 
 gen gen
 (
-	.RESET_N(~reset && !reset_delay),
+	.RESET_N(~reset && reset_delay_done),
 	.MCLK(clk_sys),
 
 	.VA(GEN_VA),
@@ -2793,7 +2838,7 @@ wire        MCD_RST_N;
 MCD MCD
 (
 	// keep gen/MCD/CART reset release aligned: reset_delay applied to all
-	.RST_N(~(reset | bios_download) && !reset_delay),
+	.RST_N(~(reset | bios_download) && reset_delay_done),
 	.CLK(clk_sys),
 	.ENABLE(1'b1),
 	.MCD_RST_N(MCD_RST_N),
@@ -3238,7 +3283,7 @@ wire        CART_ROM_CE_N, CART_RAM_CE_N;
 
 CART CART
 (
-	.RST_N(~(reset | bios_download) && !reset_delay),
+	.RST_N(~(reset | bios_download) && reset_delay_done),
 	.CLK(clk_sys),
 	.ENABLE(1'b1),
 
