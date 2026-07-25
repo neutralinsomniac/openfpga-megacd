@@ -34,6 +34,11 @@ disagree with the methods that produced this.
 - For first boot only: hit B after the CHECKING DISC/PRESS START shows to get into the BIOS menu. Choose Memory and format your SRAM. Then you can choose "CDROM" to boot
 - Subsequent boots: just hit start after the CHECKING DISC phase completes
 
+# SRAM Limitation Workaround
+Until I implement support for the CD Backup RAM Cart, you can create "banks" of saves by copying your BIOS file to a new
+filename. The Analogue Pocket treats the BIOS's filename as your save destination in the Saves folder, so you could say,
+copy your bios .bin to something like `shining_force.bin` and dedicate the entirety of SRAM to that one game.
+
 # Known issues
 
 ## Lunar Eternal Blue
