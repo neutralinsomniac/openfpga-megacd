@@ -576,8 +576,38 @@ always @(posedge clk) begin
         // dance never completes -- the drive just oscillates NO_DISC(B) <->
         // OPEN(5) forever and never reaches disc-ready. Landing directly in
         // TOC is what makes the state survive the pulsing.
-        drv_status <= disc_present ? STAT_TOC : STAT_STOP;
-        n0 <= disc_present ? STAT_TOC : STAT_STOP; n1 <= 0;
+        // Always come up STOP(0), even with a disc present.
+        //
+        // dc3e80be made this report TOC(9) when a disc was present, to fix a
+        // CHECKING DISC hang, on the premise that "STOP+disc has no path to
+        // TOC". That premise is wrong -- the REQUEST handler below promotes
+        // STOP to TOC on the first report request (megacdd.cpp semantics) --
+        // and reporting 9 here is what hung the BIOS whenever a disc was
+        // already mounted at reset.
+        //
+        // Co-sim located it exactly. The sub-BIOS dispatches on the drive
+        // status nibble through a jump table:
+        //     0F60  MOVE.B $5844(A5),D0     ; drive status
+        //     0F68  ANDI.W #$000F,D0
+        //     0F6C  ADD.W D0,D0 (x2)        ; *4
+        //     0F70  JMP $02(PC,D0.W)
+        //     0F74  BRA $0FDC               ; index 0 = STOP  -> boots
+        //     ...
+        //     0F98  BRA $1048               ; index 9 = TOC   -> never completes
+        // Coming up 9 selects the $1048 handler, which at boot never reaches
+        // the code that writes CFS; the main CPU then waits on $A1200E
+        // forever and pulses the MCD reset in a loop. Coming up 0 selects
+        // $0FDC, the same path a discless boot takes, and the drive then
+        // reaches TOC by itself: verified in co-sim going 0 -> 9 -> 2 -> 4
+        // -> 1 (STOP, TOC, SEEK, PAUSE, PLAY) with the sub-CPU writing CFS
+        // normally.
+        //
+        // Do NOT "fix" this by reporting a timed NO_DISC -> OPEN -> TOC
+        // transition instead: that was tried and is strictly worse, because
+        // the BIOS pulses the MCD reset repeatedly and the ~0.5s tray dance
+        // never survives to completion.
+        drv_status <= STAT_STOP;
+        n0 <= STAT_STOP; n1 <= 0;
         n2 <= 0; n3 <= 0; n4 <= 0; n5 <= 0; n6 <= 0; n7 <= 0; n8 <= 0;
         cdd_stat <= {4'hF, 36'h0};
         cdd_dm   <= 0;
