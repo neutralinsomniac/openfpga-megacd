@@ -1819,7 +1819,9 @@ wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
                          (dbg_y < 10'd150) ? dbg_cdcnt :
                          // audio diagnostics: CCSSBBLD = cmd_cnt, seek_cnt,
                          // backSEEK_cnt (the CDDA-replay counter), last c0, status
-                                             cdd_dbg_cmds;
+                         (dbg_y < 10'd162) ? cdd_dbg_cmds :
+                         // main/sub comm handshake: CFM CFS <cfm changes> <cfs changes>
+                                             dbg_commrow;
 wire [3:0] dbg_dv = dbg_hexrow[((3'd7 - dbg_x[6:4])*4) +: 4];
 reg [23:0] dbg_glyph;
 always @* case (dbg_dv)
@@ -1936,7 +1938,7 @@ always @(posedge current_pix_clk) begin
                                        (dbg_ack4_rate != 0)     ? 24'hFFFF00 : 24'hFF0000;
                 default: ;
             endcase
-        end else if (dbg_y >= 10'd30 && dbg_y < 10'd162) begin
+        end else if (dbg_y >= 10'd30 && dbg_y < 10'd174) begin
             // numeric readout rows: stats / [frames-with-blit, M68K addr] / [frames-with-GFX-op, S68K addr]
             if (dbg_x[9:4] < 6'd8) begin
                 if (~dbg_x[3])
@@ -2919,11 +2921,21 @@ MCD MCD
 	.DBG_INT_PEND(dbg_int_pend),
 	.DBG_INT_ACK(dbg_int_ack),
 	.DBG_GRON(dbg_gron)
+// The co-sim uses a pre-converted mcd.v that predates this port; in sim the
+// same values are read straight out of asic's cfm/cfs (see sim/full/tb_full).
+`ifndef VERILATOR
+	,.DBG_COMM(dbg_comm)
+`endif
 );
 
 wire [2:0] dbg_s68k_ipl_n;
 wire [6:1] dbg_int_pend, dbg_int_ack;
 wire dbg_gron;
+`ifdef VERILATOR
+wire [15:0] dbg_comm = 16'd0;
+`else
+wire [15:0] dbg_comm;   // {CFM, CFS} as read at $A1200E
+`endif
 
 ///////////////////////////////////////////////
 // Bring-up debug indicators (top-left corner)
@@ -3225,6 +3237,22 @@ wire CD_CDC_CDDA_WR;
 
 // CD fetch-path counters for the hardware overlay (debug only, loose CDC)
 wire [31:0] cdd_dbg_state;
+
+// main/sub comm-flag tap. CFM is written by the MAIN CPU, CFS by the SUB,
+// and both are read back together at $A1200E -- the register the main CPU
+// sits polling when a reset-with-disc-mounted hangs the BIOS. The raw values
+// alone cannot distinguish "frozen" from "settled on a value", so count the
+// changes on each side too: if the CFM counter climbs while the CFS counter
+// stands still, the main CPU is asking and the sub is not answering.
+reg  [7:0] dbg_cfm_chg = 0, dbg_cfs_chg = 0;
+reg [15:0] dbg_comm_d = 0;
+always @(posedge clk_sys) begin
+    dbg_comm_d <= dbg_comm;
+    if (dbg_comm[15:8] != dbg_comm_d[15:8]) dbg_cfm_chg <= dbg_cfm_chg + 1'b1;
+    if (dbg_comm[7:0]  != dbg_comm_d[7:0])  dbg_cfs_chg <= dbg_cfs_chg + 1'b1;
+end
+// CFM CFS <cfm changes> <cfs changes>
+wire [31:0] dbg_commrow = {dbg_comm, dbg_cfm_chg, dbg_cfs_chg};
 
 // CD-path debug counters for the overlay (clk_74a): every host round-trip
 // and error, plus a snapshot of the fetch/reopen/mount state machines

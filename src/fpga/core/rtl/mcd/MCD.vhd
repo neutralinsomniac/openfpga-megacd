@@ -86,7 +86,9 @@ entity MCD is
 		DBG_S68K_IPL_N	: out std_logic_vector(2 downto 0);
 		DBG_INT_PEND	: out std_logic_vector(6 downto 1);
 		DBG_INT_ACK		: out std_logic_vector(6 downto 1);
-		DBG_GRON			: out std_logic
+		DBG_GRON			: out std_logic;
+		-- main/sub comm flags (CFM & CFS) for the debug overlay
+		DBG_COMM			: out std_logic_vector(15 downto 0)
 	);
 end MCD;
 
@@ -317,6 +319,7 @@ begin
 		DBG_INT_PEND	=> DBG_INT_PEND,
 		DBG_INT_ACK		=> DBG_INT_ACK,
 		DBG_GRON			=> DBG_GRON,
+		DBG_COMM			=> DBG_COMM,
 		
 		LED_RED   		=> LED_RED,
 		LED_GREEN   	=> LED_GREEN

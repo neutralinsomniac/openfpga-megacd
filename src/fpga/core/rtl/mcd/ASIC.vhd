@@ -106,6 +106,11 @@ entity ASIC is
 		DBG_INT_PEND	: out std_logic_vector(6 downto 1);
 		DBG_INT_ACK		: out std_logic_vector(6 downto 1);
 		DBG_GRON			: out std_logic;
+		-- main/sub communication flags, as read back at $A1200E: CFM is
+		-- written by the MAIN CPU, CFS by the SUB. Exposed so the overlay can
+		-- show whether the handshake is live -- the reset-with-disc hang
+		-- parks the main CPU polling exactly this register.
+		DBG_COMM			: out std_logic_vector(15 downto 0);
 		
 		LED_RED			: out std_logic;
 		LED_GREEN		: out std_logic
@@ -565,6 +570,14 @@ begin
 								MAIN_RST_EXEC <= not EXT_VDI(0);
 							end if;
 							if EXT_UDS_N = '0' then
+								-- NB: gating the LATCH on IEN(2) drops a MAIN->SUB
+								-- INT2 request outright if the sub has not yet
+								-- enabled level 2 (masking would normally belong at
+								-- delivery, which the IPL encoder below already
+								-- does). Co-sim confirms requests DO arrive while
+								-- IEN(2)=0, so this does discard them -- but removing
+								-- the gate was tried and does NOT fix the
+								-- reset-with-disc hang, so it is left as upstream.
 								if EXT_VDI(8) = '1' and IEN(2) = '1' then
 									INT_PEND(2) <= '1';
 									IFL2 <= '1';
@@ -2629,6 +2642,7 @@ begin
 	DBG_INT_PEND <= INT_PEND;
 	DBG_INT_ACK <= INT_ACK;
 	DBG_GRON <= GRON;
+	DBG_COMM <= CFM & CFS;
 	S68K_DTACK_N <= S68K_REG_DTACK_N and S68K_PRGRAM_DTACK_N and S68K_WORDRAM_DTACK_N and S68K_PCM_DTACK_N and S68K_BRAM_DTACK_N;
 	S68K_DO <= S68K_REG_DO when S68K_REG_DTACK_N = '0' else
 				  S68K_PRGRAM_DO when S68K_PRGRAM_DTACK_N = '0' else
