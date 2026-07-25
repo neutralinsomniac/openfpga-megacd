@@ -3,6 +3,14 @@
 
 # Quartus artifacts if a flow is ever run from the repo root
 # (the normal build runs in src/fpga, which has its own .gitignore)
+#
+# The project files matter as much as the artifacts: a stray ap_core.qpf /
+# megacd.qsf here makes `quartus_* ap_core -c megacd` from the repo root open
+# a second, fit-less copy of the project and report "Fitter failed or was not
+# run" against a build that actually succeeded in src/fpga. Easy to misread as
+# a corrupt database.
+/*.qpf
+/*.qsf
 /db/
 /incremental_db/
 /greybox_tmp/
