@@ -417,6 +417,77 @@ int main(int argc,char**argv){
         uint32_t mpc = dut->rootp->core_top__DOT__dbg_m68k_a & 0xFFFFFF;
         uint32_t spc = dut->rootp->core_top__DOT__dbg_s68k_a & 0xFFFFFF;
         auto* r = dut->rootp;
+
+        // PCTRACE=<file>: dump the sub-CPU's distinct-PC sequence once it is
+        // out of reset. Diffing this between the disc and no-disc runs finds
+        // the exact instruction where the two boots diverge -- every
+        // individual signal checked so far reads the SAME in both cases, so
+        // the divergence has to be located rather than guessed at.
+        { static FILE* pf=NULL; static bool pi=false; static uint32_t pl=0xFFFFFFFF;
+          static long n=0;
+          if(!pi){ pi=true; const char* e=getenv("PCTRACE"); if(e) pf=fopen(e,"w"); }
+          if(pf && spc!=pl && n<4000000){
+              if(spc) { fprintf(pf, "%06X\n", spc); n++; }
+              pl=spc;
+              if(n==4000000){ fclose(pf); pf=NULL; }
+          } }
+
+        // CKTRACE=1: the sub-CPU checksum-verify loop.
+        //   02E0: ADD.W (A0)+,D0 / DBF D2 / DBF D1     <- sums a region
+        //   02EA: MOVE.W $8E(A1),D1 ; CMP.W D1,D0 ; BNE $0206  <- verify
+        // The sub cycles between this and the $05E8 INT2 wait and never
+        // reaches the code that writes CFS. Log the distinct sub addresses
+        // seen while the loop is live: the ascending run IS the region being
+        // checksummed, which says whether the disc data arrived at all.
+        { static bool cki=false, ck=false; static int armed=0; static long n=0;
+          static uint32_t lo=0xFFFFFFFF, hi=0, prev=0xFFFFFFFF; static long nrun=0;
+          if(!cki){ cki=true; const char* e=getenv("CKTRACE"); ck = e && *e=='1'; }
+          if(ck){
+              if(spc>=0x02DE && spc<=0x02E8){ if(!armed){ lo=0xFFFFFFFF; hi=0; nrun=0; } armed=1; }
+              if(armed && spc!=prev){
+                  if(spc<0x02D0 || spc>0x0300){                 // a data access
+                      if(spc<lo) lo=spc;
+                      if(spc>hi) hi=spc;
+                      nrun++;
+                      if(n<40){ printf("CK data addr %06X\n", spc); fflush(stdout); }
+                      n++;
+                  }
+                  prev=spc;
+              }
+              // capture A1: at 02EA the sub does MOVE.W $8E(A1),D1, so the
+              // next data access after that fetch is at A1+$8E. Comparing
+              // this between the disc and no-disc runs says whether the two
+              // are consulting the same structure for the expected checksum.
+              { static int want=0; static uint32_t pv2=0; static long shown=0;
+                if(spc!=pv2){
+                    if(spc==0x02EA) want=1;
+                    else if(want && (spc<0x0200 || spc>0x0320)){
+                        if(shown<8){ printf("CK expected-value read at %06X  (A1=%06X)\n",
+                                            spc, spc-0x8E); fflush(stdout); shown++; }
+                        want=0;
+                    }
+                    pv2=spc;
+                } }
+              // which branch does the verify take?
+              { static long n2F0=0,n2F6=0,n0206=0; static uint32_t pv=0;
+                if(spc!=pv){
+                    if(spc==0x02F0) n2F0++;          // CMP executed (expected!=0)
+                    if(spc==0x02F6) n2F6++;          // check skipped or passed
+                    if(spc==0x0206){ n0206++;        // MISMATCH -> error path
+                        printf("CK MISMATCH #%ld: region %06X..%06X (%ld words)\n",
+                               n0206, lo, hi, nrun); fflush(stdout); }
+                    pv=spc;
+                    if(((n2F0+n2F6+n0206)%20)==0 && (n2F0+n2F6+n0206))
+                        printf("CK path: cmp-executed=%ld fallthrough=%ld ERROR-PATH=%ld\n",
+                               n2F0,n2F6,n0206), fflush(stdout);
+                } }
+              if(spc>=0x02EA && spc<=0x02F4 && armed){          // reached the compare
+                  printf("CK compare reached: summed-region seen %06X..%06X (%ld accesses)\n",
+                         lo, hi, nrun); fflush(stdout);
+                  armed=0;
+              }
+          } }
+
         // ring buffer of last distinct main address-bus values (execution trail)
         static uint32_t trail[32]; static int ti=0; static uint32_t tlast=0xFFFFFFFF;
         if(mpc!=tlast){ trail[ti&31]=mpc; ti++; tlast=mpc;
