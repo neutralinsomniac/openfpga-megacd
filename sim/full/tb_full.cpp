@@ -127,6 +127,51 @@ int main(int argc,char**argv){
                            (int)((lo>>20)&0xFFFFF),(int)(lo&0xFFFFF));
                 }
             }
+            // toc_final edge: the drive may only report "disc ready" (9) once
+            // this is high, so it must not rise until the refine layout pass
+            // has retired and mount_eff_size holds the true leadout.
+            { static int tf_prev=-1;
+              int tf = dut->rootp->core_top__DOT__toc_final_sys;
+              if(tf!=tf_prev){
+                  printf("TOCFINAL [%ld] toc_final=%d mount_eff_size=%u (%u sectors)\n",
+                         c, tf, dut->rootp->core_top__DOT__mount_eff_size,
+                         dut->rootp->core_top__DOT__mount_eff_size/2352);
+                  tf_prev=tf;
+              } }
+            // the size the DRIVE sees: must stay 0 (= no disc, drive drains to
+            // NO_DISC and the BIOS idles untimed) until the TOC is final
+            { static uint32_t is_prev=0xFFFFFFFFu;
+              uint32_t is = dut->rootp->core_top__DOT__cd_img_size_sys;
+              if(is!=is_prev){
+                  printf("DISCSIZE [%ld] drive img_size=%u (%u sectors) present=%d\n",
+                         c, is, is/2352, is>=2352);
+                  is_prev=is;
+              } }
+            // ---- APF data-slot table model ----
+            // The real table is {id, size} word PAIRS; datatable word W lives
+            // at bridge addr 0xF8002000 + W*4. Row order is firmware-defined,
+            // so DT_ORDER models both: "json" (default) = our data.json
+            // declaration order 0,10,1,2 -- the layout the old fixed-index
+            // reads assumed; "id" = sorted by slot id 0,1,2,10, which moves CD
+            // Data's size from word 7 to word 5 and breaks those reads.
+            // Previously this tb only ever wrote SIZE words at fixed indices
+            // and never wrote an id at all, so it could not exercise a lookup.
+            static bool dt_by_id = [](){ const char* e=getenv("DT_ORDER");
+                                         return e && !strcmp(e,"id"); }();
+            auto write_dtable = [&](uint32_t cue_sz, uint32_t bin_sz){
+                const uint32_t ids_json[4] = {0, 10, 1, 2};
+                const uint32_t ids_byid[4] = {0, 1, 2, 10};
+                const uint32_t* ids = dt_by_id ? ids_byid : ids_json;
+                for(int i=0;i<4;i++){
+                    uint32_t id = ids[i], sz;
+                    switch(id){ case 0:  sz = 0x20000; break;   // BIOS
+                                case 10: sz = 8192;    break;   // Save
+                                case 1:  sz = cue_sz;  break;   // CD Image
+                                default: sz = bin_sz;  break; } // CD Data
+                    q.push_back({0xF8002000u + (uint32_t)(i*2)  *4u, id});
+                    q.push_back({0xF8002000u + (uint32_t)(i*2+1)*4u, sz});
+                }
+            };
             // MOUNT_AT=<cycle>: delay the mount to model a user browsing
             // the menu mid-session (the default mounts at boot)
             static long mount_at = 5001;
@@ -135,7 +180,7 @@ int main(int argc,char**argv){
             if(did_reset_exit && c>5000){
                 if(f1 && !table_written && c>mount_at){ table_written=true;
                     printf("[%ld] mounting CD (008A)\n", c);
-                    q.push_back({0xF8002014u, size1});   // datatable: slot idx 2 size
+                    write_dtable(size1, 0);             // CD Image sized; no bin open yet
                     // deferload mount notification (host cmd 0x008A):
                     // params first, then the command word
                     q.push_back({0xF8000020u, 1u});      // slot id
@@ -221,7 +266,9 @@ int main(int argc,char**argv){
                         // order differs from our guess (the real-hardware
                         // failure mode) — only the 008A path carries the size
                         static bool no_dtable = getenv("NO_DTABLE")!=nullptr;
-                        if(f2 && !no_dtable) q.push_back({0xF800201Cu,size2}); // datatable idx 3 size
+                        // firmware refreshes the table after the openfile:
+                        // the CD Data row (id 2) now carries this bin's size
+                        if(f2 && !no_dtable) write_dtable(size1, size2);
                         q.push_back({0xF8001000u,(uint32_t)(f2?0x6F6B0000u:0x6F6B0003u)});
                         // user-reloadable slot: firmware follows the openfile
                         // with a 008A "slot updated" notification carrying the

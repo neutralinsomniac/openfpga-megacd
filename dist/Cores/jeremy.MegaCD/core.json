@@ -7,8 +7,8 @@
             "description": "Sega CD / Mega CD, the CD-ROM add-on for the Sega Genesis / Mega Drive. Adds a second 68000, CD-ROM drive, scaling/rotation ASIC and PCM audio.",
             "author": "jeremy",
             "url": "https://github.com/jeremy/openFPGA-Genesis",
-            "version": "0.0.1",
-            "date_release": "2026-07-19"
+            "version": "0.0.3",
+            "date_release": "2026-07-25"
         },
         "framework": {
             "target_product": "Analogue Pocket",

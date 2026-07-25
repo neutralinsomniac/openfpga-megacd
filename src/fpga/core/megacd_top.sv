@@ -592,8 +592,13 @@ always @(posedge clk_74a) pbuf_q <= parse_buf[pbuf_addr];
 // stream sectors from there.
 ///////////////////////////////////////////////
 reg        mount_ready /*verilator public_flat_rd*/ = 0;
+// 1 from the moment a .cue/.bin is picked until its TOC is final. Drives the
+// CDD's tray-open-while-loading state, so the BIOS shows a drive busy with a
+// disc for the whole load instead of NO DISC. Starts 0, so a boot with nothing
+// mounted never shows a tray.
+reg        mount_loading /* verilator public_flat_rd */ = 0;
 reg        mount_use_slot2 = 0;
-reg [31:0] mount_eff_size = 0;
+reg [31:0] mount_eff_size /* verilator public_flat_rd */ = 0;
 reg [31:0] mounted_size = 0;
 reg [6:0]  toc_track_count = 0;
 
@@ -647,9 +652,20 @@ reg [5:0]  pb_next = 0;        // next file index to background-probe
 // a probe after the drive fetch path has been idle a while (pb_idle), and
 // ABORTS instantly (pb_yield) if a real fetch needs a different file — the
 // drive then reopens within one openfile instead of stalling a full probe.
-reg [21:0] pb_idle = 0;        // clk_74a cycles since the last drive fetch
+//
+// The idle gate used to be bit 21 (~28ms). That is longer than the natural
+// gaps in the drive's fetch pattern -- the bank fills, the head stops, and
+// the next request lands well inside 28ms -- so on a multi-bin cue the
+// refine could be deferred indefinitely while the disc was ALREADY
+// advertised present carrying the preliminary (fallback) TOC. A BIOS that
+// caches track starts in that window then plays every track from a stale
+// LBA. Bit 14 (~220us @74MHz) still clears a burst but fits the real gaps.
+// Starvation safety does not rest on this number: pb_yield aborts a probe
+// the moment a fetch wants another file, and the search is now resumable
+// (pr_valid), so a yielded probe resumes instead of restarting from zero.
+reg [14:0] pb_idle = 0;        // clk_74a cycles since the last drive fetch
 wire       pb_yield = pb_active && reopen_req && (reopen_file != opened_file);
-wire       pb_ready = pb_idle[21];   // drive idle long enough to slip a probe in
+wire       pb_ready = pb_idle[14];   // drive idle long enough to slip a probe in
 always @(posedge clk_74a) begin
     files_nm_q   <= files_nm[files_addr];
     files_secs_q <= files_secs[files_addr];
@@ -720,6 +736,13 @@ reg        of_size_new = 0;
 // code on real firmware — the one size signal every firmware provides)
 reg [20:0] pr_n, pr_lo, pr_hi;   // sector-count probe cursor / bounds
 reg        pr_ok;
+// a yielded probe keeps its bounds: pr_valid marks [pr_lo,pr_hi) as a live
+// search for pr_file, so re-entering M_FSIZE for that same file resumes
+// instead of paying the 2ms size-notification grace and reseeding [0,2^20)
+// from scratch. Without this a drive fetch arriving mid-probe costs all the
+// round-trips already spent, and a busy drive can starve the refine forever.
+reg [4:0]  pr_file;
+reg        pr_valid = 0;
 reg        mnt_rd_err = 0;       // result of the last mount-channel read
 reg [6:0]  lay_t;
 reg [2:0]  lay_ph;
@@ -759,13 +782,17 @@ always @(posedge clk_74a) begin
     target_dataslot_openfile <= 0;
     fbuf_wr <= 0;
     toc_wr_en <= 0;
+    // the load is over once the TOC is final. Cleared HERE, at the top, so the
+    // set in the mount-start branch below wins if a new image is picked in the
+    // same cycle (the previous disc still reads toc_final at that moment).
+    if (toc_final_74) mount_loading <= 0;
 
     // drive-idle timer for background probing: cleared on every drive fetch
-    // request, saturates at bit 21 (~28ms @74MHz). pb_idle[21] means the
-    // drive has read nothing for well over one sector period, so slipping a
-    // probe in won't collide with an active read burst (CHECKING DISC/boot).
+    // request, saturates at bit 14 (~220us @74MHz). pb_idle[14] means the
+    // drive has read nothing for a while, so slipping a probe in is unlikely
+    // to collide with an active read burst (CHECKING DISC/boot).
     if (cdreq_s[1]) pb_idle <= 0;
-    else if (!pb_idle[21]) pb_idle <= pb_idle + 1'b1;
+    else if (!pb_idle[14]) pb_idle <= pb_idle + 1'b1;
 
     // slot-2 openfile size: user-reloadable slots (data.json parameters
     // bit 0) get a 008A "slot updated" notification carrying the new size
@@ -790,6 +817,7 @@ always @(posedge clk_74a) begin
             && dataslot_update_size != 32'd0) begin
             mounted_size <= dataslot_update_size;
             mount_ready <= 0;
+            mount_loading <= 1;      // tray opens now; closes when the TOC lands
             mount_use_slot2 <= 0;
             toc_track_count <= 0;
             mnt_offset <= 0;
@@ -802,6 +830,7 @@ always @(posedge clk_74a) begin
             mnt_term <= 4'h1;
             mnt_reopen <= 0;
             pb_active <= 0;          // cancel any prior background probe
+            pr_valid <= 0;           // and any partial probe bounds with it
             lay_prelim <= 0;
             fsecs_valid <= 0;        // all file sizes unknown until probed
             mnt_st <= M_SNIFF;
@@ -1108,7 +1137,11 @@ always @(posedge clk_74a) begin
             mnt_st <= M_FAIL;
         end
     end
-    M_FSIZE: if (pb_yield) mnt_st <= M_IDLE; else begin
+    M_FSIZE: if (pb_yield) mnt_st <= M_IDLE;
+    // resume a probe this file already started (see pr_valid): its bounds
+    // are still live, so skip the grace + reseed and issue the next read
+    else if (pr_valid && pr_file == mnt_file) mnt_st <= M_PROBE_GO;
+    else begin
         // learn the opened file's size. Primary: the 008A notification
         // captured above (of_size_new) — real firmware sends it for
         // user-reloadable slots and it carries the size directly.
@@ -1143,6 +1176,8 @@ always @(posedge clk_74a) begin
             pr_lo <= 21'd0;              // known-good floor (>=0 sectors; never tested)
             pr_hi <= 21'h100000;         // known-bad ceiling: no CD reaches 2^20 sectors
             pr_n  <= 21'h080000;         // first probe = midpoint of [0, 2^20]
+            pr_file <= mnt_file;         // bounds now belong to this file...
+            pr_valid <= 1;               // ...and survive a pb_yield abort
             mnt_st <= M_PROBE_GO;
         end
     end
@@ -1192,6 +1227,7 @@ always @(posedge clk_74a) begin
         if (fdiv_bit == 0) begin
             files_secs[mnt_file] <= fdiv_q;
             fsecs_valid[mnt_file] <= 1'b1;
+            pr_valid <= 0;             // this file is sized; bounds retired
             if (!mount_ready) begin
                 // PHASE 1: file 0 (track 1 / the data track boot reads) is
                 // now sized. Lay out a preliminary TOC — file 0 exact, the
@@ -1410,11 +1446,33 @@ reg [ 2:0] datatable_div = 0;
 reg [31:0] rom_file_size = 0;
 reg [31:0] cd_img_size = 0;   // clk_74a; quasi-static once mounted
 
-reg [31:0] cd_bin_size = 0;   // CD Data slot (index 3) size after openfile
-// continuous scan of datatable words 0..7 (2 cycles per address, capture
-// one phase later) + a shadow copy for the debug overlay; the save-size
-// write is appended at the end of each sweep
-reg [4:0]  dt_scan = 0;
+reg [31:0] cd_bin_size = 0;   // CD Data slot (id 2) size after openfile
+// Data-slot table scan.
+//
+// The table is a list of {id, size} word PAIRS, and its ROW ORDER is
+// firmware-defined -- it is NOT guaranteed to follow our data.json order.
+// This scan used to hardcode the positions (word 5 = CD Image, word 7 = CD
+// Data) on the assumption that it did. A firmware that orders rows any other
+// way (sorting by id, say -- our data.json declares 0, 10, 1, 2, so sorted
+// order alone moves CD Data's size from word 7 to word 5) then silently
+// yields some other slot's size. That is the most likely reason "the
+// firmware never publishes a size for a core-initiated openfile" looked true
+// and motivated the ~21-round-trip binary-search probe in M_FSIZE.
+//
+// So match on the slot ID and take the NEXT word, exactly as the PC Engine
+// CD core's MPU firmware does (dataslot_search_id + dataslot_size in its
+// drivers/apf/apf.cpp). The probe remains the fallback: M_FSIZE only
+// believes cd_bin_size once it is >= one sector, so a miss still degrades to
+// probing rather than to a wrong size.
+//
+// NOTE: the Save-slot size write below still targets a fixed row (index 1).
+// If row order really does vary, that write has the same latent bug -- left
+// alone here because it is a separate function and saves are working.
+localparam [4:0] DT_WORDS = 5'd16;      // 8 {id,size} pairs; we declare 4 slots
+reg [ 5:0] dt_scan = 0;                 // 2 clk_74a per word
+wire [4:0] dt_w    = dt_scan[5:1];      // word index being presented
+wire [4:0] dt_prev = dt_w - 5'd1;       // word index datatable_q reflects
+reg [31:0] dt_id = 32'hFFFFFFFF;        // id word of the pair in flight
 reg [31:0] dbg_dtable [0:7];
 always @(posedge clk_74a or negedge pll_core_locked) begin
 	if (~pll_core_locked) begin
@@ -1422,23 +1480,24 @@ always @(posedge clk_74a or negedge pll_core_locked) begin
 		datatable_data <= 0;
 		datatable_wren <= 0;
 		dt_scan <= 0;
+		dt_id <= 32'hFFFFFFFF;
 	end else begin
-		if (dt_scan[4:1] <= 4'd7) begin
+		if (dt_w <= DT_WORDS) begin
 			datatable_wren <= 0;
-			datatable_addr <= {6'd0, dt_scan[4:1]};      // words 0..7
-			if (dt_scan[0] && dt_scan[4:1] != 0) begin
+			datatable_addr <= {5'd0, dt_w};
+			if (dt_scan[0] && dt_w != 0) begin
 				// q now reflects the PREVIOUS address (held 2 cycles)
-				dbg_dtable[dt_scan[4:1] - 1] <= datatable_q;
-				case (dt_scan[4:1] - 1)
-				4'd1: rom_file_size <= datatable_q;
-				4'd5: cd_img_size   <= datatable_q;
-				4'd7: cd_bin_size   <= datatable_q;
+				if (dt_prev < 5'd8) dbg_dtable[dt_prev[2:0]] <= datatable_q;
+				if (!dt_prev[0]) dt_id <= datatable_q;   // even word = slot id
+				else case (dt_id)                        // odd word = its size
+				32'd0: rom_file_size <= datatable_q;
+				32'd1: cd_img_size   <= datatable_q;
+				32'd2: cd_bin_size   <= datatable_q;
 				default: ;
 				endcase
 			end
-		end else if (dt_scan == 5'd16) begin
-			dbg_dtable[7] <= datatable_q;
-			cd_bin_size <= datatable_q;
+		end else begin
+			// sweep done: advertise the Save slot size, then restart
 			datatable_wren <= 1;
 `ifdef MCD_SAVE_DUMP
 			// DEBUG: advertise the save slot as 512KB = full PRG-RAM dump
@@ -1448,11 +1507,9 @@ always @(posedge clk_74a or negedge pll_core_locked) begin
 			datatable_data <= 32'd8192;
 `endif
 			datatable_addr <= 1 * 2 + 1;          // data slot index 1, not id 1
-		end else begin
-			datatable_wren <= 0;
 		end
 
-		dt_scan <= (dt_scan == 5'd17) ? 5'd0 : dt_scan + 1'b1;
+		dt_scan <= (dt_scan == 6'd35) ? 6'd0 : dt_scan + 1'b1;
 	end
 end
 
@@ -3184,14 +3241,55 @@ wire        cdd_send /* verilator public_flat_rd */, cdd_rec /* verilator public
 // Effective CD size (bin size for cue mounts, 0 until the mount FSM is
 // done) crosses from clk_74a as a quasi-static value: sample through a
 // 2FF-deep pipe and only accept when stable. Track count likewise.
-wire [31:0] cd_mount_size = mount_ready ? mount_eff_size : 32'd0;
-reg [31:0] cd_img_size_s1, cd_img_size_sys = 0;
+// TOC finality: mounted AND no further layout pass pending AND not currently
+// mid-layout.
+//
+// The M_LAYOUT exclusion is load-bearing. lay_prelim is cleared in M_FDIV in
+// the SAME cycle that dispatches the refine pass (see "PHASE 2 done"), so
+// !lay_prelim alone goes true BEFORE M_LAYOUT rewrites entries 1..N one per
+// pass, and before ph5 publishes the true leadout into mount_eff_size.
+//
+// A raw BIN/ISO mount has no cue and no phase 2, so lay_prelim is 0, the
+// single M_LAYOUT pass retires immediately, and this is simply mount_ready.
+wire       toc_final_74 = mount_ready && !lay_prelim && (mnt_st != M_LAYOUT);
+reg        toc_final_s1 = 0;
+reg        toc_final_sys /* verilator public_flat_rd */ = 0;
+reg        loading_s1 = 0;
+reg        loading_sys /* verilator public_flat_rd */ = 0;
+// THE DISC DOES NOT EXIST UNTIL ITS TOC IS FINAL.
+//
+// A multi-bin cue needs ~21 host round-trips per audio bin to size it (APF
+// publishes no size for core-initiated openfiles), so the real TOC is not
+// known for hundreds of ms after the mount -- and that scales with track
+// count. Publishing the disc before then hands the BIOS a preliminary TOC
+// whose tracks past track 2 carry placeholder LBAs minutes off the truth; it
+// caches those and every later track plays from the wrong place (the silent
+// level music in Terminator).
+//
+// Holding the DRIVE busy instead (parking it in STOP = CHECKING DISC) does
+// not work: the BIOS times that state out and declares NO DISC, and the
+// timeout is shorter than the probe on track-heavy discs. So gate the disc's
+// EXISTENCE instead. While probing, img_size reads 0, the drive drains to
+// NO_DISC exactly as it does with no disc at all, and the BIOS sits in its
+// untimed no-disc idle panel. When the TOC lands the disc appears and the
+// drive's own proven NO_DISC -> OPEN -> TOC insertion dance runs, unmodified.
+// The drive needs no knowledge of any of this.
+//
+// Bonus: with no disc the drive issues no fetches, so the probe runs
+// uncontended and finishes sooner than it would have otherwise.
+wire [31:0] cd_mount_size = toc_final_74 ? mount_eff_size : 32'd0;
+reg [31:0] cd_img_size_s1;
+reg [31:0] cd_img_size_sys /* verilator public_flat_rd */ = 0;
 reg [6:0]  toc_count_s1, toc_count_sys = 0;
 always @(posedge clk_sys) begin
 	cd_img_size_s1 <= cd_mount_size;
 	if (cd_img_size_s1 == cd_mount_size) cd_img_size_sys <= cd_img_size_s1;
 	toc_count_s1 <= toc_track_count;
 	if (toc_count_s1 == toc_track_count) toc_count_sys <= toc_count_s1;
+	toc_final_s1 <= toc_final_74;
+	toc_final_sys <= toc_final_s1;
+	loading_s1  <= mount_loading;
+	loading_sys <= loading_s1;
 end
 
 wire [15:0] CD_CDC_DATA;
@@ -3224,6 +3322,7 @@ megacd_cdd_drive cdd_drive
 	.cdda_wr_ready(MCD_CDDA_WR_READY),
 
 	.track_count(toc_count_sys),
+	.disc_loading(loading_sys),
 	.toc_addr(toc_rd_addr),
 	.toc_q(toc_rd_q),
 	.cd_req_file(cd_req_file),

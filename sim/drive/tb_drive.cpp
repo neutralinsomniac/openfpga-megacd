@@ -126,7 +126,7 @@ static uint64_t mk_seek(long L){
 // the hitching we see only on multi-bin discs like Sonic CD).
 static int cdda_test(){
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
-    dut->img_size = 3000*2352; dut->track_count=3; dut->cdda_wr_ready=1;
+    dut->img_size = 3000*2352; dut->track_count=3; dut->cdda_wr_ready=1; dut->disc_loading=0;
     dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
     toc_set(1, /*audio*/false, 0,0, /*file*/0, /*delta*/0,    /*disc*/0);
     toc_set(2, /*audio*/true,  0,0, /*file*/1, /*delta*/1000, /*disc*/1000);
@@ -170,21 +170,102 @@ static int cdda_test(){
     return fail?1:0;
 }
 
+// Disc-swap test. img_size drops to 0 whenever the mount FSM restarts (a new
+// .cue picked from the menu) and only returns once that image's TOC is final.
+// The drive must notice the disc LEAVING from whatever state it is in --
+// including TOC(9) -- retire to NO_DISC, and then run the normal insertion
+// dance for the new image. Otherwise the BIOS keeps believing the old disc is
+// still in the drive and never re-reads the TOC.
+static long run_beats(long n, int* saw_status, int want){
+    const long BEAT = 715909;
+    for(long b=0;b<n;b++){
+        pulse_cmd(0x0ULL);                       // BIOS-style DRIVE STATUS poll
+        for(long c=0;c<BEAT;c++){
+            tick();
+            if((dut->dbg_cmds & 0xF) == want){ *saw_status=1; return b; }
+        }
+    }
+    return -1;
+}
+static int swap_test(){
+    dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
+    dut->img_size = 0; dut->track_count=1; dut->cdda_wr_ready=1; dut->disc_loading=0;
+    dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
+    toc_set(1, /*audio*/false, 0,0, /*file*/0, /*delta*/0, /*disc*/0);
+    for(int i=0;i<20;i++) tick();
+    dut->reset=0; dut->mcd_rst_n=1;
+    for(int i=0;i<20;i++) tick();
+
+    int saw=0;
+    dut->disc_loading = 0;
+    if(run_beats(20,&saw,0xB) < 0){ err("never drained to NO_DISC at boot"); return 1; }
+    printf("boot (nothing mounted): NO_DISC(B) — no tray shown\n");
+
+    // --- user picks disc A: tray opens IMMEDIATELY, stays open while the
+    //     bins are sized, then closes once the TOC is final ---
+    dut->disc_loading = 1; dut->img_size = 0;
+    saw=0;
+    if(run_beats(4,&saw,0x5) < 0){ err("picking a cue did not open the tray"); return 1; }
+    printf("disc A picked: tray OPEN(5) immediately\n");
+    // hold through a long load, and pulse the MCD reset the way the BIOS does
+    for(long i=0;i<20;i++){
+        pulse_cmd(0x0ULL);
+        for(long c=0;c<715909;c++) tick();
+        if(i==10){ dut->mcd_rst_n=0; for(int k=0;k<2000;k++) tick();
+                   dut->mcd_rst_n=1; for(int k=0;k<2000;k++) tick(); }
+    }
+    if((dut->dbg_cmds & 0xF) != 0x5){
+        err("tray did not stay open across the load / MCD reset pulse"); return 1; }
+    printf("disc A: tray held OPEN(5) for 20 beats incl. an MCD reset pulse\n");
+    // TOC final: disc appears, tray closes
+    dut->img_size = 3000*2352; dut->disc_loading = 0;
+    saw=0;
+    if(run_beats(60,&saw,0x9) < 0){ err("disc A never reached TOC(9) after load"); return 1; }
+    printf("disc A: TOC final -> tray closed -> TOC(9)\n");
+
+    // --- user picks a different .cue ---
+    dut->disc_loading = 1; dut->img_size = 0;
+    saw=0;
+    long b = run_beats(4,&saw,0x5);
+    if(b < 0){ err("swap: tray did not reopen for the new image"); return 1; }
+    printf("disc B picked: tray OPEN(5) again (no NO_DISC flash)\n");
+
+    // --- disc B's TOC becomes final ---
+    dut->img_size = 5000*2352; dut->disc_loading = 0;
+    saw=0;
+    if(run_beats(60,&saw,0x9) < 0){ err("disc B never reached TOC(9) — close dance did not run"); return 1; }
+    printf("disc B: closed and reached TOC(9)\n");
+
+    // --- a load that fails (no disc ever appears) must not strand the tray ---
+    dut->disc_loading = 1; dut->img_size = 0;
+    saw=0;
+    if(run_beats(4,&saw,0x5) < 0){ err("failed load: tray did not open"); return 1; }
+    dut->disc_loading = 0;                       // give up, still no media
+    saw=0;
+    if(run_beats(20,&saw,0xB) < 0){ err("failed load left the tray stuck OPEN"); return 1; }
+    printf("failed load: fell back to NO_DISC(B) instead of hanging open\n");
+
+    printf(fail ? "\n==== SWAP TEST FAILED ====\n" : "\n==== SWAP TEST PASSED ====\n");
+    return fail?1:0;
+}
+
 int main(int argc, char** argv){
     Verilated::commandArgs(argc,argv);
     dut = new Vmegacd_cdd_drive;
-    bool cdda_mode=false;
+    bool cdda_mode=false, swap_mode=false;
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--spike-at")&&i+1<argc) spike_at_fetch=atol(argv[++i]);
         if(!strcmp(argv[i],"--spike-len")&&i+1<argc) spike_len=atol(argv[++i]);
         if(!strcmp(argv[i],"--cdda")) cdda_mode=true;
+        if(!strcmp(argv[i],"--swap")) swap_mode=true;
     }
     if(cdda_mode){ int r=cdda_test(); delete dut; return r; }
+    if(swap_mode){ int r=swap_test(); delete dut; return r; }
 
     // reset
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
     dut->img_size = 300*2352;      // 300-sector disc, single data track
-    dut->track_count=0; dut->cdda_wr_ready=1;
+    dut->track_count=0; dut->cdda_wr_ready=1; dut->disc_loading=0;
     dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0;   // 66-bit VlWide
     dut->cd_ack_74a=0;
     for(int i=0;i<20;i++) tick();

@@ -54,6 +54,13 @@ module megacd_cdd_drive
     //          delta[19:0], disc_lba[19:0]}; pre01_gap = in-file INDEX 00
     // region length before INDEX 01 (region start = disc_lba - pre01)
     input      [6:0]  track_count,
+    // 1 = the host is preparing a new image (a .cue was picked; its bins are
+    // still being sized). Presented to the BIOS as an open tray for the whole
+    // load, then closed once it drops -- the drive is visibly busy with a disc
+    // instead of reporting NO DISC. This is a LEVEL, not a latched request, so
+    // an MCD reset pulse mid-load cannot strand us: the drive comes up STOP and
+    // re-enters the tray-open state on the next tick while it is still high.
+    input             disc_loading,
     output reg [6:0]  toc_addr,
     input      [65:0] toc_q,
     // file holding the current track (multi-bin cue): the host reopens
@@ -660,6 +667,22 @@ always @(posedge clk) begin
                 if (latency != 0) latency <= latency - 1'b1;
                 else drv_status <= door ? STAT_OPEN : STAT_NO_DISC;
             end
+            // MEDIA GONE. img_size drops to 0 whenever the mount FSM starts
+            // over -- including when the user picks a different .cue -- and
+            // stays 0 until the new TOC is final. Only the drain above
+            // noticed, and it only looks at STOP, so after a swap the drive
+            // sat in TOC(9) holding the OLD disc: the BIOS never saw the disc
+            // leave, and the insertion dance below (which fires only from
+            // NO_DISC) never ran for the new image. Fall back to STOP from any
+            // state that implies media so the drain retires us to NO_DISC and
+            // the normal insertion path runs again. Skipped while door=1: an
+            // explicit OPEN TRAY is the host's own doing, not an eject.
+            if (!disc_present && !door && !disc_loading &&
+                drv_status != STAT_NO_DISC && drv_status != STAT_STOP) begin
+                drv_status <= STAT_STOP;
+                latency    <= 4'd0;   // drain to NO_DISC on the next tick
+                ins_cnt    <= 0;      // cancel an insertion dance in flight
+            end
             // disc inserted mid-session (drive was NO_DISC): emulate a real
             // insertion — tray OPEN ~0.5s then closed-with-media, landing in
             // TOC(9). (Present-at-boot and post-MCD-reset are handled by the
@@ -676,6 +699,26 @@ always @(posedge clk) begin
                 // watches DRIVE STATUS for 9 — ending in STOP deadlocks
                 // (BIOS waits for 9, we wait for a TOC request)
                 if (ins_cnt == 6'd1) drv_status <= STAT_TOC;
+            end
+            // LOADING: hold the tray open for as long as the host is preparing
+            // the image. Placed after the rules above so it wins over the drain
+            // and the dance. door is deliberately NOT set -- that reg means
+            // "the host commanded a tray state", and setting it here would
+            // block the insertion path. Status alone is what the BIOS reads.
+            if (disc_loading && !door) begin
+                drv_status <= STAT_OPEN;
+                ins_cnt    <= 0;
+            end
+            // LOADING DONE: close the tray. With media, run the normal close
+            // dance so we land in TOC(9) exactly as a real insertion does; if
+            // the mount failed and no disc appeared, fall back to the drain.
+            if (!disc_loading && !door && drv_status == STAT_OPEN &&
+                ins_cnt == 0) begin
+                if (disc_present) ins_cnt <= 6'd38;
+                else begin
+                    drv_status <= STAT_STOP;
+                    latency    <= 4'd0;
+                end
             end
             if (drv_status == STAT_SEEK) begin
                 if (seek_cnt != 0) seek_cnt <= seek_cnt - 1'b1;
