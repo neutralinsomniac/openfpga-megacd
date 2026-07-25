@@ -250,6 +250,50 @@ int main(int argc,char**argv){
         }
         dut->eval(); t++;
 
+        // ---- reset-with-disc-mounted investigation ----
+        // RESET_AT=<cycle>: issue the APF "Reset Core" bridge write ($70)
+        // mid-run, reproducing the hardware repro (mount a disc, then reset).
+        { static long rst_at=-1; static bool rsti=false; static int rst_ph=0;
+          if(!rsti){ rsti=true; const char* e=getenv("RESET_AT"); if(e) rst_at=atol(e); }
+          if(rst_at>0 && rst_ph<2){
+              if(c==rst_at){ dut->bridge_addr=0x00000070; dut->bridge_wr_data=1;
+                             dut->bridge_wr=1; rst_ph=1;
+                             printf("[%ld] >>> Reset Core\n", c); fflush(stdout); }
+              else if(c==rst_at+10){ dut->bridge_wr=0; rst_ph=2; }
+          } }
+        // COMMTRACE=1: main/sub handshake. CFM is written by the MAIN CPU,
+        // CFS by the SUB; the hardware hang parks the main CPU polling
+        // $A1200E with CFS never changing. SRES=0 means the sub is HELD in
+        // reset, which is what we cannot tell apart on hardware.
+        // NB: these are yosys-mangled net names from mcd.v (cfs=_1459_,
+        // cfm=_1461_, sres=_1421_, sbrq=_1423_); re-converting mcd.v will
+        // renumber them -- re-derive from the "assign cfs = _NNNN_;" lines.
+        { static bool cti=false, ct=false; static int lcfm=-1,lcfs=-1,lsres=-1,lsbrq=-1;
+          static long ncfm=0, ncfs=0;
+          if(!cti){ cti=true; const char* e=getenv("COMMTRACE"); ct = e && *e=='1'; }
+          if(ct){
+              int cfm = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1461_/*sig:cfm*/;
+              int cfs = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1459_/*sig:cfs*/;
+              int sres= dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1421_/*sig:sres*/;
+              int sbrq= dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1424_/*sig:sbrq*/;
+              // INT_PEND(2) = int_pend[1] = _1543_; IEN(2) = ien[1] of _1471_.
+              // With the IEN gate removed from the latch, INT_PEND(2) staying
+              // 0 means the MAIN CPU never requests INT2 at all.
+              int ip2 = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1545_/*sig:int_pend2*/ & 1;
+              int ie2 = (dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1472_/*sig:ien*/ >> 1) & 1;
+              static int lip2=-1, lie2=-1; static long nip2=0;
+              if(ip2!=lip2 && ip2) nip2++;
+              if(cfm!=lcfm) ncfm++;
+              if(cfs!=lcfs) ncfs++;
+              if(cfm!=lcfm||cfs!=lcfs||sres!=lsres||sbrq!=lsbrq||ip2!=lip2||ie2!=lie2){
+                  printf("[%ld] CFM=%02X CFS=%02X SRES=%d SBRQ=%d IPEND2=%d IEN2=%d"
+                         " (chg m=%ld s=%ld int2req=%ld)\n",
+                         c, cfm, cfs, sres, sbrq, ip2, ie2, ncfm, ncfs, nip2); fflush(stdout);
+                  lcfm=cfm; lcfs=cfs; lsres=sres; lsbrq=sbrq; lip2=ip2; lie2=ie2;
+              }
+          } }
+
+#if 0   // CDC trace disabled (see #endif below)
         // ---- CDC instrumentation ----
         // CDCTRACE=start[,end]: log the sub<->CDC register dialogue (AR
         // shadow mirrors the LC8951 auto-increment) + host-read bursts +
@@ -326,6 +370,7 @@ int main(int argc,char**argv){
                 printf("[%ld] cdcram_dump skipped (see tb note)\n",c);
             }
         }
+#endif  // CDC trace disabled: this yosys conversion drops the MCD-level nets it probes
 
         // ---- video frame capture (PPM dumps), all in clk_sys domain ----
         {
@@ -594,8 +639,8 @@ int main(int argc,char**argv){
             if(g1_n) printf("P1 [%ld] n=%ld serv=%.1f gap=%.1f\n",c,g1_n,(double)g1_serv/g1_n,(double)g1_gap/g1_n);
             vb_sum=0; vb_n=0; vb_max=0; g1_serv=0; g1_gap=0; g1_n=0; }
           static int r0_p=0,r1_p=0,d0_p=0,d1_p=0; static long swp[4]={0,0,0,0};
-          { int r0=r->core_top__DOT__MCD__DOT__asic__DOT__ret0, r1=r->core_top__DOT__MCD__DOT__asic__DOT__ret1;
-            int d0=r->core_top__DOT__MCD__DOT__asic__DOT__dmna0, d1=r->core_top__DOT__MCD__DOT__asic__DOT__dmna1;
+          { int r0=r->core_top__DOT__MCD__DOT__asic__DOT___1430_/*sig:ret0*/, r1=r->core_top__DOT__MCD__DOT__asic__DOT___1432_/*sig:ret1*/;
+            int d0=r->core_top__DOT__MCD__DOT__asic__DOT___1428_/*sig:dmna0*/, d1=r->core_top__DOT__MCD__DOT__asic__DOT___1429_/*sig:dmna1*/;
             if(r0!=r0_p) swp[0]++; if(r1!=r1_p) swp[1]++;
             if(d0!=d0_p) swp[2]++; if(d1!=d1_p) swp[3]++;
             r0_p=r0; r1_p=r1; d0_p=d0; d1_p=d1; }
