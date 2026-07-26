@@ -99,43 +99,34 @@ localparam [3:0] STAT_TOC     = 4'h9;   // TOC read done = "disc ready"
 localparam [3:0] STAT_NO_DISC = 4'hB;
 
 localparam [25:0] BEAT = 26'd715909;      // 13.3ms @ 53.693175MHz
-// Drive tick: sector delivery beat, seek countdown, insertion dance, no-disc
-// drain.
+// Drive tick: seek countdown, insertion dance, no-disc drain, and the raw
+// delivery beat (rate-limited to one per frame -- see owe_inc).
 //
-// TRIED AND REVERTED (hardware): setting this to 715909 = true 75Hz. It breaks
-// boot -- never gets past CHECKING DISC with a disc inserted. That is the same
-// failure the delivery-beat note further down records, and it is why the
-// delivery beat is now taken from wdog instead of by retiming this constant.
+// 698010 cycles = 76.92Hz. DO NOT "correct" this to 715909 (true 75Hz): that
+// gives ms_tick a period of 715910, IDENTICAL to wdog's, so the two stop
+// drifting and the delivery beat freezes at a fixed offset from the status
+// frame. Hardware result: BIOS hangs at CHECKING DISC. Being 2.56% fast is
+// what keeps the phase sweeping, and the sweep is load-bearing.
 //
-// A BIOS-audio slowdown was reported alongside that build and initially blamed
-// on this tick. It was not related: it was interact.json's HiFi PCM default
-// (0) disagreeing with cs_hifi_pcm_enable's reset value (1), exposed when a
-// menu reorder moved that entry inside the display cutoff so the firmware
-// began writing it. There is NO audio dependency on this tick -- with no disc,
-// disc_present is false, owe_inc never fires, and the sub's 75Hz INT2 comes
-// from wdog/BEAT. Confirmed by an older bitstream showing the same slowdown.
+// The over-delivery that rate implies (+1.92 sectors/sec) is real and was the
+// FMV stutter -- a streaming game overruns its read-ahead and resyncs with a
+// backward seek every ~2.1s, each resync paying the seek latency. It is fixed
+// at owe_inc by taking only the first ms_tick event per frame, which gives
+// exactly 75Hz without freezing the phase.
 //
-// It was 698010 cycles = 76.92Hz, 2.56% fast, which over-delivers by +1.92
-// sectors/sec. A game streaming FMV overruns its read-ahead buffer at that
-// rate and resyncs with a BACKWARD seek to re-read what it missed -- ~one
-// every 2.1s for a 4-sector buffer. Each resync pays the seek latency, and
-// that is the FMV stutter: measured on hardware as seek_cnt and backseek_cnt
-// incrementing in lockstep (i.e. EVERY seek is backward) about once every two
-// seconds, in cadence with the audible stutters.
+// Attempts that failed, so they are not retried:
+//   - TICK_13MS = 715909              -> CHECKING DISC hang (phase freeze)
+//   - dedicated 20-bit DLV_TICK       -> FAILED TIMING (97% ALM)
+//   - wdog beat + held-beat register  -> FAILED TIMING
+//   - wdog beat, sampled at BEAT/2    -> boots and fixes FMV, but the fixed
+//     phase starves a frame-synchronised loader: Lunar Eternal Blue took 3-4
+//     minutes to reach its intro FMV
 //
-// RETRIED (this value). The earlier failure of 715909 was reported as two
-// symptoms: BIOS audio slow, and never past CHECKING DISC. The audio one was
-// later proven to be interact.json's HiFi PCM default, nothing to do with this
-// tick. The disc-check one was never explained, so it may have been real or may
-// have been part of the same bad session -- retested here now the confound is
-// gone, because every alternative has been exhausted on AREA:
-//   - dedicated DLV_TICK counter (20 registers)  -> FAILED TIMING
-//   - delivery beat off wdog + held-beat register -> FAILED TIMING
-//   - delivery beat off wdog, sampled             -> boots, but the fixed phase
-//     against the status frame makes a frame-synchronised loader miss nearly
-//     every beat (Lunar Eternal Blue: 3-4 min to its intro FMV)
-// This costs nothing -- one constant -- and is the only remaining way to get a
-// true-1x beat that is phase-independent of the status frame.
+// A BIOS-audio slowdown once reported against the 715909 build was NOT this
+// tick: it was interact.json's HiFi PCM default (0) disagreeing with
+// cs_hifi_pcm_enable's reset value (1), exposed when a menu reorder moved that
+// entry inside the display cutoff. With no disc, disc_present is false and
+// owe_inc never fires; the sub's 75Hz INT2 comes from wdog/BEAT.
 localparam [19:0] TICK_13MS = 20'd698010;
 
 wire disc_present = (img_size >= 32'd2352);
