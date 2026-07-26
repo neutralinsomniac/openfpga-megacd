@@ -123,28 +123,20 @@ localparam [25:0] BEAT = 26'd715909;      // 13.3ms @ 53.693175MHz
 // incrementing in lockstep (i.e. EVERY seek is backward) about once every two
 // seconds, in cadence with the audible stutters.
 //
-// 53693175/75 = 715909 exactly, numerically the same as BEAT. ms_tick was
-// already a counter separate from wdog when that was tried, so independence
-// from the status frame was not what boot needed. A third variant -- a
-// dedicated DLV_TICK counter for delivery only -- was never booted at all: it
-// FAILED TIMING, because at 97% ALM there is no room for another 20-bit
-// counter. The fix that works is below: leave this tick alone and take the
-// delivery beat off wdog, which costs a comparator and no registers.
-localparam [19:0] TICK_13MS = 20'd698010;
-// Delivery beat: exact 1x, taken from the EXISTING wdog counter rather than a
-// new one. wdog already runs the 75Hz status frame (period BEAT+1 = 715910
-// cycles = 74.9999Hz), so comparing against a mid-period value gives a true
-// 75Hz delivery beat that is still half a frame away from the frame emission.
-//
-// It has to come from wdog because the design has no room: at 97% ALM and
-// 19347 registers, adding a separate 20-bit counter for this failed timing
-// outright. This costs one comparator and no registers.
-//
-// Phase matters here, not just rate. Driving delivery off wdog==BEAT -- i.e.
-// coincident with the frame emission -- broke the BIOS disc check before; the
-// half-frame offset keeps the two apart, which is what the boot header capture
-// was documented to need.
-localparam [25:0] BEAT_DLV  = 26'd357954;   // BEAT/2
+// RETRIED (this value). The earlier failure of 715909 was reported as two
+// symptoms: BIOS audio slow, and never past CHECKING DISC. The audio one was
+// later proven to be interact.json's HiFi PCM default, nothing to do with this
+// tick. The disc-check one was never explained, so it may have been real or may
+// have been part of the same bad session -- retested here now the confound is
+// gone, because every alternative has been exhausted on AREA:
+//   - dedicated DLV_TICK counter (20 registers)  -> FAILED TIMING
+//   - delivery beat off wdog + held-beat register -> FAILED TIMING
+//   - delivery beat off wdog, sampled             -> boots, but the fixed phase
+//     against the status frame makes a frame-synchronised loader miss nearly
+//     every beat (Lunar Eternal Blue: 3-4 min to its intro FMV)
+// This costs nothing -- one constant -- and is the only remaining way to get a
+// true-1x beat that is phase-independent of the status frame.
+localparam [19:0] TICK_13MS = 20'd715909;
 
 wire disc_present = (img_size >= 32'd2352);
 wire [31:0] leadout_lba = img_lba;        // computed at mount
@@ -684,29 +676,16 @@ reg        rpt_trk_audio = 0;
 // Note also that the FMV motivation above is weak: a PCM underrun is a
 // CPU-throughput problem, and extra DECI only helps if the sub's refill loop is
 // BLOCKED on DECI rather than short of cycles.
-// The beat is HELD, not sampled. Testing (drv_status == PLAY) at the single
-// instant wdog hits BEAT_DLV loses the whole beat whenever the drive happens
-// not to be playing right then -- and because wdog also drives the status
-// frame, that instant sits at a FIXED offset from the interrupt the host
-// synchronises its own PLAY/PAUSE pattern to. A loader that pauses in step
-// with the frame can therefore miss essentially every beat, systematically,
-// rather than losing a random few. Lunar Eternal Blue took 3-4 minutes to
-// reach its intro FMV on a build with the naive sample, and loads normally
-// without it.
-//
-// Real hardware has no such correlation: its sector boundaries come from disc
-// rotation, which is independent of host frame timing. Holding one pending
-// beat until PLAY resumes restores that -- delivery still averages exactly
-// 75Hz, a beat landing in a brief pause is honoured on resume instead of
-// vanishing, and only ONE can ever be outstanding so a long pause cannot
-// accumulate a burst.
-reg  beat_pend = 0;
-wire owe_inc = beat_pend && (drv_status == STAT_PLAY) && disc_present;
-always @(posedge clk) begin
-    if (reset | ~mcd_rst_n)      beat_pend <= 0;
-    else if (wdog == BEAT_DLV)   beat_pend <= 1;
-    else if (owe_inc)            beat_pend <= 0;
-end
+// Delivery beat, on ms_tick (see TICK_13MS). Phase-independent of the status
+// frame BY CONSTRUCTION, which is the property that matters: wdog drives the
+// frame the host synchronises its PLAY/PAUSE pattern to, so a beat derived
+// from wdog sits at a fixed offset from it and a loader pausing in step with
+// the frame misses essentially EVERY beat. Lunar Eternal Blue took 3-4 minutes
+// to reach its intro FMV that way, and loads normally otherwise. A separate
+// counter, or a held-beat register to survive the sampling instant, would both
+// solve it too -- both failed timing. ms_tick already exists and already
+// drifts against wdog, so it costs nothing.
+wire owe_inc = (ms_tick == TICK_13MS) && (drv_status == STAT_PLAY) && disc_present;
 // REQUEST 5 track number from the command's c4/c5 BCD digits
 wire [6:0] req_track = {3'd0,c4}*7'd10 + {3'd0,c5};
 
