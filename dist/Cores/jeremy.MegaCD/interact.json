@@ -167,7 +167,7 @@
         "persist": true,
         "address": "0x00000060",
         "writeonly": true,
-        "defaultval": 0,
+        "defaultval": 1,
         "value": 1
       },
       {
