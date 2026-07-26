@@ -264,6 +264,13 @@ int main(int argc, char** argv){
     dut = new Vmegacd_cdd_drive;
     bool cdda_mode=false, swap_mode=false;
     for(int i=1;i<argc;i++){
+        // --lat N: SUSTAINED per-fetch host latency in clk, modelling real SD
+        // round-trip cost rather than a one-off stall. This is the number that
+        // decides whether streaming keeps up: the fetch FSM is serial, so the
+        // drive must retire roughly one fetch per sector period (BEAT =
+        // 715909 clk = 13.3ms) to hold 1 sector/beat, no matter how deep the
+        // prefetch bank is. Depth buys burst tolerance, not throughput.
+        if(!strcmp(argv[i],"--lat")&&i+1<argc) LAT_NORMAL=atol(argv[++i]);
         if(!strcmp(argv[i],"--spike-at")&&i+1<argc) spike_at_fetch=atol(argv[++i]);
         if(!strcmp(argv[i],"--spike-len")&&i+1<argc) spike_len=atol(argv[++i]);
         if(!strcmp(argv[i],"--cdda")) cdda_mode=true;
