@@ -111,7 +111,14 @@ entity ASIC is
 		-- show whether the handshake is live -- the reset-with-disc hang
 		-- parks the main CPU polling exactly this register.
 		DBG_COMM			: out std_logic_vector(15 downto 0);
-		
+		-- CDC host-transfer state, for the hardware overlay. The sub sets up a
+		-- transfer, then waits for it to finish; if the destination handshake
+		-- never completes the sub spins until its own timeout, which looks
+		-- exactly like a multi-second freeze with both CPUs still executing.
+		-- Packed as: DD | DS | PCMA | {DSR,EDT,DTEN_N,WAIT_N} | done_cnt[8] |
+		-- dwell[8], where dwell is how long DS has been continuously non-IDLE.
+		DBG_CDCX			: out std_logic_vector(31 downto 0);
+
 		LED_RED			: out std_logic;
 		LED_GREEN		: out std_logic
 	);
@@ -309,6 +316,14 @@ architecture rtl of ASIC is
 	signal GEN_S68K_HALT				: std_logic;
 	
 	signal PCMA 						: PcmAccess_t;
+
+	-- CDC host-transfer instrumentation (see the DBGX process)
+	signal DBGX_DONE					: std_logic_vector(7 downto 0);
+	signal DBGX_DWELL					: std_logic_vector(7 downto 0);
+	signal DBGX_PRESC					: std_logic_vector(15 downto 0);
+	signal DBGX_DS_D					: DMAState_t;
+	signal ds_enc						: std_logic_vector(1 downto 0);
+	signal pcma_enc					: std_logic_vector(2 downto 0);
 	signal PCM_DMA_ADDR 				: std_logic_vector(12 downto 0);
 	signal PCM_DMA_DO 				: std_logic_vector(7 downto 0);
 	signal PCM_DMA_WR 				: std_logic;
@@ -2652,6 +2667,59 @@ begin
 	BROM_N <= '0' when EXT_ROM_N = '0' and EXT_VA(17) = '0' and EXT_VA(16 downto 2) /= "0"&x"007"&"00" and EXT_ASEL_N = '0' else '1';
 	CDC_N <= '0' when S68K_A(19 downto 2) = x"F800" & "01" and S68K_LDS_N = '0' and S68K_AS_N = '0' else '1';
 	
+	-------------------------------------------------------------------
+	-- CDC host-transfer instrumentation (overlay row 12)
+	-------------------------------------------------------------------
+	-- DS parks in DS_WRITE until its destination's *_DMA_RUN asserts, and in
+	-- DS_WRITE_WAIT until it deasserts (or until the CPU reads, for DD=010/011).
+	-- A destination whose handshake never completes therefore shows up as DS
+	-- stuck non-IDLE with a climbing dwell and a frozen done counter, and DD
+	-- says which destination is at fault:
+	--   010 main-CPU read  011 sub-CPU read  100 PCM RAM DMA
+	--   101 PRG RAM DMA    111 word RAM DMA
+	DBGX : process( RST_N, CLK )
+	begin
+		if RST_N = '0' then
+			DBGX_DONE  <= (others => '0');
+			DBGX_DWELL <= (others => '0');
+			DBGX_PRESC <= (others => '0');
+			DBGX_DS_D  <= DS_IDLE;
+		elsif rising_edge(CLK) then
+			if EN = '1' then
+				-- a transfer retires on any return to DS_IDLE from DS_WRITE_WAIT
+				if DBGX_DS_D = DS_WRITE_WAIT and DS = DS_IDLE then
+					DBGX_DONE <= std_logic_vector(unsigned(DBGX_DONE) + 1);
+				end if;
+				DBGX_DS_D <= DS;
+				-- dwell: ~1.5ms per count (clk/2^16), saturating, cleared
+				-- whenever the transfer engine is idle
+				if DS = DS_IDLE then
+					DBGX_DWELL <= (others => '0');
+					DBGX_PRESC <= (others => '0');
+				else
+					DBGX_PRESC <= std_logic_vector(unsigned(DBGX_PRESC) + 1);
+					if DBGX_PRESC = x"FFFF" then
+						if DBGX_DWELL /= x"FF" then
+							DBGX_DWELL <= std_logic_vector(unsigned(DBGX_DWELL) + 1);
+						end if;
+					end if;
+				end if;
+			end if;
+		end if;
+	end process;
+
+	with DS select ds_enc <=
+		"00" when DS_IDLE,     "01" when DS_CDC_READ,
+		"10" when DS_WRITE,    "11" when others;
+	with PCMA select pcma_enc <=
+		"000" when PCMA_IDLE,       "001" when PCMA_DMA_HALT0,
+		"010" when PCMA_DMA_HALT1,  "011" when PCMA_DMA_HALT2,
+		"100" when PCMA_DMA_WRITE,  "101" when others;
+
+	DBG_CDCX <= "0" & DD & "00" & ds_enc & "0" & pcma_enc &
+	            DSR & EDT & CDC_DTEN_N & CDC_WAIT_N &
+	            DBGX_DONE & DBGX_DWELL;
+
 	CLWE_N <= S68K_LDS_N or S68K_RNW;
 	CUWE_N <= S68K_UDS_N or S68K_RNW;
 	COE_N <= (S68K_LDS_N and S68K_UDS_N) or not S68K_RNW;

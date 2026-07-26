@@ -68,10 +68,17 @@ int main(int argc,char**argv){
         // screen; d-pad RIGHT (bit3) twice later -> cursor must move.
         {
             uint16_t k=0;
+            // The canned button script below was written for the cursor
+            // soft-lock investigation and PRESSES START ~5s in, which skips a
+            // game's intro movie -- exactly what a run investigating the intro
+            // needs to keep. Opt in with SCRIPTED_INPUT=1.
+            static bool scripted = getenv("SCRIPTED_INPUT") != nullptr;
+            if(scripted){
             if(c>=750000000 && c<775000000) k |= 1u<<15;   // START (title up ~frame 200)
             if(c>=1150000000 && c<1165000000) k |= 1u<<3;  // RIGHT on player screen
             if(c>=1230000000 && c<1245000000) k |= 1u<<1;  // DOWN too
             if(c>=1400000000 && c<1415000000) k |= 1u<<3;  // RIGHT (post-auto-open)
+            }
             // PRESS_START=start,end : extra scripted START window (e.g. to
             // skip the game intro movie like a real player would)
             { static long ps0=-1, ps1=-1; static bool psi=false;
@@ -319,15 +326,15 @@ int main(int argc,char**argv){
           static long ncfm=0, ncfs=0;
           if(!cti){ cti=true; const char* e=getenv("COMMTRACE"); ct = e && *e=='1'; }
           if(ct){
-              int cfm = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1461_/*sig:cfm*/;
-              int cfs = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1459_/*sig:cfs*/;
-              int sres= dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1421_/*sig:sres*/;
-              int sbrq= dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1424_/*sig:sbrq*/;
+              int cfm = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1489_/*sig:cfm*/;
+              int cfs = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1486_/*sig:cfs*/;
+              int sres= dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1449_/*sig:sres*/;
+              int sbrq= dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1451_/*sig:sbrq*/;
               // INT_PEND(2) = int_pend[1] = _1543_; IEN(2) = ien[1] of _1471_.
               // With the IEN gate removed from the latch, INT_PEND(2) staying
               // 0 means the MAIN CPU never requests INT2 at all.
-              int ip2 = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1545_/*sig:int_pend2*/ & 1;
-              int ie2 = (dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1472_/*sig:ien*/ >> 1) & 1;
+              int ip2 = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1572_/*sig:int_pend2*/ & 1;
+              int ie2 = (dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1500_/*sig:ien*/ >> 1) & 1;
               static int lip2=-1, lie2=-1; static long nip2=0;
               if(ip2!=lip2 && ip2) nip2++;
               if(cfm!=lcfm) ncfm++;
@@ -567,11 +574,13 @@ int main(int argc,char**argv){
             int ca  = r->core_top__DOT__cdd_drive__DOT__cur_audio;
             int ds2 = r->core_top__DOT__cdd_drive__DOT__drv_status;
             unsigned head = r->core_top__DOT__cdd_drive__DOT__head;
-            static int cmd_prev=-1;
-            int cmdc = r->core_top__DOT__cdd_drive__DOT__dbg_cmd_cnt;
-            if(cmdc != cmd_prev){
-              cmd_prev = cmdc;
-              unsigned long long cm = r->core_top__DOT__cdd_drive__DOT__dbg_last_comm;
+            // dbg_cmd_cnt was retired from the overlay packing (it wrapped ~3x/s
+            // and could not say which command changed state); trigger off the
+            // latched command word itself instead.
+            static unsigned long long cmd_prev=~0ULL;
+            unsigned long long cm = r->core_top__DOT__cdd_drive__DOT__dbg_last_comm;
+            if(cm != cmd_prev){
+              cmd_prev = cm;
               int c0 = cm & 0xF;
               if(c0!=0)   // non-poll command
                 printf("CDD [%ld] comm=%010llX c0=%d status=%d audio=%d head=%u\n",
@@ -649,14 +658,14 @@ int main(int argc,char**argv){
           if((c%2000000)==0 && c)
               printf("MCDRST [%ld] high=%.1f%% edges=%ld now=%d sbrq=%d\n",
                      c, 100.0*rst_hi/2000000.0, edges, rn,
-                     dut->rootp->core_top__DOT__MCD__DOT__asic__DOT__sbrq), rst_hi=0; }
+                     dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1451_/*sig:sbrq*/), rst_hi=0; }
         // SBRQ is the main's bus request for the sub. ASIC.vhd:2631/2638 make it
         // halt the sub 68000 outright (GEN_S68K_HALT <= SBRQ), and it RESETS TO
         // '1' -- so the sub is born halted and only runs once the main writes
         // $A12001 with bit1 clear. If this never falls, the sub can be fully out
         // of reset and still never fetch an instruction.
         { static int sb_prev=-1; static long sb_edges=0;
-          int sb = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT__sbrq;
+          int sb = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1451_/*sig:sbrq*/;
           if(sb!=sb_prev){
               if(sb_edges<12)
                   printf("[%ld] SBRQ %d -> %d (main=%06X sub=%06X)\n",c,sb_prev,sb,mpc,spc);
@@ -786,14 +795,66 @@ int main(int argc,char**argv){
             if(g1_n) printf("P1 [%ld] n=%ld serv=%.1f gap=%.1f\n",c,g1_n,(double)g1_serv/g1_n,(double)g1_gap/g1_n);
             vb_sum=0; vb_n=0; vb_max=0; g1_serv=0; g1_gap=0; g1_n=0; }
           static int r0_p=0,r1_p=0,d0_p=0,d1_p=0; static long swp[4]={0,0,0,0};
-          { int r0=r->core_top__DOT__MCD__DOT__asic__DOT___1430_/*sig:ret0*/, r1=r->core_top__DOT__MCD__DOT__asic__DOT___1432_/*sig:ret1*/;
-            int d0=r->core_top__DOT__MCD__DOT__asic__DOT___1428_/*sig:dmna0*/, d1=r->core_top__DOT__MCD__DOT__asic__DOT___1429_/*sig:dmna1*/;
+          { int r0=r->core_top__DOT__MCD__DOT__asic__DOT___1458_/*sig:ret0*/, r1=r->core_top__DOT__MCD__DOT__asic__DOT___1460_/*sig:ret1*/;
+            int d0=r->core_top__DOT__MCD__DOT__asic__DOT___1456_/*sig:dmna0*/, d1=r->core_top__DOT__MCD__DOT__asic__DOT___1457_/*sig:dmna1*/;
             if(r0!=r0_p) swp[0]++; if(r1!=r1_p) swp[1]++;
             if(d0!=d0_p) swp[2]++; if(d1!=d1_p) swp[3]++;
             r0_p=r0; r1_p=r1; d0_p=d0; d1_p=d1; }
           if((c%2000000)==0 && c){
             printf("SWAP [%ld] ret0=%ld ret1=%ld dmna0=%ld dmna1=%ld\n",c,swp[0],swp[1],swp[2],swp[3]);
             swp[0]=swp[1]=swp[2]=swp[3]=0; }
+          // CPU CLOCKS PER MAIN BUS CYCLE. The bus machine leaves MBUS_IDLE
+          // when the 68000 starts a cycle and returns to it only once the CPU
+          // has released AS, so an out-of-IDLE excursion IS one bus cycle.
+          // Counting M68K_CLKENp pulses across it (one pulse per full 7.67MHz
+          // CPU clock, gen.sv:163) measures the cost of a bus cycle.
+          //
+          // READ THIS AS A COMPARISON BETWEEN SLAVES, NOT AN ABSOLUTE. Every
+          // slave measures ~8.0 here -- work RAM (3/4), expansion window (5),
+          // VDP (6) alike -- and plain Genesis carts and other Sega CD titles
+          // run at full speed on this core, so 8.0 is simply what a correct bus
+          // cycle costs through an MCLK-domain FSM feeding a clock-enabled CPU.
+          // A naive "4 clocks = zero wait states" reading of this number sent
+          // one investigation chasing a 2x main-CPU slowdown that does not
+          // exist. What it IS good for: a slave that is genuinely slow shows up
+          // as its state costing more than the others.
+          { static int prev=-1; static long clks=0; static int via=0;
+            static long n[16]={0}, sum[16]={0};
+            int ms = r->core_top__DOT__gen__DOT__mstate & 15;
+            if(prev==0 && ms!=0){ clks=0; via=ms; }          // cycle start
+            if(ms!=0){ if(ms!=14) via=ms; if(r->core_top__DOT__gen__DOT__M68K_CLKENp) clks++; }
+            if(prev!=0 && ms==0 && via){ n[via]++; sum[via]+=clks; via=0; }
+            prev=ms;
+            if((c%2000000)==0 && c){
+              printf("BUSCYC [%ld]",c);
+              for(int i=0;i<16;i++) if(n[i]>16)
+                printf("  st%d: n=%ld %.1f cpuclk", i, n[i], (double)sum[i]/n[i]);
+              printf("   (compare slaves, not absolutes)\n");
+              for(int i=0;i<16;i++){ n[i]=0; sum[i]=0; } } }
+          // ---- CD pipeline snapshot (CDTRACE=1) ----------------------
+          // One line per 2M cycles carrying what the hardware overlay shows:
+          // drive state + head, the CDC decode path (DECEN/WRRQ, the mm:ss it
+          // framed, decode + DTTRG counters) and the seek/backseek counters.
+          // The stall shows up as head frozen with drv_status=4 while the
+          // seek counters stop and the framed header stops tracking head.
+          { static bool on = getenv("CDTRACE")!=nullptr;
+            if(on && (c%2000000)==0 && c){
+              auto& R = *r;
+              unsigned dec = R.core_top__DOT__dbg_dec;
+              unsigned head = R.core_top__DOT__cdd_drive__DOT__head & 0xFFFFF;
+              printf("CD [%ld] st=%u head=%u aud=%u | DECEN=%u WRRQ=%u "
+                     "hdr=%02X:%02X trg=%u dec=%u | seek=%u back=%u bad=%u lastc0=%X\n",
+                     c,
+                     R.core_top__DOT__cdd_drive__DOT__drv_status, head,
+                     R.core_top__DOT__cdd_drive__DOT__cur_audio,
+                     (dec>>31)&1, (dec>>30)&1,
+                     (dec>>16)&0xFF, (dec>>8)&0xFF,
+                     (dec>>4)&0xF, dec&0xF,
+                     R.core_top__DOT__cdd_drive__DOT__dbg_seek_cnt,
+                     R.core_top__DOT__cdd_drive__DOT__dbg_backseek_cnt,
+                     R.core_top__DOT__cdd_drive__DOT__dbg_badsync_cnt,
+                     R.core_top__DOT__cdd_drive__DOT__dbg_last_real_c0);
+            } }
           static long mshist[16]={0};
           mshist[r->core_top__DOT__gen__DOT__mstate & 15]++;
           if((c%2000000)==0 && c){

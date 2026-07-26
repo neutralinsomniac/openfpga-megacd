@@ -65,6 +65,7 @@ entity MCD is
 		
 		CDC_DATA			: in std_logic_vector(15 downto 0);
 		CDC_DAT_WR		: in std_logic;
+		CDC_DEC_TICK	: in std_logic := '0';
 		CDC_SC_WR		: in std_logic;
 		CDC_CDDA_WR		: in std_logic;
 		CDDA_WR_READY	: out std_logic;
@@ -88,7 +89,9 @@ entity MCD is
 		DBG_INT_ACK		: out std_logic_vector(6 downto 1);
 		DBG_GRON			: out std_logic;
 		-- main/sub comm flags (CFM & CFS) for the debug overlay
-		DBG_COMM			: out std_logic_vector(15 downto 0)
+		DBG_COMM			: out std_logic_vector(15 downto 0);
+		DBG_CDCX			: out std_logic_vector(31 downto 0);
+		DBG_DEC			: out std_logic_vector(31 downto 0)
 	);
 end MCD;
 
@@ -320,6 +323,7 @@ begin
 		DBG_INT_ACK		=> DBG_INT_ACK,
 		DBG_GRON			=> DBG_GRON,
 		DBG_COMM			=> DBG_COMM,
+		DBG_CDCX			=> DBG_CDCX,
 		
 		LED_RED   		=> LED_RED,
 		LED_GREEN   	=> LED_GREEN
@@ -358,12 +362,14 @@ begin
 		
 		CD_DI   		=> CDC_DATA,
 		CD_WR   		=> CDC_DAT_WR,
+		DEC_TICK		=> CDC_DEC_TICK,
 		
 		RAM_A_WR   	=> CDC_RAM_A_WR,
 		RAM_A_RD   	=> CDC_RAM_A_RD,
 		RAM_DI   	=> CDC_RAM_DI,
 		RAM_DO   	=> CDC_RAM_DO,
-		RAM_WE   	=> CDC_RAM_WE
+		RAM_WE   	=> CDC_RAM_WE,
+		DBG_DEC  	=> DBG_DEC
 	);
 	
 	CDC_RAM : entity work.dpram_dif

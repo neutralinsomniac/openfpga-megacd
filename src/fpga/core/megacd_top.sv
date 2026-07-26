@@ -1879,19 +1879,86 @@ wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
                          // scan matches on slot id, so a raw word is moot).
                          (dbg_y < 10'd78)  ? {dbg_vdpw_rate, dbg_wrrd_rate,
                                               dbg_dmna_rate, 5'd0, dbg_gron_duty} :
-                         (dbg_y < 10'd90)  ? dbg_dtable[1] :
-                         (dbg_y < 10'd102) ? dbg_dtable[2] :
-                         (dbg_y < 10'd114) ? dbg_dtable[3] :
+                         // CDC decode + host transfer: F G MMSS T C
+                         //   F = {DECEN, WRRQ, DECI, DTEI}; DECI/DTEI ACTIVE
+                         //       LOW, so 8 = decoder on, nothing pending
+                         //   G = {DOUTEN, DTEN, DTBSY, 0} -- host-transfer
+                         //       enable and state
+                         //   MMSS = mm:ss BCD of the sector last latched;
+                         //       compare against head+150 from row 8
+                         //   T = DTTRG writes, wraps -- the sub ASKING for a
+                         //       host transfer. FROZEN means the sub never
+                         //       requests the data it is buffering, which is
+                         //       the one thing measured on hardware that is
+                         //       still unexplained: the transfer counter sat
+                         //       still for the whole intro.
+                         //   C = decoded-sector counter, wraps at 75Hz
+                         // Replaces an APF datatable dump kept from the mount
+                         // bring-up, which is long solved.
+                         (dbg_y < 10'd90)  ? dbg_dec :
+                         // sub interrupt service: P AA Q BB CC
+                         //   P  = INT5 (CDC) pending duty /8, 7 = asserted the
+                         //        whole second
+                         //   AA = INT5 acks/sec -- 00 with P high means the sub
+                         //        NEVER takes the CDC interrupt, so it cannot
+                         //        be reading sector headers at all
+                         //   Q  = INT4 (CDD) pending duty /8
+                         //   BB = INT4 (CDD) acks/sec  (healthy ~4B = 75/sec)
+                         //   CC = INT2 (main->sub) acks/sec
+                         // INT4 is the control channel we know works, so it is
+                         // the reference: if BB spins and AA is stuck at 00,
+                         // the sub is alive and servicing interrupts generally
+                         // but not this one.
+                         (dbg_y < 10'd102) ? {1'b0, dbg_pend_duty[5], dbg_ack5_rate,
+                                              1'b0, dbg_pend_duty[4], dbg_ack4_rate,
+                                              dbg_ack2_rate} :
+                         // sector integrity: NN LLLLL F
+                         //   NN = data sectors delivered with a BROKEN MODE1
+                         //        sync -- i.e. not data sectors at all. 00 =
+                         //        the stream we hand the CDC is clean.
+                         //   LLLLL = LBA of the FIRST one; compare against the
+                         //        track layout to see where the disc stops
+                         //        being what we think it is
+                         //   F  = {cur_audio, in_pregap, 0, 0}
+                         // Replaces the last APF datatable dump from the mount
+                         // bring-up, which is long solved.
+                         (dbg_y < 10'd114) ? cdd_dbg_integ :
                          // CD-path debug: drive/fetch state, bridge FSMs,
                          // host round-trip counters (see dbg_cdpath packing)
                          (dbg_y < 10'd126) ? cdd_dbg_state :
                          (dbg_y < 10'd138) ? dbg_cdpath :
                          (dbg_y < 10'd150) ? dbg_cdcnt :
-                         // audio diagnostics: CCSSBBLD = cmd_cnt, seek_cnt,
-                         // backSEEK_cnt (the CDDA-replay counter), last c0, status
+                         // audio diagnostics: R P SS BB C D
+                         //   R  = last STATE-CHANGING command (polls filtered):
+                         //        1 STOP, 3 SEEK+PLAY, 4 SEEK+PAUSE, 6 PAUSE,
+                         //        7 RESUME, C close tray, D open tray, F none,
+                         //        E = auto-PAUSEd on the leadout (no command)
+                         //   P  = time paused SO FAR (live, not a max), ~107ms
+                         //        per count, F = >= 1.6s, 0 when not paused
+                         //   SS = SEEK commands, BB = of those, backwards
+                         //   C  = last command incl. polls, D = drive status
+                         // With the drive parked in a state, R says who put it
+                         // there -- C only ever shows the 0/2 poll traffic.
                          (dbg_y < 10'd162) ? cdd_dbg_cmds :
-                         // main/sub comm handshake: CFM CFS <cfm changes> <cfs changes>
-                                             dbg_commrow;
+                         // position/reporting: T F TT LLLLL
+                         //   T  = report type the host last asked for:
+                         //        0 absolute, 1 relative, 2 track, 3 leadout,
+                         //        4 first/last, 5 track start, F busy
+                         //   F  = {cur_audio, in_pregap, cur_track[5:4]};
+                         //        in_pregap set means we are feeding SILENCE
+                         //        rather than file data
+                         //   TT = cur_track (low digit is cur_track[3:0])
+                         //   LLLLL = target LBA of the last SEEK
+                         // Read against head in row 8: a host re-seeking to the
+                         // SAME LBA while head walks past it is correcting our
+                         // reported position, not streaming.
+                         //
+                         // Replaces the CDC transfer row, which answered its
+                         // question outright -- it read 50077000 for the whole
+                         // intro: transfer FSM idle, counter frozen, i.e. NO CD
+                         // data is read during this sequence at all. The disc is
+                         // doing nothing but CDDA here.
+                                             cdd_dbg_pos;
 wire [3:0] dbg_dv = dbg_hexrow[((3'd7 - dbg_x[6:4])*4) +: 4];
 reg [23:0] dbg_glyph;
 always @* case (dbg_dv)
@@ -2969,6 +3036,7 @@ MCD MCD
 
 	.CDC_DATA(CD_CDC_DATA),
 	.CDC_DAT_WR(CD_CDC_DAT_WR),
+	.CDC_DEC_TICK(CD_CDC_DEC_TICK),
 	.CDC_SC_WR(1'b0),
 	.CDC_CDDA_WR(CD_CDC_CDDA_WR),
 	.CDDA_WR_READY(MCD_CDDA_WR_READY),
@@ -2991,21 +3059,21 @@ MCD MCD
 	.DBG_INT_PEND(dbg_int_pend),
 	.DBG_INT_ACK(dbg_int_ack),
 	.DBG_GRON(dbg_gron)
-// The co-sim uses a pre-converted mcd.v that predates this port; in sim the
-// same values are read straight out of asic's cfm/cfs (see sim/full/tb_full).
-`ifndef VERILATOR
 	,.DBG_COMM(dbg_comm)
-`endif
+	,.DBG_CDCX(dbg_cdcx)
+	,.DBG_DEC(dbg_dec)
 );
 
 wire [2:0] dbg_s68k_ipl_n;
 wire [6:1] dbg_int_pend, dbg_int_ack;
 wire dbg_gron;
-`ifdef VERILATOR
-wire [15:0] dbg_comm = 16'd0;
-`else
+// These were stubbed to 0 under VERILATOR because the co-sim's pre-converted
+// mcd.v predated the ports. It has been reconverted and carries them now, so
+// the co-sim can read the real values -- which is the whole point of having
+// them when chasing something the overlay cannot reach.
 wire [15:0] dbg_comm;   // {CFM, CFS} as read at $A1200E
-`endif
+wire [31:0] dbg_cdcx;   // CDC host-transfer state (see ASIC.vhd DBG_CDCX)
+wire [31:0] dbg_dec /* verilator public_flat_rd */;  // CDC decode path (CDC.vhd DBG_DEC)
 
 ///////////////////////////////////////////////
 // Bring-up debug indicators (top-left corner)
@@ -3051,6 +3119,8 @@ always @(posedge clk_sys) begin
 			dbg_ack2_cnt <= 0;
 			dbg_ack4_rate <= dbg_ack4_cnt;
 			dbg_ack4_cnt <= 0;
+			dbg_ack5_rate <= dbg_ack5_cnt;
+			dbg_ack5_cnt <= 0;
 			dbg_gron_duty <= dbg_gron_cnt[25:23];
 			dbg_gron_cnt <= 0;
 			dbg_m68k_smp <= dbg_m68k_a;
@@ -3094,6 +3164,7 @@ always @(posedge clk_sys) begin
 				if (dbg_int_pend[di]) dbg_pend_cnt[di] <= dbg_pend_cnt[di] + 1'b1;
 			if (dbg_int_ack[2] & ~dbg_ack_d[2] & ~&dbg_ack2_cnt) dbg_ack2_cnt <= dbg_ack2_cnt + 1'b1;
 			if (dbg_int_ack[4] & ~dbg_ack_d[4] & ~&dbg_ack4_cnt) dbg_ack4_cnt <= dbg_ack4_cnt + 1'b1;
+			if (dbg_int_ack[5] & ~dbg_ack_d[5] & ~&dbg_ack5_cnt) dbg_ack5_cnt <= dbg_ack5_cnt + 1'b1;
 			if (dbg_gron) dbg_gron_cnt <= dbg_gron_cnt + 1'b1;
 			dbg_gron_d <= dbg_gron;
 			if (dbg_gron_d & ~dbg_gron & ~&dbg_gfx_cnt) dbg_gfx_cnt <= dbg_gfx_cnt + 1'b1;
@@ -3182,6 +3253,7 @@ reg [2:0]  dbg_pend_duty [1:6];  // per-level pending duty (/8)
 reg [6:1]  dbg_ack_d = 0;
 reg [7:0]  dbg_ack2_cnt = 0, dbg_ack2_rate = 0;  // INT2 (frame) acks/sec
 reg [7:0]  dbg_ack4_cnt = 0, dbg_ack4_rate = 0;  // INT4 (CDD) acks/sec
+reg [7:0]  dbg_ack5_cnt = 0, dbg_ack5_rate = 0;  // INT5 (CDC) acks/sec
 reg [25:0] dbg_gron_cnt = 0;
 reg [2:0]  dbg_gron_duty = 0;    // GFX op in-flight duty (/8)
 reg        dbg_gron_d = 0;
@@ -3310,6 +3382,7 @@ end
 
 wire [15:0] CD_CDC_DATA;
 wire        CD_CDC_DAT_WR;
+wire        CD_CDC_DEC_TICK;  // CDC null decoder tick (see the drive)
 
 megacd_cdd_drive cdd_drive
 (
@@ -3334,6 +3407,7 @@ megacd_cdd_drive cdd_drive
 
 	.cdc_data(CD_CDC_DATA),
 	.cdc_dat_wr(CD_CDC_DAT_WR),
+	.cdc_dec_tick(CD_CDC_DEC_TICK),
 	.cdc_cdda_wr(CD_CDC_CDDA_WR),
 	.cdda_wr_ready(MCD_CDDA_WR_READY),
 
@@ -3346,9 +3420,14 @@ megacd_cdd_drive cdd_drive
 
 	.dbg_state(cdd_dbg_state),
 	.dbg_sector_done(cdd_dbg_secdone),
-	.dbg_cmds(cdd_dbg_cmds)
+	.dbg_cmds(cdd_dbg_cmds),
+	.dbg_pos(cdd_dbg_pos),
+	.dbg_integ(cdd_dbg_integ)
 );
-wire [31:0] cdd_dbg_cmds;   // {cmd_cnt, seek_cnt, backseek_cnt, last_c0, status}
+wire [31:0] cdd_dbg_integ; // {bad-sync count, first bad LBA, audio, pregap}
+wire [31:0] cdd_dbg_pos;    // {rs_type, cur_audio, cur_track, last seek LBA}
+wire [31:0] cdd_dbg_cmds;   // {last_real_c0, pause_run, seek_cnt,
+                            //  backseek_cnt, last_c0, status}
 wire CD_CDC_CDDA_WR;
 
 // CD fetch-path counters for the hardware overlay (debug only, loose CDC)

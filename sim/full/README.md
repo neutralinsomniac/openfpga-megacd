@@ -246,6 +246,53 @@ touches it until sub/game code runs. Every workload it can currently produce
 is BIOS ROM plus PRG-RAM. It is therefore not a vehicle for decoding-speed
 work until the SBRQ release is understood. sim/m2 remains the sub-side path.
 
+## RESOLVED (2026-07-27): it WAS a run-length problem after all
+
+The sub boots at cycle ~285.8M -- the 200M run above simply stopped ~86M
+cycles short, and the "SBRQ never falls" conclusion over-generalised it.
+With a disc the full boot proceeds: BIOS disc-check seeks + pregap park
+around 3.3-4.5B, game PRG load streaming from ~2.9B on. Everything below
+supersedes the "not a vehicle" verdict: this sim boots games.
+
+## Running a game (proven recipe)
+
+    CDTRACE=1 FRAME_EVERY=60 ./obj_dir/tb_full +bios=bios_scd2.hex \
+        +brm=brm_formatted.hex --cd /path/to/game.cue --cycles 15000000000
+
+- Speed ~1.05M cycles/s wall (~214.8M sim cycles per emulated second: the tb
+  drives refclk at clk_ram rate, so c/214.8M = emulated seconds -- do NOT
+  divide by 148.5M, that misread cost a session a bogus 2x-slowdown theory).
+- `+brm=` preloads the 8KB internal backup RAM. Games that keep save data
+  (Shining Force CD demands 100 free blocks) refuse to start against an
+  unformatted BRAM -- the sim then parks forever on the "More space is
+  needed" screen while the drive sits paused, which looks exactly like a CD
+  hang. Generate the image with the GPGX brm_format 64-byte header at
+  0x1FC0 and the free-block count (0x2000/64 - 3 = 125, GPGX bram_load())
+  at header offsets 0x11/0x13/0x15/0x17:
+      python3 - <<'EOF'
+      fmt = bytearray(bytes.fromhex(
+       '5f5f5f5f5f5f5f5f5f5f5f00000000400000000000000000'
+       '00000000000000005345474125434425524f4d0001000000'.replace('25','5f')) +
+       b'RAM_CARTRIDGE___')
+      blocks = (0x2000 // 64) - 3
+      for o in (0x11,0x13,0x15,0x17): fmt[o] = blocks
+      b = bytearray(0x2000); b[0x2000-0x40:] = fmt
+      open('brm_formatted.hex','w').write(''.join('%02x\n'%v for v in b))
+      EOF
+  (*.hex is gitignored; regenerate as above.)
+- `CDTRACE=1` prints one CD-pipeline line per 2M cycles: drive status, head,
+  DECEN/WRRQ, the mm:ss the CDC framed, DTTRG/decode counters, seek and
+  backseek counters -- the hardware overlay rows, but with history.
+- `FRAME_EVERY=N` dumps frames/fNNNNN.ppm every N frames. When a run looks
+  stuck, LOOK AT THE SCREEN before theorising; the BRAM screen above was
+  found that way after two runs of counter-reading missed it.
+- The canned button script (START ~5s in, etc.) is opt-in via
+  SCRIPTED_INPUT=1; it exists for the cursor soft-lock investigation and
+  will skip a game intro if left on.
+- The CDD drive control plane is a line-by-line GPGX cdd.c port
+  (2026-07-27, hardware-validated); when in doubt about protocol behaviour
+  diff against ~/src/Genesis-Plus-GX/core/cd_hw/cdd.c rather than guessing.
+
 ## Cursor soft-lock (2026-07-21) — current state
 The CD-player screen renders fully (sim + hardware identical: TRACK 0,
 00:00, NO DISC, cursor) but ignores input. Root: the SUB's main loop is

@@ -26,12 +26,24 @@ entity CDC is
 		
 		CD_DI			: in std_logic_vector(15 downto 0);
 		CD_WR			: in std_logic;
+		-- null decoder tick (GPGX cdc_decoder_update(0) with no data):
+		-- raise DECI/!VALST, zero the HEAD registers, and advance WA/PT
+		-- by one sector when WRRQ, without any data arriving. Defaulted
+		-- so legacy instantiations compile unchanged.
+		DEC_TICK		: in std_logic := '0';
 		
 		RAM_A_WR   	: out std_logic_vector(15 downto 1);
 		RAM_A_RD   	: out std_logic_vector(15 downto 0);
 		RAM_DI		: in std_logic_vector(7 downto 0);
 		RAM_DO		: out std_logic_vector(15 downto 0);
-		RAM_WE		: out std_logic
+		RAM_WE		: out std_logic;
+		-- decode-path instrumentation for the hardware overlay:
+		--   [31:28] {DECEN, WRRQ, DECI, DTEI}  (DECI/DTEI active low)
+		--   [27:24] {DOUTEN, DTEN, DTBSY, 0} -- host-transfer enable/state
+		--   [23:8]  HEAD0,HEAD1 = mm:ss BCD of the sector last latched
+		--   [7:4]   DTTRG writes, wraps -- the sub ASKING for a transfer
+		--   [3:0]   decoded-sector counter, wraps (spins at 75Hz)
+		DBG_DEC		: out std_logic_vector(31 downto 0)
 	);
 end CDC;
 
@@ -115,6 +127,8 @@ architecture rtl of CDC is
 	signal PT : std_logic_vector(15 downto 0);
 	signal WA : std_logic_vector(15 downto 0);
 	signal CTRL0 : std_logic_vector(7 downto 0);
+	signal DBG_DEC_CNT : std_logic_vector(3 downto 0);   -- see DBGDEC below
+	signal DBG_TRG_CNT : std_logic_vector(3 downto 0);   -- DTTRG writes
 	signal CTRL1 : std_logic_vector(7 downto 0);
 	signal STAT0 : std_logic_vector(7 downto 0) := x"00";
 	constant STAT1 : std_logic_vector(7 downto 0) := x"00";
@@ -161,6 +175,9 @@ architecture rtl of CDC is
 --	signal DECI_WAIT_CNT : unsigned(15 downto 0);
 --	signal DECI_SET : std_logic;
 	signal OLD_WRRQ : std_logic;
+	signal DEC_TICK_OLD : std_logic;
+	signal SYNC_M : unsigned(2 downto 0);   -- sync-pattern match progress
+	signal SYNC_DONE : std_logic;           -- framed since DECEN went high
 	
 begin
 
@@ -299,6 +316,9 @@ begin
 			WORD_CNT <= (others => '0');
 			RAM_POS <= (others => '0');
 			DEC_POS <= (others => '0');
+			SYNC_M <= (others => '0');
+			DEC_TICK_OLD <= '0';
+			SYNC_DONE <= '0';
 			DEC_DAT <= (others => '0');
 			DEC_WR <= '0';
 			DEC_WR_EN <= '0';
@@ -375,6 +395,64 @@ begin
 							RAM_POS <= (others => '0');
 --							DEC_WR_EN <= CTRL0(WRRQ);
 						end if;
+
+						-- SECTOR FRAMING BY SYNC PATTERN.
+						--
+						-- WORD_CNT alone does not frame sectors: it is zeroed
+						-- whenever DECEN is deasserted (the else branch far
+						-- below), and zero is only the RIGHT phase if the next
+						-- word to arrive is word 0 of a sector. That holds only
+						-- when the disc is not streaming. A decoder armed while
+						-- sectors are flowing lands mid-sector and every count
+						-- after it is off by the same amount: HEAD0..3 latch
+						-- from whatever bytes sit at word 6/7, payload lands at
+						-- the wrong buffer offset, and DECI fires off boundary.
+						-- Measured on hardware as HEAD reading 84:84 / 81:81:81
+						-- while the drive was provably delivering well-formed
+						-- sectors (sync verified at the source, zero bad),
+						-- leaving a host that searches the stream for a target
+						-- sector header unable to ever match.
+						--
+						-- Which also explains how a desynced host RECOVERS, and
+						-- why it always looked like the pause was involved: its
+						-- retry path is give-up -> PAUSE -> reconfigure the CDC
+						-- -> resume, and that works only because the drive is
+						-- stopped, so the re-arm lands on a real boundary. The
+						-- multi-second freeze IS the recovery, not the fault.
+						--
+						-- The real LC8951 frames on the 12-byte sync
+						-- 00 FF*10 00 -- what CTRL1's SYDEN enables, and why
+						-- that pattern is reserved and cannot occur in
+						-- sector data. Matching it restarts the word counter,
+						-- which is self-correcting: framing recovers on the
+						-- next sector however the decoder was started.
+						-- Unconditional rather than gated on SYDEN, because
+						-- never resyncing is the bug and the pattern is
+						-- unambiguous. CD_WR carries only data sectors
+						-- (MCD.vhd:363; CDDA has its own strobe), so audio
+						-- cannot trigger it.
+						-- Re-frame only ONCE per arming (SYNC_DONE), which is all the
+						-- fault needs: the counter wraps at exactly one sector, so once
+						-- the first sync lands it stays right. Accepting a match at any
+						-- position forever would be unsafe here -- the reserved sync
+						-- cannot occur in ENCODED cd data, but this drive pushes raw
+						-- file bytes straight through, so a payload containing
+						-- 00 FF*10 00 would re-frame mid-sector and break framing that
+						-- was correct. One shot per arming cannot do that.
+						if CD_DI = x"FF00" then
+							SYNC_M <= "001";
+						elsif SYNC_M >= "001" and SYNC_M <= "100" and CD_DI = x"FFFF" then
+							SYNC_M <= SYNC_M + 1;
+						elsif SYNC_M = "101" and CD_DI = x"00FF" then
+							SYNC_M <= "000";
+							if SYNC_DONE = '0' then
+								SYNC_DONE <= '1';
+								WORD_CNT <= to_unsigned(12/2, WORD_CNT'length);
+								RAM_POS <= (others => '0');
+							end if;
+						else
+							SYNC_M <= "000";
+						end if;
 --						if CTRL0(WRRQ) = '0' then
 --							DEC_WR_EN <= '0';
 --						end if;
@@ -394,6 +472,28 @@ begin
 				else
 					WORD_CNT <= (others => '0');
 					RAM_POS <= (others => '0');
+					SYNC_DONE <= '0';   -- re-arm: next sync re-frames
+				end if;
+				
+				-- null decoder tick: GPGX cdc_decoder_update(header=0) with no
+				-- data. HEAD registers take the (zero) header, !VALST and DECI
+				-- assert, and with WRRQ latched the block pointer and write
+				-- address advance one sector with nothing written -- exactly
+				-- upstream's WRRQ branch when cdd_read_data has no data to give
+				-- (audio track, negative lba). The drive pulses this on every
+				-- 75Hz tick where it does not stream a sector down CD_DI.
+				DEC_TICK_OLD <= DEC_TICK;
+				if DEC_TICK = '1' and DEC_TICK_OLD = '0' and CTRL0(DECEN) = '1' then
+					HEAD0 <= x"00";
+					HEAD1 <= x"00";
+					HEAD2 <= x"00";
+					HEAD3 <= x"00";
+					STAT3(VALST) <= '0';
+					IFSTAT(DECI) <= '0';
+					if DEC_WR_EN = '1' then
+						WA <= std_logic_vector( unsigned(WA) + 2352 );
+						PT <= std_logic_vector( unsigned(PT) + 2352 );
+					end if;
 				end if;
 			end if;
 		end if;
@@ -591,6 +691,36 @@ begin
 	
 	
 	INT_N <= (IFSTAT(DTEI) or not IFCTRL(DTEIEN)) and (IFSTAT(DECI) or not IFCTRL(DECIEN));
-	
+
+	-------------------------------------------------------------------
+	-- decode-path instrumentation (overlay row 5)
+	-------------------------------------------------------------------
+	-- Sits between the drive (which we know delivers correctly) and the sub
+	-- (which we know keeps executing). Answers two things a stalled sub
+	-- cannot: is the decoder even ENABLED and retiring sectors, and does the
+	-- sector it latched agree with where the drive says its head is.
+	-- HEAD0..2 are the raw mm:ss:ff BCD from the sector stream, so they can
+	-- be compared straight against head+150 from row 8.
+	DBGDEC : process( RESET_N, CLK )
+	begin
+		if RESET_N = '0' then
+			DBG_DEC_CNT <= (others => '0');
+			DBG_TRG_CNT <= (others => '0');
+		elsif rising_edge(CLK) then
+			if EN = '1' and CTRL0(DECEN) = '1' and CD_WR = '1' and CD_WR_OLD = '0'
+			   and WORD_CNT = 2352/2-1 then
+				DBG_DEC_CNT <= std_logic_vector(unsigned(DBG_DEC_CNT) + 1);
+			end if;
+			-- every write to R6 (DTTRG) = the sub ASKING for a host transfer
+			if EN = '1' and REG_WR = '1' and AR = x"6" then
+				DBG_TRG_CNT <= std_logic_vector(unsigned(DBG_TRG_CNT) + 1);
+			end if;
+		end if;
+	end process;
+
+	DBG_DEC <= CTRL0(DECEN) & CTRL0(WRRQ) & IFSTAT(DECI) & IFSTAT(DTEI) &
+	           IFCTRL(DOUTEN) & IFSTAT(DTEN) & IFSTAT(DTBSY) & '0' &
+	           HEAD0 & HEAD1 & DBG_TRG_CNT & DBG_DEC_CNT;
+
 end rtl;
 	

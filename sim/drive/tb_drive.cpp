@@ -19,6 +19,8 @@ static vluint64_t tk = 0;
 // On cd_req rising, after LAT cycles assert cd_ack and record which file
 // offset landed in which bank slot. A one-shot SPIKE injects a long latency.
 static uint32_t slot_off[4] = {0,0,0,0};   // file byte offset held by each slot
+static int      slot_file[4] = {-1,-1,-1,-1}; // WHICH BIN filled each slot
+static int      g_dlv_file = -1;            // bin the last delivered word came from
 static bool     slot_val[4] = {false,false,false,false};
 static long     lat_ctr = -1;
 static long     LAT_NORMAL = 40;            // ~normal fetch latency (cycles)
@@ -29,6 +31,11 @@ static bool     req_d = false;
 
 // ---- mock cd_buf: 1-cycle read latency; value encodes file byte offset ----
 static uint32_t buf_addr_d = 0;
+// When set, the mock returns a REAL MODE1/2352 sync (00 FF*10 00) in the first
+// 12 bytes of every sector, so the drive's sync check sees a well-formed data
+// sector. Left off by default: the other tests encode the file offset in every
+// word to verify routing, which is deliberately not a valid sync.
+static bool mock_valid_sync = false;
 
 // stats
 static long fetch_count = 0, deliver_words = 0, deliver_secs = 0;
@@ -62,7 +69,12 @@ static void tick(){
     uint32_t slot = (a >> 10) & 3, word = a & 0x3FF;
     // present previous-cycle address' data (1-cycle latency modelled below)
     uint32_t bslot = (buf_addr_d >> 10) & 3, bword = buf_addr_d & 0x3FF;
-    dut->cd_buf_q = slot_off[bslot] + bword*4;
+    if (mock_valid_sync && bword < 3)
+        dut->cd_buf_q = (bword==0) ? 0xFFFFFF00u        // bytes 00 FF FF FF
+                      : (bword==1) ? 0xFFFFFFFFu        // bytes FF FF FF FF
+                                   : 0x00FFFFFFu;       // bytes FF FF FF 00
+    else
+        dut->cd_buf_q = slot_off[bslot] + bword*4;
     buf_addr_d = a;
 
     // fetch handshake
@@ -73,6 +85,7 @@ static void tick(){
         if (off % 2352 != 0) err("cd_req_offset not sector-aligned");
         if (((off/2352) & 3) != s) err("cd_req_slot != (lba & 3)");
         slot_off[s] = off;
+        slot_file[s] = dut->cd_req_file;
         long lba = off/2352; if(lba > g_max_fetch_lba) g_max_fetch_lba = lba;
         fetch_idx++;
     }
@@ -89,7 +102,7 @@ static void tick(){
     // count delivered words / sectors (data + CDDA paths)
     static bool datwr_d=false, cddawr_d=false;
     bool datwr = dut->cdc_dat_wr;
-    if (datwr && !datwr_d) deliver_words++;
+    if (datwr && !datwr_d){ deliver_words++; g_dlv_file = slot_file[bslot]; }
     datwr_d = datwr;
     bool cddawr = dut->cdc_cdda_wr;
     if (cddawr && !cddawr_d) cdda_words++;
@@ -103,8 +116,17 @@ static void tick(){
     tk++;
 }
 
+// Present the command word, THEN strobe. On hardware the sub writes CDDC over
+// five separate 68000 bus cycles ($FF8042..$FF804A) and only the last one sets
+// CDD_SEND, so every nibble is stable tens of clk before the strobe and the
+// drive's 4-deep seek-latency pipeline has settled. Raising cdd_send on the
+// same tick as cdd_comm (as this did) instead latched a latency computed from
+// the PREVIOUS command's MSF: a 50000-sector seek measured as the bare 11-beat
+// base, so the distance term -- and every bug in it -- was invisible here.
 static void pulse_cmd(uint64_t comm){
-    dut->cdd_comm = comm; dut->cdd_send = 1;
+    dut->cdd_comm = comm;
+    for(int i=0;i<40;i++) tick();
+    dut->cdd_send = 1;
     for(int i=0;i<4;i++) tick();
     dut->cdd_send = 0;
     for(int i=0;i<4;i++) tick();
@@ -197,6 +219,254 @@ static long run_beats(long n, int* saw_status, int want){
     }
     return -1;
 }
+// GPGX port: a paused (or stopped, or TOC'd) drive keeps feeding the decoder
+// the sector under the head at 75Hz -- upstream's cdc_decoder_update in every
+// non-PLAY state -- and the head must NOT drift while it does. A paused AUDIO
+// track gets null ticks only (no CDDA words: the DAC would loop 13ms of audio
+// as a buzz; upstream sends no audio while paused either).
+static int pause_test(){
+    dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
+    dut->img_size = 3000*2352; dut->track_count=2; dut->cdda_wr_ready=1;
+    dut->cd_fast_seek=1; dut->disc_loading=0;
+    dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
+    toc_set(1, /*audio*/false, 0,0, /*file*/0, /*delta*/0,    /*disc*/0);
+    toc_set(2, /*audio*/true,  0,0, /*file*/1, /*delta*/1000, /*disc*/1000);
+    for(int i=0;i<20;i++) tick();
+    dut->reset=0; dut->mcd_rst_n=1;
+    for(int i=0;i<20;i++) tick();
+
+    const long BEAT = 715909;
+    // ---- data track: play in, then PAUSE ----
+    pulse_cmd(mk_seek(200));
+    for(long b=0;b<12;b++){ pulse_cmd(0x0ULL);
+        for(long c=0;c<BEAT;c++){ tick(); if((dut->dbg_cmds&0xF)==1) break; } }
+    if((dut->dbg_cmds&0xF)!=1) err("data track never reached PLAY");
+
+    pulse_cmd(0x6ULL);                                  // PAUSE
+    if((dut->dbg_cmds&0xF)!=4) err("PAUSE command did not reach PAUSE");
+    long head0 = dut->dbg_state & 0xFFFFF;
+    long secs=0; bool dsd=false;
+    for(long b=0;b<10;b++){
+        pulse_cmd(0x0ULL);
+        for(long c=0;c<BEAT;c++){
+            tick();
+            bool d = dut->dbg_sector_done;
+            if(d && !dsd) secs++;
+            dsd = d;
+        }
+    }
+    long head1 = dut->dbg_state & 0xFFFFF;
+    printf("paused DATA track: %ld sectors delivered over 10 beats, head %ld -> %ld\n",
+           secs, head0, head1);
+    if(secs < 8)  err("paused data track stopped feeding the decoder (GPGX re-delivers)");
+    if(head1 != head0) err("head moved while paused");
+
+    // ---- audio track: play in, then PAUSE ----
+    pulse_cmd(mk_seek(1200));
+    for(long b=0;b<12;b++){ pulse_cmd(0x0ULL);
+        for(long c=0;c<BEAT;c++){ tick(); if((dut->dbg_cmds&0xF)==1) break; } }
+    if((dut->dbg_cmds&0xF)!=1) err("audio track never reached PLAY");
+    pulse_cmd(0x6ULL);                                  // PAUSE
+    long asecs=0; dsd=false;
+    for(long b=0;b<10;b++){
+        pulse_cmd(0x0ULL);
+        for(long c=0;c<BEAT;c++){
+            tick();
+            bool d = dut->dbg_sector_done;
+            if(d && !dsd) asecs++;
+            dsd = d;
+        }
+    }
+    printf("paused AUDIO track: %ld sectors delivered over 10 beats (want 0, hw mutes)\n",
+           asecs);
+    if(asecs > 1) err("paused audio track keeps feeding the CDDA FIFO (audible buzz)");
+
+    printf(fail ? "\n==== PAUSE TEST FAILED ====\n" : "\n==== PAUSE TEST PASSED ====\n");
+    return fail?1:0;
+}
+
+// SCAN: fast forward (c0=8) / fast rewind (c0=9), ended by recover-initial-
+// state (c0=A). These were unimplemented -- acknowledged and ignored -- so the
+// head never moved and a host scanning for the next track waited forever. The
+// host stops a scan by watching the position reports, so the only thing that
+// really matters is that the head MOVES, in the right direction, and that A
+// returns the drive to 1x play from wherever the scan left it.
+static int scan_test(){
+    dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
+    dut->img_size = 40000*2352; dut->track_count=0; dut->cdda_wr_ready=1;
+    dut->cd_fast_seek=1; dut->disc_loading=0;
+    dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
+    for(int i=0;i<20;i++) tick();
+    dut->reset=0; dut->mcd_rst_n=1;
+    for(int i=0;i<20;i++) tick();
+
+    const long BEAT = 715909;
+    pulse_cmd(mk_seek(5000));
+    for(long b=0;b<12;b++){ pulse_cmd(0x0ULL);
+        for(long c=0;c<BEAT;c++){ tick(); if((dut->dbg_cmds&0xF)==1) break; } }
+    if((dut->dbg_cmds&0xF)!=1) err("never reached PLAY before the scan");
+
+    auto head = [&]{ return (long)(dut->dbg_state & 0xFFFFF); };
+    auto run  = [&](int beats){ for(int b=0;b<beats;b++){ pulse_cmd(0x0ULL);
+                                  for(long c=0;c<BEAT;c++) tick(); } };
+
+    run(4);              // drain the residual seek latency (scan does not
+                         // walk while latency counts, matching upstream)
+    long h0 = head();
+    pulse_cmd(0x8ULL);                              // FAST FORWARD
+    if((dut->dbg_cmds&0xF)!=3) err("FF did not report SCAN (status 3)");
+    run(10);
+    long h1 = head();
+    printf("fast forward: head %ld -> %ld over 10 beats (+%ld)\n", h0, h1, h1-h0);
+    // GPGX CD_SCAN_SPEED = 30 sectors per 75Hz update
+    if(h1 - h0 < 250 || h1 - h0 > 350) err("fast forward rate is not ~30 sectors/beat");
+
+    // 0x0A: GPGX lands this in PAUSE, not PLAY (it is sent just before a
+    // SEEK/PLAY). Whichever it is, the head must stop moving at scan rate.
+    pulse_cmd(0xAULL);                              // N-track jump control
+    if((dut->dbg_cmds&0xF)!=4) err("0x0A did not land in PAUSE (GPGX: CD_PAUSE)");
+    long h2 = head();
+    run(5);
+    long h3 = head();
+    printf("0x0A: PAUSE at head %ld, +%ld over 5 beats (want 0, scan stopped)\n",
+           h2, h3-h2);
+    if(h3-h2 > 2) err("still scanning after 0x0A");
+
+    pulse_cmd(0x9ULL);                              // FAST REWIND
+    if((dut->dbg_cmds&0xF)!=3) err("FR did not report SCAN (status 3)");
+    long h4 = head();
+    run(10);
+    long h5 = head();
+    printf("fast rewind:  head %ld -> %ld over 10 beats (%ld)\n", h4, h5, h5-h4);
+    if(h4 - h5 < 250 || h4 - h5 > 350) err("fast rewind rate is not ~30 sectors/beat");
+
+    pulse_cmd(0xAULL);
+    if((dut->dbg_cmds&0xF)!=4) err("0x0A after rewind did not land in PAUSE");
+
+    // scan off the end of the disc: GPGX reports CD_END (0xC), not PAUSE
+    pulse_cmd(mk_seek(39980));
+    for(long b=0;b<12;b++){ pulse_cmd(0x0ULL);
+        for(long c=0;c<BEAT;c++){ tick(); if((dut->dbg_cmds&0xF)==1) break; } }
+    pulse_cmd(0x8ULL);                              // FAST FORWARD into leadout
+    run(4);
+    printf("scan into lead-out: status=%lX head=%ld (want C @ 40000)\n",
+           (long)(dut->dbg_cmds&0xF), head());
+    if((dut->dbg_cmds&0xF)!=0xC) err("lead-out did not report CD_END (C)");
+    if(head()!=40000) err("scan did not clamp at the lead-out LBA");
+
+    printf(fail ? "\n==== SCAN TEST FAILED ====\n" : "\n==== SCAN TEST PASSED ====\n");
+    return fail?1:0;
+}
+
+// Cross-bin prefetch collision. The bank tags slots by FILE lba, and every bin
+// of a multi-bin cue restarts at file lba 0, so tags collide across files: play
+// in one bin, then seek to the SAME file lba in another, and a stale slot reads
+// as a hit. The drive then delivers the previous bin's bytes and never issues a
+// fetch -- silent data corruption, and for a data track it means the sector
+// "header" handed to the CDC is arbitrary audio, so a host searching for a
+// target header never matches.
+//
+// Built so the two tracks share file lbas exactly: track 2 (file 1) and track 3
+// (file 2) both start at their own file lba 0, at disc 1000 and 2000.
+static int binswap_test(){
+    dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
+    dut->img_size = 4000*2352; dut->track_count=3; dut->cdda_wr_ready=1;
+    dut->cd_fast_seek=1; dut->disc_loading=0;
+    dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
+    toc_set(1, /*audio*/false, 0,0, /*file*/0, /*delta*/0,    /*disc*/0);
+    toc_set(2, /*audio*/false, 0,0, /*file*/1, /*delta*/1000, /*disc*/1000);
+    toc_set(3, /*audio*/false, 0,0, /*file*/2, /*delta*/2000, /*disc*/2000);
+    for(int i=0;i<20;i++) tick();
+    dut->reset=0; dut->mcd_rst_n=1;
+    for(int i=0;i<20;i++) tick();
+
+    const long BEAT = 715909;
+    // Play only a FEW sectors of track 2 so the bank holds file 1's file lbas
+    // 0..3 -- the same file lbas track 3 will ask for. This overlap is the
+    // whole point: land anywhere further in and the tags simply differ and the
+    // collision cannot occur.
+    pulse_cmd(mk_seek(1000));
+    for(long b=0;b<5;b++){ pulse_cmd(0x0ULL); for(long c=0;c<BEAT;c++) tick(); }
+    long h2 = dut->dbg_state & 0xFFFFF;
+    printf("track 2 (file 1): head=%ld -> file lba %ld, bank holds file 1 lbas 0..3\n",
+           h2, h2-1000);
+    if(h2-1000 > 6) err("test setup: ran too far into track 2 to collide");
+
+    // seek to track 3 -> file 2, asking for the SAME file lbas 0..3
+    long fetches_before = fetch_count;
+    int  file_seen = -1;
+    long wrong_bin_words = 0, delivered_words = 0;
+    // the pending window (1 tick) and any in-flight hold sector legitimately
+    // deliver the OLD position (file 1) -- GPGX reads the old lba there too.
+    // Only what is delivered once the head has settled on track 3 may be
+    // held against the bank.
+    pulse_cmd(mk_seek(2000));
+    for(long b=0;b<3;b++){ pulse_cmd(0x0ULL); for(long c=0;c<BEAT;c++) tick(); }
+    long dw_before = deliver_words;
+    for(long b=0;b<8;b++){
+        pulse_cmd(0x0ULL);
+        for(long c=0;c<BEAT;c++){
+            long dw = deliver_words;
+            tick();
+            if(dut->cd_req) file_seen = dut->cd_req_file;
+            // count DELIVERED words that came out of a slot still holding
+            // another bin's data -- the fetch count alone cannot see this,
+            // because the bank rotates and only SOME slots collide.
+            if(deliver_words != dw && g_dlv_file >= 0 && g_dlv_file != 2)
+                wrong_bin_words++;
+        }
+    }
+    delivered_words = deliver_words - dw_before;
+    long fetched = fetch_count - fetches_before;
+    printf("track 3 (file 2): %ld fetches, cd_req_file=%d, %ld/%ld delivered words "
+           "came from the WRONG bin\n", fetched, file_seen,
+           wrong_bin_words, delivered_words);
+    if(file_seen != 2)
+        err("fetched from the wrong bin after crossing");
+    if(delivered_words == 0)
+        err("test setup: nothing delivered from track 3");
+    if(wrong_bin_words != 0)
+        err("stale bank served ANOTHER BIN'S data as track 3 sectors");
+
+    printf(fail ? "\n==== BINSWAP TEST FAILED ====\n" : "\n==== BINSWAP TEST PASSED ====\n");
+    return fail?1:0;
+}
+
+// Two-sided check of the sector-integrity detector (dbg_integ): it must stay
+// silent on well-formed MODE1 sectors and fire on malformed ones. Without both
+// halves the counter could be stuck at zero, or firing on everything, and a
+// hardware reading of it would mean nothing.
+static int integ_test(){
+    dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
+    dut->img_size = 3000*2352; dut->track_count=0; dut->cdda_wr_ready=1;
+    dut->cd_fast_seek=1; dut->disc_loading=0;
+    dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
+    mock_valid_sync = true;
+    for(int i=0;i<20;i++) tick();
+    dut->reset=0; dut->mcd_rst_n=1;
+    for(int i=0;i<20;i++) tick();
+
+    const long BEAT = 715909;
+    pulse_cmd(mk_seek(100));
+    for(long b=0;b<16;b++){ pulse_cmd(0x0ULL); for(long c=0;c<BEAT;c++) tick(); }
+    long good = (dut->dbg_integ >> 24) & 0xFF;
+    printf("well-formed sectors: bad-sync count = %ld (want 0)\n", good);
+    if(good != 0) err("sync check false-positives on valid MODE1 sectors");
+
+    // now hand it malformed sectors and require it to notice
+    mock_valid_sync = false;
+    for(long b=0;b<16;b++){ pulse_cmd(0x0ULL); for(long c=0;c<BEAT;c++) tick(); }
+    long bad = (dut->dbg_integ >> 24) & 0xFF;
+    long lba = (dut->dbg_integ >> 4) & 0xFFFFF;
+    printf("malformed sectors:   bad-sync count = %ld, first bad LBA = %ld\n",
+           bad, lba);
+    if(bad == 0) err("sync check missed malformed sectors entirely");
+    if(lba == 0) err("first-bad LBA was never latched");
+
+    printf(fail ? "\n==== INTEG TEST FAILED ====\n" : "\n==== INTEG TEST PASSED ====\n");
+    return fail?1:0;
+}
+
 static int swap_test(){
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
     dut->img_size = 0; dut->track_count=1; dut->cdda_wr_ready=1; dut->cd_fast_seek=0; dut->disc_loading=0;
@@ -273,8 +543,9 @@ static int swap_test(){
 // the shape of an FMV stutter: drv_status parked at SEEK(2) with head stalled.
 static int reseek_test(){
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
-    dut->img_size = 3000*2352; dut->track_count=0; dut->cdda_wr_ready=1; dut->cd_fast_seek=0;
-    if(getenv("FASTSEEK")) dut->cd_fast_seek=1;   // isolate: fast from t=0
+    // full-size disc: the distance term only bites past ~2250 sectors
+    dut->img_size = 330000u*2352u; dut->track_count=0; dut->cdda_wr_ready=1; dut->cd_fast_seek=0;
+    if(getenv("FASTSEEK")) dut->cd_fast_seek=1;
     dut->disc_loading=0;
     dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
     for(int i=0;i<20;i++) tick();
@@ -282,49 +553,62 @@ static int reseek_test(){
     for(int i=0;i<20;i++) tick();
 
     const long BEAT = 715909;
+    auto head = [&]{ return (long)(dut->dbg_state & 0xFFFFF); };
+    // GPGX semantics: the head parks ON the target at the apply tick and the
+    // internal status is PLAY throughout the latency; "seek done" is when the
+    // head starts ADVANCING. Latency = 1 apply tick + base(12 acc / 2 fast) +
+    // dist/2250 (accurate only).
+    auto seek_and_wait = [&](long L, int reissue_ivl, int reissue_for)->long{
+        pulse_cmd(mk_seek(L));
+        for(long b=0;b<400;b++){
+            pulse_cmd(0x0ULL);                    // Get-Drive-Status poll
+            if(reissue_ivl && b<reissue_for && (b%reissue_ivl)==0)
+                pulse_cmd(mk_seek(L));
+            for(long c=0;c<BEAT;c++){ tick(); }
+            if(head() > L) return b;              // first advance past target
+        }
+        return -1;
+    };
 
-    // baseline: one SEEK+PLAY, left alone -> PLAY after the 11-frame base
+    long base_exp = getenv("FASTSEEK") ? 2 : 12;
+
+    long single = seek_and_wait(100, 0, 0);
+    printf("single SEEK+PLAY      -> head moves after %ld beats (expect ~%ld)\n",
+           single, base_exp+1);
+    if(single < base_exp-1 || single > base_exp+3)
+        err("short seek latency does not match GPGX base");
+
+    long FAR = 50000;
+    long far_exp = base_exp + (getenv("FASTSEEK") ? 0 : FAR/2250);
+    long fars = seek_and_wait(FAR, 0, 0);
+    printf("long  SEEK+PLAY (%ld) -> head moves after %ld beats (expect ~%ld)\n",
+           FAR, fars, far_exp+1);
+    if(fars < far_exp-2 || fars > far_exp+4)
+        err("long-stroke latency does not match base + |dlba|/2250");
+
+    // head must be PARKED on the target while the latency drains (upstream
+    // cdd.lba = lba at apply): sample mid-latency
     pulse_cmd(mk_seek(100));
-    long single=-1;
-    for(long b=0;b<40 && single<0;b++){
-        pulse_cmd(0x0ULL);
-        for(long c=0;c<BEAT;c++){ tick(); if((dut->dbg_cmds&0xF)==1){ single=b; break; } }
-    }
-    printf("single SEEK+PLAY      -> PLAY after %ld beats (%.0f ms)\n",
-           single, single*13.3);
+    for(long b=0;b<5;b++){ pulse_cmd(0x0ULL); for(long c=0;c<BEAT;c++) tick(); }
+    if(!getenv("FASTSEEK") && head() != 100)
+        err("head not parked on the target during seek latency");
 
-    // re-issued: same target, re-commanded every 2 beats for 20 beats, then
-    // left alone. Measured from the FIRST command.
-    pulse_cmd(mk_seek(500));
-    long reissued=-1, last_cmd_beat=0;
-    for(long b=0;b<60 && reissued<0;b++){
-        pulse_cmd(0x0ULL);
-        if(b<20 && (b%2)==0){ pulse_cmd(mk_seek(500)); last_cmd_beat=b; }
-        for(long c=0;c<BEAT;c++){ tick(); if((dut->dbg_cmds&0xF)==1){ reissued=b; break; } }
-    }
-    printf("re-issued every 2 beats -> PLAY after %ld beats (%.0f ms), last cmd at beat %ld\n",
-           reissued, reissued*13.3, last_cmd_beat);
-    printf("head frozen for the whole seek; extra stall vs baseline = %ld beats (%.0f ms)\n",
-           reissued-single, (reissued-single)*13.3);
-
+    // re-issued while pending: |dlba| = 0 from the parked head, so the
+    // latency must not restart or compound (the old accumulate bug)
+    // drain current
+    for(long b=0;b<20;b++){ pulse_cmd(0x0ULL); for(long c=0;c<BEAT;c++) tick(); }
+    long re = seek_and_wait(FAR/2, 2, 20);
+    printf("re-issued every 2 beats -> head moves after %ld beats (expect ~%ld)\n",
+           re, base_exp + (getenv("FASTSEEK")?0:(FAR/2 - 100)/2250) + 1);
     // Only meaningful while the base exceeds the re-issue interval. Under
-    // FASTSEEK the base is 2 beats and we re-issue every 2, so the latency
-    // legitimately drains to 0 between commands and each one re-charges it --
-    // upstream's guard is likewise "no latency pending", so that is correct,
-    // not the restart bug this checks for.
-    if(!getenv("FASTSEEK") && reissued > single + 2)
-        err("re-issued SEEK+PLAY restarts the latency base (upstream does not)");
+    // FASTSEEK the base is 2 and we re-issue every 2: each command's apply
+    // legitimately re-parks lba and recharges the base -- upstream behaves
+    // identically (cdd.lba = lba on every apply), so 20+ beats is CORRECT
+    // there, not the compounding bug this guards against.
+    long re_exp = base_exp + (getenv("FASTSEEK")?0:(FAR/2)/2250);
+    if(!getenv("FASTSEEK") && re > re_exp + 6)
+        err("re-issued seek restarts/compounds the latency (upstream does not)");
 
-    // CD Access Time (menu). Checked per-invocation rather than by toggling
-    // mid-run, which is how the option is actually used -- it is a menu setting,
-    // not something that changes between seeks. FASTSEEK=1 selects GPGX's
-    // cd_latency=0 profile: base 2 and no distance term.
-    //   accurate: 11 beats = 146ms   fast: 2 beats = 27ms
-    if(getenv("FASTSEEK")){
-        if(single > 4) err("FASTSEEK set but the seek still paid the long base");
-    } else {
-        if(single < 9) err("accurate mode lost the 11-frame spin-up base");
-    }
     printf(fail ? "\n==== RESEEK TEST FAILED ====\n" : "\n==== RESEEK TEST PASSED ====\n");
     return fail?1:0;
 }
@@ -332,7 +616,7 @@ static int reseek_test(){
 int main(int argc, char** argv){
     Verilated::commandArgs(argc,argv);
     dut = new Vmegacd_cdd_drive;
-    bool cdda_mode=false, swap_mode=false, reseek_mode=false;
+    bool cdda_mode=false, swap_mode=false, reseek_mode=false, pause_mode=false, scan_mode=false, binswap_mode=false, integ_mode=false;
     for(int i=1;i<argc;i++){
         // --lat N: SUSTAINED per-fetch host latency in clk, modelling real SD
         // round-trip cost rather than a one-off stall. This is the number that
@@ -346,10 +630,18 @@ int main(int argc, char** argv){
         if(!strcmp(argv[i],"--cdda")) cdda_mode=true;
         if(!strcmp(argv[i],"--swap")) swap_mode=true;
         if(!strcmp(argv[i],"--reseek")) reseek_mode=true;
+        if(!strcmp(argv[i],"--pause")) pause_mode=true;
+        if(!strcmp(argv[i],"--scan")) scan_mode=true;
+        if(!strcmp(argv[i],"--binswap")) binswap_mode=true;
+        if(!strcmp(argv[i],"--integ")) integ_mode=true;
     }
     if(cdda_mode){ int r=cdda_test(); delete dut; return r; }
     if(swap_mode){ int r=swap_test(); delete dut; return r; }
     if(reseek_mode){ int r=reseek_test(); delete dut; return r; }
+    if(pause_mode){ int r=pause_test(); delete dut; return r; }
+    if(scan_mode){ int r=scan_test(); delete dut; return r; }
+    if(binswap_mode){ int r=binswap_test(); delete dut; return r; }
+    if(integ_mode){ int r=integ_test(); delete dut; return r; }
 
     // reset
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;

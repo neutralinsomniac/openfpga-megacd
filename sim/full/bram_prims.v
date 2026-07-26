@@ -42,6 +42,22 @@ module dpram_dif #(parameter addr_width_a=8, parameter data_width_a=8,
     localparam RATIO = data_width_b / data_width_a;
     reg [data_width_a-1:0] mem [0:(1<<addr_width_a)-1];
     integer i;
+
+    // +brm=<file> preloads the 8KB internal backup RAM (the only dpram_dif
+    // with this shape -- see megacd_top's `backup_ram`). Games that keep save
+    // data refuse to run past their title/BRAM-check screen against an
+    // unformatted one, so the co-sim cannot reach in-game content without it.
+    // Sim-only: this file is not synthesised.
+    reg [1023:0] brm_file;
+    initial begin
+        if (addr_width_a == 13 && data_width_a == 8 &&
+            addr_width_b == 12 && data_width_b == 16) begin
+            if ($value$plusargs("brm=%s", brm_file)) begin
+                $readmemh(brm_file, mem);
+                $display("[bram] preloaded backup RAM from +brm");
+            end
+        end
+    end
     always @(posedge clock) begin
         if (wren_a) mem[address_a] <= data_a;
         q_a <= mem[address_a];

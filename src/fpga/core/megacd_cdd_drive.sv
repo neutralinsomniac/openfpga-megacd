@@ -1,19 +1,48 @@
 // CDD (CD-drive microcontroller) with a mounted disc image.
 //
-// v1 disc model: one MODE1/2352 data track (raw BIN). Track 1 starts at
-// 00:02:00 (LBA 0); leadout = image size / 2352. No CDDA, no cue sheet.
+// CONTROL PLANE IS A LINE-BY-LINE PORT OF GPGX cdd.c (cdd_update/cdd_process,
+// see ~/src/Genesis-Plus-GX/core/cd_hw/cdd.c). Where this file and upstream
+// disagree, upstream wins unless a divergence is explicitly documented below.
+// The key semantics, none of which the previous implementation had:
 //
-// The no-disc protocol is inherited verbatim from megacd_cdd_stub (GPGX
-// cdd.c semantics, hard-won in cosim): status drains STOP->NO_DISC and
-// STAYS there; ReadTOC never fabricates entries; OPEN/CLOSE TRAY reply
-// with their own status nibbles. With a disc mounted the same command set
-// answers with real TOC data, seeks, and streams raw sectors to the CDC
-// at 75Hz through the APF sector-fetch handshake.
+//   - The internal status is NEVER "seek". CD_SEEK (2) exists only in the
+//     REPORTED status: Play/Seek commands set the report to (SEEK<<8)|0xF and
+//     a pending flag; the next 75Hz tick charges the latency, parks lba on
+//     the target, and sets the internal status to the pending PLAY/PAUSE.
+//   - The decoder is fed on EVERY tick. PLAY delivers the sector at lba and
+//     advances; every other state (latency countdown, pause, stop, TOC, END,
+//     scan) re-delivers the sector under the head without advancing (data
+//     track), or null-ticks the CDC (DECI + WA/PT advance, no data) for
+//     audio/negative positions. GPGX's comments credit MCD-verificator CDC
+//     Init and Flags Test #30 for exactly this.
+//   - Latency base is 2 + 10*cd_latency (i.e. 12 accurate / 2 fast) for BOTH
+//     Play and Seek, plus |dlba|*120/270000 when accurate. Re-issued seeks
+//     add nothing: lba is already parked on the target, so |dlba| = 0.
+//   - There is no periodic report rebuild. RS1-8 change only in command
+//     responses; Get-Drive-Status refreshes them from the live position,
+//     gated on latency <= 3, and the report-type memory is RS1 itself.
+//   - Reset/Stop with a disc land in TOC(9) internally while the REPORTED
+//     status register still shows what it last showed (zeros / STOP once) --
+//     which is how upstream avoids the boot hang we once caused by
+//     REPORTING 9 at reset (see git history of this file for the disasm).
 //
-// Status frame: nibbles n0..n9; n0 = status, n1 = latched report type,
-// n2..n8 report payload, n9 = ~(sum n0..n8)&F. A frame is emitted every
-// 13.3ms; the payload is rebuilt each beat for the latched report type
-// (so ABSOLUTE tracks the head while playing).
+// Documented divergences from upstream (all deliberate):
+//   - Data-track re-delivery during latency/pause streams the REAL sector,
+//     so the CDC latches the real header; GPGX writes HEAD=00:00:00 for
+//     those ticks. Real hardware re-reads the parked sector, so ours is the
+//     more faithful of the two.
+//   - SCAN walks linearly through inter-track gaps at +/-30 sectors/tick;
+//     GPGX jumps straight to the next track's INDEX 01. A 2s gap costs us 5
+//     extra ticks; the host stops the scan on the position reports either way.
+//   - No-disc REQUEST replies carry a zeroed payload (stub heritage, proven
+//     boot path); GPGX fills them from its zeroed TOC, which is nearly but
+//     not exactly the same bytes.
+//   - The tray/insertion dance, disc_loading hold-open, and media-swap
+//     detection have no upstream equivalent (the host mount flow is ours).
+//
+// Transport (unchanged): 4-sector prefetch bank filled over the APF
+// sector-fetch handshake; sectors are streamed to the CDC as 1176 16-bit
+// words (~350us), CDDA paced by the DAC FIFO instead.
 module megacd_cdd_drive
 (
     input             clk,
@@ -44,6 +73,14 @@ module megacd_cdd_drive
     output reg [15:0] cdc_data,
     output reg        cdc_dat_wr,
 
+    // CDC null decoder tick (GPGX cdc_decoder_update(0) with no data): the
+    // CDC raises DECI and advances WA/PT (when WRRQ) without receiving a
+    // sector. Pulsed on ticks where nothing is streamed down the data path:
+    // audio playback, and any no-data position (negative lba, virtual
+    // pregap, bank miss) in a non-delivering state. Held 8 clk so the CDC's
+    // 12.5MHz clock-enable domain cannot miss it.
+    output reg        cdc_dec_tick,
+
     // CDDA feed: audio-track sectors go to the CD DAC on the same data
     // bus, paced by its FIFO backpressure
     output reg        cdc_cdda_wr,
@@ -56,24 +93,11 @@ module megacd_cdd_drive
     input      [6:0]  track_count,
     // 1 = the host is preparing a new image (a .cue was picked; its bins are
     // still being sized). Presented to the BIOS as an open tray for the whole
-    // load, then closed once it drops -- the drive is visibly busy with a disc
-    // instead of reporting NO DISC. This is a LEVEL, not a latched request, so
-    // an MCD reset pulse mid-load cannot strand us: the drive comes up STOP and
-    // re-enters the tray-open state on the next tick while it is still high.
+    // load, then closed once it drops.
     input             disc_loading,
-    // CD access time, mirroring GPGX's config.cd_latency user option:
-    //   0 = accurate (default): 11-frame spin-up base + distance term
-    //   1 = fast:               2-frame base, no distance term
-    // FMV streaming seeks per chunk, and at 13.3ms/frame the accurate base is
-    // 146ms of frozen head per seek, which is what an FMV stutter looks like on
-    // the overlay. Upstream exposes this as an option rather than a change
-    // because some titles NEED the delay -- GPGX notes the Wolf Team FMV games
-    // want >=12 interrupts or they hang -- so the default must stay accurate.
-    //
-    // Status after the delivery-rate fix: FMV is stutter-free on ACCURATE on
-    // hardware, so this is a fallback rather than something to reach for. The
-    // stutter was never really the seek base; it was the backward resyncs the
-    // over-delivery provoked, and each resync merely paid that base.
+    // GPGX config.cd_latency: 0 selects base 12 + distance term (accurate),
+    // 1 selects base 2, no distance term (fast). Note cd_fast_seek=1 maps to
+    // upstream cd_latency=0.
     input             cd_fast_seek,
     output reg [6:0]  toc_addr,
     input      [65:0] toc_q,
@@ -84,56 +108,61 @@ module megacd_cdd_drive
     // hardware-overlay debug: {status, fetch_st, dlv_st, head[7:0]}
     output wire [31:0] dbg_state,
     output wire        dbg_sector_done,
-    // audio-path diagnostics: {cmd_cnt[8], seek_cnt[8], backseek_cnt[8],
-    // last command c0[4], drv_status[4]}. backseek_cnt = SEEKs whose target is
-    // BEHIND the current head (a resync-seek = an audible CDDA replay).
-    output wire [31:0] dbg_cmds
+    // audio-path diagnostics, one hex digit each:
+    //   [31:28] last STATE-CHANGING command c0 (IDLE/REQUEST polls excluded),
+    //           or E if playback ran into the lead-out (no command behind it)
+    //   [27:24] time spent in PAUSE SO FAR, live, in units of 8 beats
+    //           (~107ms), saturating at F (>= 1.6s), 0 whenever not paused
+    //   [23:16] seek_cnt      -- SEEK+PLAY / SEEK+PAUSE commands
+    //   [15:8]  backseek_cnt  -- of those, targets BEHIND the head
+    //   [7:4]   last command c0, polls included
+    //   [3:0]   drv_status (internal GPGX status; 2/SEEK never appears here)
+    output wire [31:0] dbg_cmds,
+    // position/reporting diagnostics:
+    //   [31:28] n1 (RS1) -- the live report type (F = busy/seeking)
+    //   [27]    cur_audio    [26] in_pregap
+    //   [25:20] cur_track
+    //   [19:0]  target LBA of the last SEEK+PLAY / SEEK+PAUSE
+    output wire [31:0] dbg_pos,
+    // sector-integrity diagnostics:
+    //   [31:24] data sectors delivered whose 12-byte MODE1 sync was WRONG
+    //   [23:4]  LBA of the first such sector
+    //   [3]     cur_audio      [2] in_pregap
+    output wire [31:0] dbg_integ
 );
 
+// GPGX cdd.h status values (CD_SEEK is report-only, never stored)
 localparam [3:0] STAT_STOP    = 4'h0;
 localparam [3:0] STAT_PLAY    = 4'h1;
 localparam [3:0] STAT_SEEK    = 4'h2;
+localparam [3:0] STAT_SCAN    = 4'h3;
 localparam [3:0] STAT_PAUSE   = 4'h4;
 localparam [3:0] STAT_OPEN    = 4'h5;
 localparam [3:0] STAT_TOC     = 4'h9;   // TOC read done = "disc ready"
 localparam [3:0] STAT_NO_DISC = 4'hB;
+localparam [3:0] STAT_END     = 4'hC;   // lead-out reached (GPGX CD_END)
 
+// ONE tick. GPGX runs cdd_update at exactly 75Hz on the same event that
+// raises INT4, and the whole protocol above assumes that single phase; the
+// old ms_tick/owe_inc phase-sweep machinery existed to patch protocol
+// deficiencies (stale position reports, no decoder feed during latency)
+// that the port removes at the source. If boot regresses on hardware, debug
+// it in the co-sim -- it boots the sub now -- instead of re-growing sweeps.
 localparam [25:0] BEAT = 26'd715909;      // 13.3ms @ 53.693175MHz
-// Drive tick: seek countdown, insertion dance, no-disc drain, and the raw
-// delivery beat (rate-limited to one per frame -- see owe_inc).
-//
-// 698010 cycles = 76.92Hz. DO NOT "correct" this to 715909 (true 75Hz): that
-// gives ms_tick a period of 715910, IDENTICAL to wdog's, so the two stop
-// drifting and the delivery beat freezes at a fixed offset from the status
-// frame. Hardware result: BIOS hangs at CHECKING DISC. Being 2.56% fast is
-// what keeps the phase sweeping, and the sweep is load-bearing.
-//
-// The over-delivery that rate implies (+1.92 sectors/sec) is real and was the
-// FMV stutter -- a streaming game overruns its read-ahead and resyncs with a
-// backward seek every ~2.1s, each resync paying the seek latency. It is fixed
-// at owe_inc by taking only the first ms_tick event per frame, which gives
-// exactly 75Hz without freezing the phase.
-//
-// Attempts that failed, so they are not retried:
-//   - TICK_13MS = 715909              -> CHECKING DISC hang (phase freeze)
-//   - dedicated 20-bit DLV_TICK       -> FAILED TIMING (97% ALM)
-//   - wdog beat + held-beat register  -> FAILED TIMING
-//   - wdog beat, sampled at BEAT/2    -> boots and fixes FMV, but the fixed
-//     phase starves a frame-synchronised loader: Lunar Eternal Blue took 3-4
-//     minutes to reach its intro FMV
-//
-// A BIOS-audio slowdown once reported against the 715909 build was NOT this
-// tick: it was interact.json's HiFi PCM default (0) disagreeing with
-// cs_hifi_pcm_enable's reset value (1), exposed when a menu reorder moved that
-// entry inside the display cutoff. With no disc, disc_present is false and
-// owe_inc never fires; the sub's 75Hz INT2 comes from wdog/BEAT.
-localparam [19:0] TICK_13MS = 20'd698010;
 
 wire disc_present = (img_size >= 32'd2352);
 wire [31:0] leadout_lba = img_lba;        // computed at mount
 
-reg  [3:0] drv_status /*verilator public_flat_rd*/ = STAT_STOP;
-reg  [3:0] n0, n1, n2, n3, n4, n5, n6, n7, n8;
+reg  [3:0] drv_status /*verilator public_flat_rd*/ = STAT_NO_DISC; // cdd.status
+reg  [3:0] pending = 0;                   // cdd.pending (0 = none)
+reg  [7:0] latency = 0;                   // cdd.latency, in 75Hz frames
+reg [31:0] head /*verilator public_flat_rd*/ = 0;  // cdd.lba (signed)
+reg [31:0] pend_lba = 0;                  // target latched with a Play/Seek
+reg        scan_rev = 0;                  // cdd.scanOffset sign
+// GPGX: #define CD_SCAN_SPEED 30; cdd.lba += scanOffset each update
+localparam [7:0] SCAN_STEP = 8'd30;
+
+reg  [3:0] n0, n1, n2, n3, n4, n5, n6, n7, n8;   // RS0..RS8 (persistent)
 wire [3:0] csum = ~(n0 + n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8) & 4'hF;
 
 reg        door /*verilator public_flat_rd*/ = 0;
@@ -141,37 +170,25 @@ reg  [5:0] ins_cnt = 0;   // insertion tray-open pulse, in beats
 reg [25:0] wdog = 0;
 reg        send_d = 0;
 reg  [3:0] rec_cnt = 0;
-reg [19:0] ms_tick = 0;
-reg  [3:0] latency = 4'd10;
 
-// playback state
-reg [31:0] head /*verilator public_flat_rd*/ = 0;  // current LBA
-reg [31:0] seek_target = 0;
-reg  [7:0] seek_cnt = 0;      // beats remaining in seek (1 beat ~= 13.3ms)
-reg        seek_to_play = 0;  // arrive in PLAY (else PAUSE)
+// GPGX latency model: base 2 + 10*cd_latency for Play AND Seek, plus
+// |dlba|*120/270000 (== /2250) when accurate. SEEK_CAP is only an 8-bit
+// overflow guard (upstream is uncapped, bounded by disc size).
+localparam [12:0] SEEK_MULT   = 13'd7457; // 7457/2^24 ~= 1/2250
+localparam [4:0]  SEEK_RSHIFT = 5'd24;
+localparam [7:0]  SEEK_CAP    = 8'd200;
 
-// distance-proportional seek latency, matching GPGX/MiSTer cdd_t::SeekToLBA:
-//   frames = (play ? 11 : 0) + |Δlba| * 120 / 270000
-// The distance term is |Δlba|/2250; done here as *7457>>24 (7457/2^24 =
-// 1/2249.7, which reproduces MiSTer's truncated integer result to the frame
-// across the whole disc). 1 beat (frame) ~= 13.3ms (the ms_tick period below).
-// Full-disc play seek ~= 11 + 146 = 157 frames ~= 2.1s; base play ~= 0.15s.
-// MiSTer applies no cap (bounded by disc size); SEEK_CAP is only an 8-bit
-// overflow guard past that natural max.
-localparam [12:0] SEEK_MULT      = 13'd7457; // 7457/2^24 ~= 1/2250
-localparam [4:0]  SEEK_RSHIFT    = 5'd24;
-localparam [7:0]  SEEK_PLAY_BASE = 8'd11;    // +11 frames on PLAY only
-localparam [7:0]  SEEK_CAP       = 8'd200;   // overflow guard (MiSTer: uncapped)
-reg  [3:0] rs_type = 4'hF;    // latched report type (F = none/status only)
-reg  [6:0] rs_track = 1;      // track # latched with a REQUEST 5
 // instrumentation: last CDD command word + counters (sim log + hw overlay)
 reg [39:0] dbg_last_comm /*verilator public_flat_rd*/ = 0;
-reg  [7:0] dbg_cmd_cnt   /*verilator public_flat_rd*/ = 0;
 reg  [7:0] dbg_seek_cnt  /*verilator public_flat_rd*/ = 0;  // SEEK cmds
 reg  [7:0] dbg_backseek_cnt /*verilator public_flat_rd*/ = 0; // backward SEEKs
 reg  [3:0] dbg_last_c0   = 0;
-assign dbg_cmds = {dbg_cmd_cnt, dbg_seek_cnt, dbg_backseek_cnt,
+reg  [3:0] dbg_last_real_c0 /*verilator public_flat_rd*/ = 4'hF;
+reg  [6:0] dbg_pause_run /*verilator public_flat_rd*/ = 0;
+assign dbg_cmds = {dbg_last_real_c0, dbg_pause_run[6:3],
+                   dbg_seek_cnt, dbg_backseek_cnt,
                    dbg_last_c0, drv_status};
+reg [19:0] dbg_seek_lba /*verilator public_flat_rd*/ = 0;  // last SEEK target
 
 ///////////////////////////////////////////////
 // current-track tracker: linear search of the TOC whenever the head
@@ -182,7 +199,7 @@ reg  [6:0] cur_track = 1;
 reg        cur_audio /*verilator public_flat_rd*/ = 0;
 reg [19:0] cur_delta = 0;     // disc->file offset for the current track
 reg  [6:0] cur_file = 0;      // which bin holds the current track
-reg [19:0] cur_start = 0;     // current track's disc start
+reg [19:0] cur_start = 0;     // current track's disc start (INDEX 01)
 reg [19:0] pgap_lo = 20'hFFFFF, pgap_hi = 20'hFFFFF; // next track's
                               // virtual-pregap window [lo, hi)
 reg [31:0] srch_head = 32'hFFFFFFFF;
@@ -200,25 +217,14 @@ assign cd_req_file = cur_file;
 // sector is inside the NEXT track's virtual pregap: silence, not file data
 wire in_pregap = !head[31] && (head[19:0] >= pgap_lo) && (head[19:0] < pgap_hi)
                  && (head[31:20] == 12'd0);
+assign dbg_pos = {n1, cur_audio, in_pregap, cur_track[5:0], dbg_seek_lba};
+assign dbg_integ = {dbg_badsync_cnt, dbg_badsync_lba, cur_audio, in_pregap, 2'b00};
 // disc LBA -> file LBA for fetch/delivery
 wire [31:0] head_file = head - {12'd0, cur_delta};
 
-// Constant divide/modulo by 10, by reciprocal multiply.
-//
-// Every `/ 10` and `% 10` in this file is BCD digit-splitting of track
-// numbers and MSF timecode, but Quartus was inferring a full lpm_divide
-// block for each: 13 of them, ~275 ALMs, on a design sitting at 99% ALM
-// utilization. This is the same trick the seek math above already uses
-// (SEEK_MULT), just applied to the BCD conversions as well.
-//
-// (v * 205) >> 11 == v/10 exactly for v <= 1023: the error term is v/10240,
-// and the tightest case is v = 9 (mod 10), where the fractional part is 0.9,
-// so it stays below the next integer while v < 1024. Every caller here is
-// 7 or 8 bits (<= 255), so there is ample margin.
-//
-// Callers assign into 4-bit fields and therefore truncate exactly as the
-// original `/` and `%` did -- these functions return the full value and
-// deliberately do not change that behaviour.
+// Constant divide/modulo by 10, by reciprocal multiply: (v*205)>>11 == v/10
+// exactly for v <= 1023. Quartus infers a full lpm_divide per `/`/`%`
+// otherwise (~275 ALMs across this file at 99% utilization).
 function [7:0] div10;
     input [7:0] v;
     reg [15:0] p;
@@ -253,55 +259,25 @@ wire [7:0]  s_bcd_in = c4*4'd10 + c5;
 wire [7:0]  f_bcd_in = c6*4'd10 + c7;
 wire [31:0] comm_lba = m_bcd_in*32'd4500 + s_bcd_in*32'd75 + f_bcd_in - 32'd150;
 
-// seek stroke = |target - head| in sectors. Both are signed LBAs (pregap
-// sectors are small negatives), so signed subtraction keeps boot-pregap
-// parks (head~0 -> ~-2) a short hop rather than a full-stroke seek.
 // --- seek-latency pipeline -------------------------------------------------
-// This distance math is two chained multiplies (comm_lba's BCD*constants, then
-// |Δlba|*7457) plus the cap adders — as a single combinational cone from
-// cdd_comm/head into seek_cnt it was ~32ns and failed setup on the 107MHz
-// clock by ~14ns (TNS -358): the boot-corruption regression. cdd_comm and head
-// are stable for thousands of clk cycles before the cdd_send strobe or the
-// 13.3ms tick that consume the result, so these free-running stages have long
-// settled by the time a command latches seek_cnt. Same operations and
-// bit-exact values as the old single-cycle path — only pipelined off it.
-reg  [31:0] comm_lba_r   = 0;   // stage 0: BCD*const multiplies resolved
+// |pend_lba - head| * 7457 >> 24 (== GPGX |dlba|*120/270000), capped to 8
+// bits. As a single combinational cone this failed setup on the 107MHz clock
+// (TNS -358, the boot-corruption regression), so it free-runs in stages;
+// both inputs are stable thousands of clk before the tick that consumes the
+// result. Distance is measured from the LIVE head, exactly like upstream
+// measuring from cdd.lba at apply time: after the first apply parks the head
+// on the target, a re-issued identical seek measures |dlba| = 0 and adds
+// nothing (the old compounding-latency bug cannot exist in this shape).
+reg  [31:0] pend_lba_r   = 0;
 reg  [31:0] head_r       = 0;
-reg  [31:0] seek_dist_r  = 0;   // stage 1: |target - head|
-reg  [31:0] seek_dterm_r = 0;   // stage 2: distance term (the *7457 multiply)
-reg   [7:0] play_beats_r  = 0;  // stage 3: distance term + PLAY base, capped
-reg   [7:0] pause_beats_r = 0;  // stage 3: distance term (PAUSE), capped
-
-wire signed [31:0] seek_diff = $signed(comm_lba_r) - $signed(head_r);
+reg  [31:0] seek_dist_r  = 0;
+reg  [31:0] seek_dterm_r = 0;
+reg   [7:0] dterm_cap_r  = 0;
+wire signed [31:0] seek_diff = $signed(pend_lba_r) - $signed(head_r);
 wire [31:0] seek_dist   = seek_diff[31] ? (~seek_diff + 32'd1) : seek_diff;
-// distance term = |Δlba| * 7457 >> 24  (== MiSTer's |Δlba|/2250)
 wire [44:0] seek_scaled = seek_dist_r * SEEK_MULT;
 wire [31:0] seek_dterm  = seek_scaled >> SEEK_RSHIFT;
-// SEEK+PLAY carries the +11 base; SEEK+PAUSE has none (MiSTer play flag).
-//
-// The base is charged only when no seek is already pending, matching GPGX:
-//
-//     if (!cdd.latency) cdd.latency = 2 + 10*config.cd_latency;
-//     cdd.latency += ((|dlba| * 120 * config.cd_latency) / 270000);
-//
-// Assigning it unconditionally meant a PLAY re-issued mid-seek restarted the
-// whole 11-frame (146ms) base, so a host that re-commands while the drive is
-// still seeking could hold the head frozen indefinitely -- measured at 386ms
-// vs 146ms for a seek re-issued every 2 beats (tb_drive --reseek).
-// seek_cnt IS cdd.latency, so the guard maps directly: nonzero = a seek is
-// still pending, keep its remaining count as the base; zero = charge the base.
-// Keying off drv_status instead would misfire in the window where the count
-// has hit 0 but the status has not yet flipped to PLAY, handing a command
-// landing there a base of 0 and an instant seek.
-//
-// cd_fast_seek picks the upstream cd_latency=0 profile: base 2 (GPGX's
-// "2 + 10*config.cd_latency" with the option off) and no distance term.
-wire [7:0]  seek_base_cfg   = cd_fast_seek ? 8'd2 : SEEK_PLAY_BASE;
-wire [31:0] seek_dterm_eff  = cd_fast_seek ? 32'd0 : seek_dterm_r;
-wire [31:0] seek_base_r     = (seek_cnt != 8'd0) ? {24'd0, seek_cnt}
-                                                : {24'd0, seek_base_cfg};
-wire [31:0] play_beats_raw  = seek_base_r + seek_dterm_eff;
-wire [31:0] pause_beats_raw = seek_dterm_eff;
+wire  [7:0] lat_base_cfg = cd_fast_seek ? 8'd2 : 8'd12;  // 2 + 10*cd_latency
 
 task zeros; begin
     n2 <= 0; n3 <= 0; n4 <= 0; n5 <= 0; n6 <= 0; n7 <= 0; n8 <= 0;
@@ -451,34 +427,31 @@ end
 // spikes during continuous CDDA (delivery still meters to the DAC at 1x; the
 // bank just buffers ahead). Deep look-ahead (k>=2) is confined to clean
 // mid-track streaming so every banked sector shares the current cur_delta.
+//
+// GPGX-port note: because the head parks on the target the moment a seek is
+// applied, this engine starts prefetching the TARGET during the seek latency
+// -- the read-ahead a real drive's own buffer does -- so when PLAY delivery
+// begins the bank is already warm.
 ///////////////////////////////////////////////
-// buf_lba is the FILE LBA held in each slot. A CD never reaches 2^20 sectors,
-// so 21 bits fully distinguish sectors -- narrower than the 32-bit head lets
-// the 4 "is it banked?" comparators cost far fewer ALMs (this design fits at
-// ~98% util, so the prefetch scan is kept lean).
+// buf_lba is the FILE LBA held in each slot (21 bits: a CD never reaches
+// 2^20 sectors, and narrow comparators matter at ~98% ALM).
 reg [20:0] buf_lba [0:3];
 reg  [3:0] buf_valid = 0;
+reg  [6:0] buf_file = 0;   // which bin the bank currently holds (see below)
 reg  [1:0] cdack_s = 0;
 reg  [1:0] fetch_st = 0;
 reg [31:0] fetch_lba;
 // cur_track/cur_delta/cur_file describe srch_head, which is NOT necessarily
-// the current head: the track search takes ~6 clk to walk the TOC, so right
-// after a seek they still describe wherever the head used to be. Fetching in
-// that window computes head_file from a stale cur_delta and tags it with a
-// stale cur_file, so the drive asks the host for the wrong offset in the wrong
-// bin. The bad sector is never delivered (its buf_lba cannot match once the
-// search corrects, since two tracks only share a delta when they share a file)
-// but it costs a wasted round-trip plus a reopen away and back on every
-// track-crossing seek -- the multi-bin startup hitch.
-//
-// With no cue there is a single track and the registers are always valid;
-// srch_head is never updated in that branch, so it must be excluded or the
-// drive would never fetch at all.
+// the current head: the track search takes ~6 clk to walk the TOC. Fetching
+// in that window would use a stale delta/file. With no cue there is a single
+// track and the registers are always valid.
 wire       toc_settled = (track_count == 7'd0) ||
                          ((srch_st == 3'd0) && (srch_head == head));
+// every state except the trays wants the bank warm: PLAY consumes it, and
+// all other states re-deliver the sector under the head each tick
 wire       fetch_wanted = disc_present && toc_settled &&
-                          (drv_status == STAT_PLAY || drv_status == STAT_SEEK ||
-                           drv_status == STAT_PAUSE || drv_status == STAT_TOC);
+                          (drv_status != STAT_OPEN) &&
+                          (drv_status != STAT_NO_DISC);
 // LBAs are signed: seeks into the track-1 pregap (down to -150) are part
 // of the BIOS boot flow. Negative and virtual-pregap sectors are never
 // fetched from the file; all real fetches use FILE LBAs (disc - delta).
@@ -486,8 +459,8 @@ wire [31:0] hf0 = head_file;
 wire [31:0] hf1 = head_file + 32'd1;
 wire [31:0] hf2 = head_file + 32'd2;
 wire [31:0] hf3 = head_file + 32'd3;
-wire       want_head = !head[31] && !in_pregap &&
-                       !(buf_valid[hf0[1:0]] && buf_lba[hf0[1:0]] == hf0[20:0]);
+wire       head_banked = buf_valid[hf0[1:0]] && buf_lba[hf0[1:0]] == hf0[20:0];
+wire       want_head = !head[31] && !in_pregap && !head_banked;
 wire       want_next = !hf1[31] && !in_pregap &&
                        !(buf_valid[hf1[1:0]] && buf_lba[hf1[1:0]] == hf1[20:0]);
 // deep look-ahead only when head is positive, not in a pregap window, and the
@@ -508,50 +481,65 @@ always @(posedge clk) begin
         cd_req <= 0;
         fetch_st <= 0;
         buf_valid <= 0;
-    end else case (fetch_st)
-    2'd0: if (fetch_wanted && any_want) begin
-        fetch_lba <= fetch_pick;
-        fetch_st  <= 2'd1;
+        buf_file <= 0;
+    end else begin
+        case (fetch_st)
+        2'd0: if (fetch_wanted && any_want) begin
+            fetch_lba <= fetch_pick;
+            fetch_st  <= 2'd1;
+        end
+        2'd1: begin
+            // offset = lba * 2352 (2048 + 256 + 32 + 16)
+            cd_req_offset <= (fetch_lba << 11) + (fetch_lba << 8) +
+                             (fetch_lba << 5)  + (fetch_lba << 4);
+            cd_req_slot   <= fetch_lba[1:0];
+            buf_valid[fetch_lba[1:0]] <= 0;
+            cd_req <= 1;
+            fetch_st <= 2'd2;
+        end
+        2'd2: if (cdack_s[1]) begin
+            cd_req <= 0;
+            buf_lba[fetch_lba[1:0]]   <= fetch_lba[20:0];
+            buf_valid[fetch_lba[1:0]] <= 1;
+            fetch_st <= 2'd3;
+        end
+        2'd3: if (!cdack_s[1]) fetch_st <= 2'd0;
+        endcase
+        // BANK IS TAGGED BY FILE LBA ONLY, so it must be dropped whenever the
+        // current bin changes: every bin of a multi-bin cue restarts at file
+        // LBA 0, so slot tags collide across files and a stale entry from one
+        // bin reads as a hit for another -- silent wrong-bin data (2 sectors
+        // in 5 in the tb_drive --binswap repro).
+        if (cur_file != buf_file) begin
+            buf_file  <= cur_file;
+            buf_valid <= 0;
+        end
     end
-    2'd1: begin
-        // offset = lba * 2352 (2048 + 256 + 32 + 16)
-        cd_req_offset <= (fetch_lba << 11) + (fetch_lba << 8) +
-                         (fetch_lba << 5)  + (fetch_lba << 4);
-        cd_req_slot   <= fetch_lba[1:0];
-        buf_valid[fetch_lba[1:0]] <= 0;
-        cd_req <= 1;
-        fetch_st <= 2'd2;
-    end
-    2'd2: if (cdack_s[1]) begin
-        cd_req <= 0;
-        buf_lba[fetch_lba[1:0]]   <= fetch_lba[20:0];
-        buf_valid[fetch_lba[1:0]] <= 1;
-        fetch_st <= 2'd3;
-    end
-    2'd3: if (!cdack_s[1]) fetch_st <= 2'd0;
-    endcase
 end
 
 ///////////////////////////////////////////////
-// sector delivery: on each beat while PLAY, stream 1176 words to the CDC
-// (16 clks per word: 8 high, 8 low = ~350us per sector)
+// sector delivery: stream 1176 words to the CDC (16 clks per word: 8 high,
+// 8 low = ~350us per sector) or to the CDDA DAC (FIFO-paced, ~13ms).
+// dlv_hold marks a re-delivery of the sector under a parked head (latency /
+// pause / any non-PLAY state): it feeds the decoder but must not advance.
 ///////////////////////////////////////////////
 reg  [1:0] dlv_st = 0;
 reg [10:0] dlv_w;       // word index 0..1175
 reg  [3:0] dlv_ph;
 reg  [1:0] dlv_slot;    // bank slot (file_lba[1:0]) latched at delivery start
 reg        dlv_neg;     // pregap sector: synthesize sync+header, zero payload
-// sectors owed to the delivery FSM: +1 per PLAY beat, -1 per delivered
-// sector (saturating). A COUNTER, not a level flag: the old dlv_kick level
-// was raised on the beat and lowered on completion in the same always-block,
-// so a beat landing on the same clock as a completion was silently dropped.
-// During CDDA the FIFO backpressure stretches each sector's delivery to
-// nearly a full beat, so completion sat right on the next beat boundary and
-// that collision recurred every few beats -> dropped sectors -> FIFO
-// underrun -> audible skips. The counter never loses a beat and lets the
-// engine burst-catch-up after a stall (the CDDA FIFO / CDC ring absorb it).
+// sectors owed to the delivery FSM: +1 per PLAY tick, -1 per delivered
+// sector. A COUNTER, not a level flag, so a tick landing on the same clock
+// as a completion is never lost, and CDDA backpressure stalls can burst-
+// catch-up afterwards. Hold ticks never stack (one re-delivery at a time).
 reg  [3:0] dlv_owed = 0;
+reg        dlv_hold_req = 0;   // this tick's owed delivery is a hold
+reg        dlv_hold;           // latched per delivery
 reg        dlv_advance /*verilator public_flat_rd*/ = 0;
+// seek-apply generation stamp: a delivery that started before a pending seek
+// was applied must not advance the freshly parked head when it completes
+reg        apply_tog = 0;
+reg        dlv_stamp;
 // pregap header MSF digits (valid for head in -150..-1): abs = head+150
 wire [7:0] pre_v   = head[7:0] + 8'd150;
 wire       pre_s   = (pre_v >= 8'd75);
@@ -569,6 +557,10 @@ always @* begin
     default: dlv_synth = 16'h0000;
     endcase
 end
+reg dlv_badsync;             // this sector failed the sync check
+reg  [7:0] dbg_badsync_cnt /*verilator public_flat_rd*/ = 0;  // saturating
+reg [19:0] dbg_badsync_lba /*verilator public_flat_rd*/ = 0;  // first bad one
+reg        dbg_badsync_seen = 0;
 reg dlv_aud;    // audio sector: route to the CDDA DAC, pace on its FIFO
 reg dlv_pgap;   // virtual-pregap sector: deliver silence
 always @(posedge clk) begin
@@ -577,6 +569,9 @@ always @(posedge clk) begin
         dlv_st <= 0;
         cdc_dat_wr <= 0;
         cdc_cdda_wr <= 0;
+        dlv_badsync <= 0;
+        dbg_badsync_cnt <= 0;
+        dbg_badsync_seen <= 0;
     end else case (dlv_st)
     2'd0: if (dlv_owed != 0 && (head[31] || !want_head)) begin
         dlv_w  <= 0;
@@ -584,6 +579,9 @@ always @(posedge clk) begin
         dlv_neg  <= head[31];
         dlv_pgap <= in_pregap && !head[31];   // virtual pregap: silence
         dlv_aud  <= (cur_audio || in_pregap) && !head[31];
+        dlv_hold <= dlv_hold_req;
+        dlv_stamp <= apply_tog;
+        dlv_badsync <= 0;
         dlv_st <= 2'd1;
     end
     2'd1: begin // present address, wait RAM latency
@@ -602,11 +600,26 @@ always @(posedge clk) begin
             if (dlv_ph == 2) begin
                 if (dlv_aud) cdc_cdda_wr <= 1;
                 else         cdc_dat_wr <= 1;
+                // SYNC CHECK (instrumentation): every MODE1/2352 sector opens
+                // with 00 FF*10 00 == dlv_synth words 0..5. A mismatch means
+                // this is not a data sector at all (wrong bin / wrong offset /
+                // audio routed down the data path).
+                if (!dlv_aud && !dlv_pgap && !dlv_neg && dlv_w <= 11'd5
+                    && cdc_data != dlv_synth)
+                    dlv_badsync <= 1;
             end
             if (dlv_ph == 10) begin cdc_dat_wr <= 0; cdc_cdda_wr <= 0; end
             if (dlv_ph == 15) begin
                 if (dlv_w == 11'd1175) begin
                     dlv_advance <= 1;   // sector fully delivered
+                    if (dlv_badsync) begin
+                        if (dbg_badsync_cnt != 8'hFF)
+                            dbg_badsync_cnt <= dbg_badsync_cnt + 1'b1;
+                        if (!dbg_badsync_seen) begin
+                            dbg_badsync_seen <= 1;
+                            dbg_badsync_lba  <= head[19:0];
+                        end
+                    end
                     dlv_st <= 2'd3;
                 end else begin
                     dlv_w  <= dlv_w + 1'b1;
@@ -615,9 +628,8 @@ always @(posedge clk) begin
             end
         end
     end
-    // one-cycle drain: hold here while dlv_advance propagates so the report
+    // one-cycle drain: hold here while dlv_advance propagates so the main
     // block advances head and decrements dlv_owed before state 0 re-arms
-    // (else delivery could restart on the not-yet-advanced head)
     2'd3: dlv_st <= 2'd0;
     default: dlv_st <= 0;
     endcase
@@ -630,312 +642,301 @@ assign dbg_state = {drv_status, fetch_st, dlv_st,
 assign dbg_sector_done = dlv_advance;
 
 ///////////////////////////////////////////////
-// report builder: on each beat rebuild n2..n8 for the latched report
-// type, then emit the frame
+// report builder (command-triggered ONLY, per GPGX: there is no periodic
+// payload rebuild; Get-Drive-Status and REQUEST update RS1-8 when processed)
 ///////////////////////////////////////////////
+localparam [3:0] K_NONE=0, K_ABS=1, K_REL=2, K_TRK_REQ=3, K_TRK_STAT=4,
+                 K_LEADOUT=5, K_FIRSTLAST=6, K_TRKSTART=7, K_ERRINFO=8;
+reg  [3:0] rpt_kind = K_NONE;
 reg  [2:0] rpt_st = 0;
-reg        frame_go = 0;
+reg  [6:0] rpt_track = 1;     // REQUEST 5 argument
 reg        rpt_trk_audio = 0;
-
-// a delivery is owed for each beat spent in PLAY with a disc present.
-// NOTE: paced off ms_tick==TICK_13MS, which is now a true 75Hz (see the
-// localparam). Retiming this to wdog==BEAT BROKE the BIOS disc-check handshake
-// (stuck at CHECKING DISC every boot) — the boot header capture depends on the
-// delivery beat being on ms_tick, decoupled from the 75Hz status frame; that
-// is about the counter, not the rate, so correcting ms_tick's period is a
-// different change from driving delivery off wdog. The
-// FMV audio glitch is a PCM UNDERRUN (sub can't refill in time), so a slower
-// delivery would not fix it anyway; left on ms_tick to preserve boot.
-//
-// TRIED AND REJECTED (hardware): owing a sector during STAT_SEEK as well, to
-// match GPGX, which keeps the decoder running for the whole seek latency --
-//
-//     if (cdd.latency > 0) { cdd.latency--; cdc_decoder_update(0); }
-//
-// -- so the sub keeps receiving DECI at 75Hz while seeking instead of nothing
-// for the 11-frame (146ms) base. Implemented faithfully (owe_inc covering
-// SEEK, head parked on the target at command time as upstream's cdd.lba = lba,
-// head advanced only in PLAY) and verified in sim: 10 sectors decoded across an
-// 11-beat seek versus 0, all drive tests passing.
-//
-// It hangs the BIOS at CHECKING DISC on hardware. Same failure as retiming the
-// beat to wdog, and for the same reason: the boot header capture depends on
-// exactly which frames deliver, and the co-sim cannot catch it because the MCD
-// is held in reset there so drv_status never leaves STOP. Do not retry without
-// first working out what the boot handshake requires of the delivery beat.
-//
-// Note also that the FMV motivation above is weak: a PCM underrun is a
-// CPU-throughput problem, and extra DECI only helps if the sub's refill loop is
-// BLOCKED on DECI rather than short of cycles.
-// Delivery beat, on ms_tick (see TICK_13MS). Phase-independent of the status
-// frame BY CONSTRUCTION, which is the property that matters: wdog drives the
-// frame the host synchronises its PLAY/PAUSE pattern to, so a beat derived
-// from wdog sits at a fixed offset from it and a loader pausing in step with
-// the frame misses essentially EVERY beat. Lunar Eternal Blue took 3-4 minutes
-// to reach its intro FMV that way, and loads normally otherwise. A separate
-// counter, or a held-beat register to survive the sampling instant, would both
-// solve it too -- both failed timing. ms_tick already exists and already
-// drifts against wdog, so it costs nothing.
-// Delivery beat: ms_tick, rate-limited to at most ONE per status frame.
-//
-// This is the only shape that satisfies both constraints at once.
-//   RATE must be 75Hz. ms_tick alone is 76.92Hz and over-delivers by +1.92
-//   sectors/sec, which overruns a streaming game's read-ahead and makes it
-//   resync with a backward seek every ~2s -- the FMV stutter.
-//   PHASE must keep moving against the status frame. Anything phase-frozen
-//   resonates with whatever the host does on its frame interrupt: locked to
-//   wdog, Lunar Eternal Blue took 3-4 minutes to reach its intro FMV; and
-//   TICK_13MS = 715909 gives ms_tick a period of 715910 -- identical to
-//   wdog's -- which freezes it just as hard and hangs the BIOS at CHECKING
-//   DISC.
-//
-// ms_tick is faster than the frame, so every frame contains at least one of
-// its events. Taking only the first gives exactly 75Hz, while WHICH event that
-// is keeps sliding as ms_tick drifts. Costs one flag, and reuses the existing
-// wdog == BEAT comparison rather than adding another wide comparator -- which
-// matters, because at 97% ALM a dedicated counter and a held-beat register
-// both failed timing outright.
-reg  dlv_done = 0;                 // already delivered in this frame
-wire owe_inc = (ms_tick == TICK_13MS) && !dlv_done
-               && (drv_status == STAT_PLAY) && disc_present;
-always @(posedge clk) begin
-    if (reset | ~mcd_rst_n) dlv_done <= 0;
-    else if (wdog == BEAT)  dlv_done <= 0;    // new frame, re-arm
-    else if (owe_inc)       dlv_done <= 1;
-end
 // REQUEST 5 track number from the command's c4/c5 BCD digits
 wire [6:0] req_track = {3'd0,c4}*7'd10 + {3'd0,c5};
 
+// the decoder-feed decision for this tick (combinational at the tick):
+// stream the sector under the head down the data path when it is a real,
+// banked data sector; otherwise pulse the CDC null tick. PLAY audio streams
+// to the DAC and null-ticks the CDC, per upstream's "audio blocks are still
+// sent to CDC as well".
+wire tick_data_ok = disc_present && toc_settled && !head[31] && !in_pregap &&
+                    !cur_audio && head_banked;
+reg  [3:0] dec_tick_hold = 0;   // 8-clk stretcher for cdc_dec_tick
+
 always @(posedge clk) begin
     if (reset | ~mcd_rst_n) begin
-        // Come up disc-ready (TOC) if a disc is present. A real CDD keeps its
-        // disc knowledge across sub-CPU/MCD resets; the BIOS pulses the MCD
-        // reset during boot, and resetting the drive to STOP left it stuck
-        // (STOP+disc has no path to TOC) -> CHECKING DISC forever. TOC is the
-        // "disc ready" state the BIOS idle screen polls for.
-        //
-        // Do NOT replace this with a timed transition (e.g. NO_DISC -> OPEN
-        // -> TOC) to give the BIOS an edge to observe: that was tried and is
-        // strictly worse. The BIOS pulses this reset repeatedly, so a ~0.5s
-        // dance never completes -- the drive just oscillates NO_DISC(B) <->
-        // OPEN(5) forever and never reaches disc-ready. Landing directly in
-        // TOC is what makes the state survive the pulsing.
-        // Always come up STOP(0), even with a disc present.
-        //
-        // dc3e80be made this report TOC(9) when a disc was present, to fix a
-        // CHECKING DISC hang, on the premise that "STOP+disc has no path to
-        // TOC". That premise is wrong -- the REQUEST handler below promotes
-        // STOP to TOC on the first report request (megacdd.cpp semantics) --
-        // and reporting 9 here is what hung the BIOS whenever a disc was
-        // already mounted at reset.
-        //
-        // Co-sim located it exactly. The sub-BIOS dispatches on the drive
-        // status nibble through a jump table:
-        //     0F60  MOVE.B $5844(A5),D0     ; drive status
-        //     0F68  ANDI.W #$000F,D0
-        //     0F6C  ADD.W D0,D0 (x2)        ; *4
-        //     0F70  JMP $02(PC,D0.W)
-        //     0F74  BRA $0FDC               ; index 0 = STOP  -> boots
-        //     ...
-        //     0F98  BRA $1048               ; index 9 = TOC   -> never completes
-        // Coming up 9 selects the $1048 handler, which at boot never reaches
-        // the code that writes CFS; the main CPU then waits on $A1200E
-        // forever and pulses the MCD reset in a loop. Coming up 0 selects
-        // $0FDC, the same path a discless boot takes, and the drive then
-        // reaches TOC by itself: verified in co-sim going 0 -> 9 -> 2 -> 4
-        // -> 1 (STOP, TOC, SEEK, PAUSE, PLAY) with the sub-CPU writing CFS
-        // normally.
-        //
-        // Do NOT "fix" this by reporting a timed NO_DISC -> OPEN -> TOC
-        // transition instead: that was tried and is strictly worse, because
-        // the BIOS pulses the MCD reset repeatedly and the ~0.5s tray dance
-        // never survives to completion.
-        drv_status <= STAT_STOP;
-        n0 <= STAT_STOP; n1 <= 0;
+        // GPGX cdd_reset(): lba = 0, latency = 0, pending = 0, and the
+        // INTERNAL status is TOC with a disc / NO_DISC without one. What the
+        // host SEES at reset is the zeroed status register file (upstream
+        // memsets scd.regs), i.e. it reads STOP until its first command gets
+        // answered -- coming up 9 internally is safe precisely because it is
+        // not REPORTED unsolicited. (Reporting 9 at reset is the historic
+        // BIOS boot hang; see git history for the jump-table disasm.)
+        drv_status <= disc_present ? STAT_TOC : STAT_NO_DISC;
+        pending  <= 0;
+        latency  <= 0;
+        head     <= 0;
+        pend_lba <= 0;
+        scan_rev <= 0;
+        n0 <= 0; n1 <= 0;
         n2 <= 0; n3 <= 0; n4 <= 0; n5 <= 0; n6 <= 0; n7 <= 0; n8 <= 0;
         cdd_stat <= {4'hF, 36'h0};
-        cdd_dm   <= 0;
+        // GPGX memsets the reg file at reset, so the audio flag comes up 0
+        // ("audio playing"), odd as that reads; the old proven boot path
+        // also reset it to 0. First PLAY/command tick sets it properly.
+        cdd_dm   <= 1'b0;
         cdd_rec  <= 0;
+        cdc_dec_tick <= 0;
+        dec_tick_hold <= 0;
         wdog     <= 0;
         rec_cnt  <= 0;
         send_d   <= 0;
-        ms_tick  <= 0;
-        latency  <= 4'd10;
         door     <= 0;
-        head     <= 0;
-        seek_cnt <= 0;
-        comm_lba_r <= 0; head_r <= 0; seek_dist_r <= 0; seek_dterm_r <= 0;
-        play_beats_r <= 0; pause_beats_r <= 0;
-        rs_type  <= 4'hF;
-        rs_track <= 7'd1;
+        ins_cnt  <= 0;
+        apply_tog <= 0;
+        dlv_hold_req <= 0;
+        pend_lba_r <= 0; head_r <= 0; seek_dist_r <= 0; seek_dterm_r <= 0;
+        dterm_cap_r <= 0;
+        rpt_kind <= K_NONE;
         rpt_st   <= 0;
+        rpt_track <= 7'd1;
         rpt_toc_use <= 0;
-        frame_go <= 0;
         msf_start <= 0;
         dlv_owed <= 0;
-    end else begin
+    end else begin : main
+        // effective latency after this tick's decrement, GPGX sequential
+        // semantics (the pending block sees the already-decremented value)
+        reg [7:0] lat_after;
+        reg       tick_streamed;   // a data sector was queued this tick
+
         send_d <= cdd_send;
         wdog   <= wdog + 1'b1;
         msf_start <= 0;
 
-        // seek-latency pipeline advance (free-running; see the wire block
-        // above). Inputs are stable long before a command reads the result.
-        comm_lba_r   <= comm_lba;
+        // seek-latency pipeline advance (free-running; see the wire block)
+        pend_lba_r   <= pend_lba;
         head_r       <= head;
         seek_dist_r  <= seek_dist;
         seek_dterm_r <= seek_dterm;
-        play_beats_r  <= (play_beats_raw  > {24'd0, SEEK_CAP})
-                         ? SEEK_CAP : play_beats_raw[7:0];
-        pause_beats_r <= (pause_beats_raw > {24'd0, SEEK_CAP})
-                         ? SEEK_CAP : pause_beats_raw[7:0];
+        dterm_cap_r  <= (seek_dterm_r > {24'd0, SEEK_CAP})
+                        ? SEEK_CAP : seek_dterm_r[7:0];
 
-        // sectors owed to the delivery FSM. Increment and decrement are
-        // combined into ONE assignment so a beat that lands on the same clock
-        // as a completion is not lost (the bug the old dlv_kick level had).
+        // null-tick stretcher
+        if (dec_tick_hold != 0) begin
+            dec_tick_hold <= dec_tick_hold - 1'b1;
+            cdc_dec_tick  <= 1;
+        end else cdc_dec_tick <= 0;
+
+        // sectors owed to the delivery FSM (single assignment so a tick and
+        // a completion on the same clock cannot cancel each other out)
         dlv_owed <= dlv_owed
-                  + ((owe_inc && dlv_owed != 4'hF) ? 4'd1 : 4'd0)
+                  + (((wdog == BEAT) && owe_this_tick && dlv_owed != 4'hF) ? 4'd1 : 4'd0)
                   - ((dlv_advance && dlv_owed != 4'd0) ? 4'd1 : 4'd0);
 
-        // 13.3ms state tick
-        if (ms_tick == TICK_13MS) begin
-            ms_tick <= 0;
-            if (drv_status == STAT_STOP && !disc_present) begin
-                // no-disc drain, proven-clean boot path
-                if (latency != 0) latency <= latency - 1'b1;
-                else drv_status <= door ? STAT_OPEN : STAT_NO_DISC;
+        // sector delivered: advance the head. Only PLAY deliveries advance
+        // (dlv_hold marks re-deliveries), and never across a seek apply.
+        if (dlv_advance && !dlv_hold && dlv_stamp == apply_tog &&
+            drv_status == STAT_PLAY && !(|latency)) begin
+            head <= head + 1'b1;
+        end
+
+        ///////////////////////////////////////////////////////////////////
+        // THE 75Hz TICK -- a line-by-line port of GPGX cdd_update()
+        ///////////////////////////////////////////////////////////////////
+        if (wdog == BEAT) begin : tick
+            lat_after = latency;
+            tick_streamed = 0;
+            dlv_hold_req <= 0;
+
+            if (latency != 0) begin
+                // drive latency: count down, decoder keeps running
+                // ("fixes MCD-verificator CDC Init")
+                lat_after = latency - 1'b1;
+                if (tick_data_ok) begin
+                    dlv_hold_req <= 1; tick_streamed = 1;
+                end
+            end else if (drv_status == STAT_PLAY) begin
+                if (!head[31] && head >= leadout_lba) begin
+                    // end of disc detection
+                    drv_status <= STAT_END;
+                    dbg_last_real_c0 <= 4'hE;   // no command behind this one
+                end else begin
+                    // deliver the sector at lba and advance (advance happens
+                    // at stream completion, see dlv_advance above)
+                    tick_streamed = 1;   // queue below whether data or CDDA
+                    // GPGX audio-flag semantics: 0x36 goes low only once an
+                    // audio track is past its INDEX 01; the inter-track gap
+                    // and all data sectors report "no audio playing"
+                    if (cur_audio && !in_pregap && !head[31] &&
+                        (head[31:20] == 12'd0) && (head[19:0] >= cur_start))
+                         cdd_dm <= 1'b0;
+                    else cdd_dm <= 1'b1;
+                end
+            end else begin
+                // decoder still running while the disc is not being read
+                // ("fixes MCD-verificator CDC Flags Test #30")
+                if (tick_data_ok) begin
+                    dlv_hold_req <= 1; tick_streamed = 1;
+                end
+                // scanning disc
+                if (drv_status == STAT_SCAN && disc_present) begin
+                    if (!scan_rev) begin
+                        if (head + {24'd0, SCAN_STEP} >= leadout_lba) begin
+                            head <= leadout_lba;      // end of disc
+                            drv_status <= STAT_END;
+                            cdd_dm     <= 1'b1;
+                        end else head <= head + {24'd0, SCAN_STEP};
+                    end else begin
+                        if ($signed(head) <= $signed({24'd0, SCAN_STEP})) begin
+                            head <= 0;                // start of first track
+                        end else head <= head - {24'd0, SCAN_STEP};
+                    end
+                    // (GPGX skips inter-track gaps to the next INDEX 01; we
+                    // walk them linearly at the same 30/tick -- documented)
+                    cdd_dm <= !(cur_audio && !in_pregap && !head[31] &&
+                                (head[31:20] == 12'd0) &&
+                                (head[19:0] >= cur_start));
+                end
             end
-            // MEDIA GONE. img_size drops to 0 whenever the mount FSM starts
-            // over -- including when the user picks a different .cue -- and
-            // stays 0 until the new TOC is final. Only the drain above
-            // noticed, and it only looks at STOP, so after a swap the drive
-            // sat in TOC(9) holding the OLD disc: the BIOS never saw the disc
-            // leave, and the insertion dance below (which fires only from
-            // NO_DISC) never ran for the new image. Fall back to STOP from any
-            // state that implies media so the drain retires us to NO_DISC and
-            // the normal insertion path runs again. Skipped while door=1: an
-            // explicit OPEN TRAY is the host's own doing, not an eject.
+
+            // check if a seek/play command is pending (LAST, sequentially
+            // after the latency decrement, exactly like upstream)
+            if (pending != 0) begin
+                // if (!cdd.latency) cdd.latency = 2 + 10*config.cd_latency;
+                // cdd.latency += |dlba| * 120 / 270000  (accurate only)
+                if (lat_after == 0) begin
+                    lat_after = lat_base_cfg;
+                end
+                if (!cd_fast_seek) begin
+                    lat_after = ({1'b0, lat_after} + {1'b0, dterm_cap_r} >
+                                 {1'b0, SEEK_CAP})
+                                ? SEEK_CAP : lat_after + dterm_cap_r;
+                end
+                head       <= pend_lba;    // cdd.lba = lba (park on target)
+                apply_tog  <= ~apply_tog;  // cancel in-flight head advances
+                cdd_dm     <= 1'b1;        // no audio track playing (yet)
+                drv_status <= pending;     // status = pending end status
+                pending    <= 0;
+            end
+            latency <= lat_after;
+
+            // decoder feed for this tick: anything that did not queue a data
+            // stream gets the CDC null tick (audio, pregap, bank miss, no
+            // disc with DECEN armed -- the CDC gates on DECEN internally)
+            if (!tick_streamed || (drv_status == STAT_PLAY && latency == 0 &&
+                                   pending == 0 && (cur_audio || in_pregap)))
+                dec_tick_hold <= 4'd8;
+
+            // ---- host-integration housekeeping (no upstream equivalent) --
+            // MEDIA GONE: img_size drops to 0 whenever the mount FSM starts
+            // over (including a new .cue pick) and stays 0 until the new TOC
+            // is final. Retire to NO_DISC so the insertion dance below runs
+            // for the new image. Skipped while door=1 (host commanded).
             if (!disc_present && !door && !disc_loading &&
-                drv_status != STAT_NO_DISC && drv_status != STAT_STOP) begin
-                drv_status <= STAT_STOP;
-                latency    <= 4'd0;   // drain to NO_DISC on the next tick
-                ins_cnt    <= 0;      // cancel an insertion dance in flight
+                drv_status != STAT_NO_DISC) begin
+                drv_status <= STAT_NO_DISC;
+                ins_cnt    <= 0;
             end
-            // disc inserted mid-session (drive was NO_DISC): emulate a real
-            // insertion — tray OPEN ~0.5s then closed-with-media, landing in
-            // TOC(9). (Present-at-boot and post-MCD-reset are handled by the
-            // reset block bringing the drive up disc-ready, see above -- this
-            // path is too slow to survive the BIOS's reset pulsing.)
+            // disc inserted mid-session: tray OPEN ~0.5s then closed-with-
+            // media, landing in TOC(9). (Present-at-boot / post-MCD-reset are
+            // handled by the reset block coming up TOC directly -- this path
+            // is too slow to survive the BIOS's reset pulsing.)
             if (drv_status == STAT_NO_DISC && disc_present && !door) begin
                 drv_status <= STAT_OPEN;
                 ins_cnt <= 6'd38;
             end
             if (drv_status == STAT_OPEN && ins_cnt != 0) begin
                 ins_cnt <= ins_cnt - 1'b1;
-                // land in TOC (9), not STOP: a real drive reads the TOC by
-                // itself after a close, and the BIOS's idle screen only
-                // watches DRIVE STATUS for 9 — ending in STOP deadlocks
-                // (BIOS waits for 9, we wait for a TOC request)
+                // land in TOC(9): a real drive reads the TOC by itself after
+                // a close, and the BIOS idle screen polls for 9
                 if (ins_cnt == 6'd1) drv_status <= STAT_TOC;
             end
-            // LOADING: hold the tray open for as long as the host is preparing
-            // the image. Placed after the rules above so it wins over the drain
-            // and the dance. door is deliberately NOT set -- that reg means
-            // "the host commanded a tray state", and setting it here would
-            // block the insertion path. Status alone is what the BIOS reads.
+            // LOADING: hold the tray open while the host prepares the image
             if (disc_loading && !door) begin
                 drv_status <= STAT_OPEN;
                 ins_cnt    <= 0;
             end
-            // LOADING DONE: close the tray. With media, run the normal close
-            // dance so we land in TOC(9) exactly as a real insertion does; if
-            // the mount failed and no disc appeared, fall back to the drain.
+            // LOADING DONE: close the tray (normal dance with media; plain
+            // NO_DISC if the mount failed)
             if (!disc_loading && !door && drv_status == STAT_OPEN &&
                 ins_cnt == 0) begin
                 if (disc_present) ins_cnt <= 6'd38;
-                else begin
-                    drv_status <= STAT_STOP;
-                    latency    <= 4'd0;
-                end
+                else drv_status <= STAT_NO_DISC;
             end
-            if (drv_status == STAT_SEEK) begin
-                if (seek_cnt != 0) seek_cnt <= seek_cnt - 1'b1;
-                else begin
-                    head <= seek_target;
-                    drv_status <= seek_to_play ? STAT_PLAY : STAT_PAUSE;
-                end
-            end
-            if (drv_status == STAT_PLAY && disc_present) begin
-                cdd_dm <= ~cur_audio;           // data/music flag per track
-                // pregap sectors (negative LBA) are synthesized by the
-                // delivery FSM: the BIOS parks at 00:01:73 and watches the
-                // pregap headers roll by to arm its capture window.
-                // The beat is accounted by owe_inc -> dlv_owed above.
-            end
-        end else begin
-            ms_tick <= ms_tick + 1'b1;
+            // PAUSE dwell meter (instrumentation)
+            if (drv_status == STAT_PAUSE) begin
+                if (dbg_pause_run != 7'd127) dbg_pause_run <= dbg_pause_run + 1'b1;
+            end else dbg_pause_run <= 0;
         end
 
-        // rebuild the report payload just before each frame emit (~19us,
-        // build takes ~5us worst case), and immediately after a REQUEST so
-        // the reply frame carries the newly latched type's data
-        if (wdog == BEAT - 26'd1024) rpt_st <= 3'd1;
-
-        // sector delivered: advance the head (the consumed half is naturally
-        // refetched: after head++ the lba->half mapping asks it for head+1)
-        if (dlv_advance) begin
-            if (head != leadout_lba) head <= head + 1'b1;
-            else drv_status <= STAT_PAUSE;  // ran into leadout
-        end
-
-        // report payload builder (runs between beats, few us)
+        ///////////////////////////////////////////////////////////////////
+        // report payload builder (runs for a few us after a command)
+        ///////////////////////////////////////////////////////////////////
         case (rpt_st)
         3'd1: begin
-            n0 <= drv_status;
-            case (rs_type)
-            4'h0: begin msf_lba <= head + 32'd150; msf_start <= 1; rpt_st <= 3'd2; end
-            4'h1: begin msf_lba <= head[31] ? (~head + 1'b1)
-                                  : (head >= {12'd0, cur_start})
-                                    ? (head - {12'd0, cur_start})
-                                    : ({12'd0, cur_start} - head);
-                        msf_start <= 1; rpt_st <= 3'd2; end
-            4'h3: begin msf_lba <= leadout_lba + 32'd150; msf_start <= 1; rpt_st <= 3'd2; end
-            4'h2: begin n1 <= 4'h2; n2 <= curtrk_bcd10; n3 <= curtrk_bcd1;
-                        n4 <= 0; n5 <= 0; n6 <= 0; n7 <= 0; n8 <= 0; rpt_st <= 3'd4; end
-            4'h4: begin n1 <= 4'h4; n2 <= 0; n3 <= 1;
-                        n4 <= last_bcd10; n5 <= last_bcd1;
-                        n6 <= 0; n7 <= 0; n8 <= 0; rpt_st <= 3'd4; end
-            4'h5: begin
+            case (rpt_kind)
+            K_ABS: begin
+                msf_lba <= head + 32'd150; msf_start <= 1; rpt_st <= 3'd2;
+            end
+            K_REL: begin   // abs(lba - track start)
+                msf_lba <= head[31] ? (~head + 1'b1)
+                          : (head >= {12'd0, cur_start})
+                            ? (head - {12'd0, cur_start})
+                            : ({12'd0, cur_start} - head);
+                msf_start <= 1; rpt_st <= 3'd2;
+            end
+            K_LEADOUT: begin
+                msf_lba <= leadout_lba + 32'd150; msf_start <= 1; rpt_st <= 3'd2;
+            end
+            K_TRK_REQ: begin    // REQUEST 2: full payload
+                n2 <= curtrk_bcd10; n3 <= curtrk_bcd1;
+                n4 <= 0; n5 <= 0; n6 <= 0; n7 <= 0; n8 <= 0;
+                rpt_st <= 3'd0;
+            end
+            K_TRK_STAT: begin   // Get-Status with RS1==2: RS2-3 only (GPGX)
+                n2 <= curtrk_bcd10; n3 <= curtrk_bcd1;
+                rpt_st <= 3'd0;
+            end
+            K_FIRSTLAST: begin
+                n2 <= 0; n3 <= 1;
+                n4 <= last_bcd10; n5 <= last_bcd1;
+                n6 <= 0; n7 <= 0; n8 <= 0;
+                rpt_st <= 3'd0;
+            end
+            K_ERRINFO: begin    // REQUEST 6: no error
+                zeros;
+                rpt_st <= 3'd0;
+            end
+            K_TRKSTART: begin
                 if (track_count == 0) begin       // no cue: single data track
                     rpt_trk_audio <= 0;
                     msf_lba <= 32'd150; msf_start <= 1; rpt_st <= 3'd3;
                 end else begin                    // look the track up in the TOC
                     rpt_toc_use <= 1;
-                    rpt_toc_addr <= rs_track;
+                    rpt_toc_addr <= rpt_track;
                     rpt_st <= 3'd5;
                 end
             end
-            default: rpt_st <= 3'd4; // keep last payload
+            default: rpt_st <= 3'd0;
             endcase
         end
-        3'd2: if (msf_done) begin // MSF payload (types 0/1/3)
-            n1 <= rs_type;
+        3'd2: if (msf_done) begin // MSF payload (abs/rel/leadout)
             n2 <= msf_m10; n3 <= msf_m1;
             n4 <= msf_s10; n5 <= msf_s1;
             n6 <= msf_f10; n7 <= msf_f1;
-            // megacdd.cpp: ABSOLUTE and RELATIVE both report the current
-            // track's type<<2 in n8 (the BIOS checks it before PLAYing)
-            n8 <= (rs_type != 4'h3 && disc_present && !cur_audio) ? 4'h4 : 4'h0;
-            rpt_st <= 3'd4;
+            // RS8 block flags: bit2 = data track (GPGX: type ? 0x04 : 0x00);
+            // the lead-out report carries 0
+            n8 <= (rpt_kind != K_LEADOUT && disc_present && !cur_audio)
+                  ? 4'h4 : 4'h0;
+            rpt_st <= 3'd0;
         end
-        3'd3: if (msf_done) begin // track start (type 5): data flag in n6 bit3
-            n1 <= 4'h5;
+        3'd3: if (msf_done) begin // track start (REQUEST 5)
             n2 <= msf_m10; n3 <= msf_m1;
             n4 <= msf_s10; n5 <= msf_s1;
             n6 <= msf_f10 | (rpt_trk_audio ? 4'h0 : 4'h8); n7 <= msf_f1;
-            n8 <= mod10(rs_track);   // track number (BCD units)
-            rpt_st <= 3'd4;
+            n8 <= mod10(rpt_track);   // track number, low digit
+            rpt_st <= 3'd0;
         end
-        3'd4: begin frame_go <= 1; rpt_st <= 3'd0; end
         3'd5: rpt_st <= 3'd6;         // TOC read latency
         3'd6: begin
             rpt_trk_audio <= toc_q[65];
@@ -947,115 +948,152 @@ always @(posedge clk) begin
         default: ;
         endcase
 
-        // command handling: immediate reply nibbles per megacdd.cpp/GPGX
+        ///////////////////////////////////////////////////////////////////
+        // command handling -- a line-by-line port of GPGX cdd_process()
+        ///////////////////////////////////////////////////////////////////
         if (cdd_send & ~send_d) begin
             dbg_last_comm <= cdd_comm;      // instrumentation
-            dbg_cmd_cnt   <= dbg_cmd_cnt + 1'b1;
             dbg_last_c0   <= c0;
+            if (c0 != 4'h0 && c0 != 4'h2) dbg_last_real_c0 <= c0;
             if (c0 == 4'h3 || c0 == 4'h4) begin       // SEEK+PLAY / SEEK+PAUSE
                 dbg_seek_cnt <= dbg_seek_cnt + 1'b1;
-                // target behind the current head = a backward resync-seek,
-                // which replays audio (the CDDA "repeat" the user hears)
-                if (disc_present && !head[31] && comm_lba < head)
+                dbg_seek_lba <= comm_lba[19:0];
+                if (disc_present && !head[31] &&
+                    $signed(comm_lba) < $signed(head))
                     dbg_backseek_cnt <= dbg_backseek_cnt + 1'b1;
             end
             case (c0)
-                4'h0: begin                   // DRIVE STATUS (IDLE)
-                    n0 <= drv_status;
-                    // megacdd.cpp: while a seek/play is settling the report
-                    // type is F ("busy"); the IDLE poll near completion
-                    // flips it to a live absolute-position report — that
-                    // F->0 transition is the BIOS's seek-done signal
-                    if (rs_type == 4'hF &&
-                        (drv_status != STAT_SEEK || seek_cnt <= 8'd3)) begin
-                        rs_type <= 4'h0;
-                        rpt_st <= 3'd1;
+                4'h0: begin                   // Get Drive Status
+                    // RS0-1 unchanged until the previous command has been
+                    // processed; latency runs one frame ahead of the update
+                    if (latency <= 8'd3) begin
+                        n0 <= drv_status;
+                        // no RS1-8 update while stopped or in any status
+                        // above PAUSE (OPEN/TOC/NO_DISC/END)
+                        if (!(drv_status == STAT_STOP ||
+                              drv_status > STAT_PAUSE)) begin
+                            if (n1 == 4'hF) begin
+                                // seeking has ended: return valid infos,
+                                // absolute time by default (fixes Lunar)
+                                n1 <= 4'h0;
+                                rpt_kind <= K_ABS; rpt_st <= 3'd1;
+                            end
+                            else if (n1 == 4'h0) begin
+                                rpt_kind <= K_ABS; rpt_st <= 3'd1;
+                            end
+                            else if (n1 == 4'h1) begin
+                                rpt_kind <= K_REL; rpt_st <= 3'd1;
+                            end
+                            else if (n1 == 4'h2) begin
+                                rpt_kind <= K_TRK_STAT; rpt_st <= 3'd1;
+                            end
+                            // RS1 3..6: RS2-8 keep their last values
+                        end
                     end
                 end
-                4'h1: begin                   // STOP
-                    drv_status <= disc_present ? STAT_STOP : STAT_STOP;
-                    latency <= 4'd0;
-                    n0 <= STAT_STOP; n1 <= 0; zeros;
-                    rs_type <= 4'hF;
+                4'h1: begin                   // Stop Drive
+                    // GPGX: status = loaded ? CD_TOC : NO_DISC, reply reads
+                    // CD_STOP once with RS1=0xF; drive position resets.
+                    // (pending/latency deliberately NOT cleared -- upstream
+                    // quirk kept as-is.)
+                    drv_status <= disc_present ? STAT_TOC : STAT_NO_DISC;
+                    cdd_dm <= 1'b1;
+                    n0 <= STAT_STOP; n1 <= 4'hF; zeros;
+                    head <= 0;
+                    apply_tog <= ~apply_tog;
                 end
-                4'h2: begin                   // REQUEST report c3
+                4'h2: begin                   // Report TOC infos (type in c3)
                     if (disc_present) begin
-                        // megacdd.cpp: first TOC request while stopped moves
-                        // the drive to TOC (9) — the "disc ready" resting
-                        // state the BIOS polls for before booting
-                        if (drv_status == STAT_STOP) drv_status <= STAT_TOC;
-                        rs_type <= c3;
-                        // REQUEST 5 carries the track number in c4/c5 (BCD)
-                        if (c3 == 4'h5)
-                            rs_track <= (req_track == 0 ||
-                                         (track_count != 0 && req_track > track_count))
-                                        ? 7'd1 : req_track;
-                        n0 <= (drv_status == STAT_STOP) ? STAT_TOC : drv_status;
+                        n0 <= drv_status;
                         n1 <= c3;
-                        rpt_st <= 3'd1;       // rebuild payload now
+                        case (c3)
+                        4'h0: begin rpt_kind <= K_ABS;       rpt_st <= 3'd1; end
+                        4'h1: begin rpt_kind <= K_REL;       rpt_st <= 3'd1; end
+                        4'h2: begin rpt_kind <= K_TRK_REQ;   rpt_st <= 3'd1; end
+                        4'h3: begin rpt_kind <= K_LEADOUT;   rpt_st <= 3'd1; end
+                        4'h4: begin rpt_kind <= K_FIRSTLAST; rpt_st <= 3'd1; end
+                        4'h5: begin
+                            rpt_track <= (req_track == 0 ||
+                                          (track_count != 0 && req_track > track_count))
+                                         ? 7'd1 : req_track;
+                            rpt_kind <= K_TRKSTART; rpt_st <= 3'd1;
+                        end
+                        4'h6: begin rpt_kind <= K_ERRINFO;   rpt_st <= 3'd1; end
+                        default: ; // invalid request: regs unchanged (GPGX)
+                        endcase
                     end else begin
+                        // no-disc: zeroed payload (stub heritage; proven
+                        // boot path -- documented divergence)
                         n0 <= drv_status; n1 <= c3; zeros;
                     end
                 end
-                4'h3: begin                   // SEEK + PLAY
+                4'h3, 4'h4: begin             // Play / Seek
                     if (disc_present) begin
-                        seek_target <= comm_lba;
-                        seek_to_play <= 1;
-                        seek_cnt <= play_beats_r;
-                        drv_status <= STAT_SEEK;
-                        rs_type <= 4'hF;      // busy until an IDLE poll near done
+                        // report (CD_SEEK<<8)|0xF: RS0 shows seeking, RS1=F
+                        // invalidates track infos until the drive is ready
                         n0 <= STAT_SEEK; n1 <= 4'hF; zeros;
+                        // one-interrupt delay before seeking starts: pending
+                        // is applied by the next tick (fixes Radical Rex)
+                        pending  <= (c0 == 4'h3) ? STAT_PLAY : STAT_PAUSE;
+                        pend_lba <= comm_lba;
                     end else begin
                         n0 <= drv_status;
                     end
                 end
-                4'h4: begin                   // SEEK + PAUSE
+                4'h6: begin                   // Pause
                     if (disc_present) begin
-                        seek_target <= comm_lba;
-                        seek_to_play <= 0;
-                        seek_cnt <= pause_beats_r;
-                        drv_status <= STAT_SEEK;
-                        rs_type <= 4'hF;      // busy until an IDLE poll near done
-                        n0 <= STAT_SEEK; n1 <= 4'hF; zeros;
-                    end else begin
-                        n0 <= drv_status;
+                        drv_status <= STAT_PAUSE;
+                        cdd_dm <= 1'b1;       // no audio track playing
                     end
-                end
-                4'h6: begin                   // PAUSE
-                    if (disc_present) drv_status <= STAT_PAUSE;
                     n0 <= disc_present ? STAT_PAUSE : drv_status;
                 end
-                4'h7: begin                   // RESUME (PAUSE->PLAY)
-                    // Instant, matching GPGX/MiSTer: RESUME goes straight to
-                    // PLAY from PAUSE/STOP/TOC with no spin-up delay.
+                4'h7: begin                   // Resume
                     if (disc_present) drv_status <= STAT_PLAY;
                     n0 <= disc_present ? STAT_PLAY : drv_status;
                 end
-                4'hD: begin                   // OPEN TRAY
-                    door <= 1;
-                    drv_status <= STAT_OPEN;
-                    latency <= 4'd0;
-                    n0 <= STAT_OPEN; n1 <= 0; zeros;
+                4'h8, 4'h9: begin             // Forward / Rewind Scan
+                    if (disc_present) begin
+                        drv_status <= STAT_SCAN;
+                        scan_rev   <= (c0 == 4'h9);
+                    end
+                    n0 <= disc_present ? STAT_SCAN : drv_status;
                 end
-                4'hC: begin                   // CLOSE TRAY (reply STOP; with a
-                    door <= 0;                // disc the drive lands in TOC)
+                4'hA: begin                   // N-Track Jump Control
+                    if (disc_present) begin
+                        drv_status <= STAT_PAUSE;
+                        cdd_dm     <= 1'b1;
+                    end
+                    n0 <= disc_present ? STAT_PAUSE : drv_status;
+                end
+                4'hC: begin                   // Close Tray
+                    door <= 0;
+                    cdd_dm <= 1'b1;
                     drv_status <= disc_present ? STAT_TOC : STAT_NO_DISC;
-                    latency <= 4'd0;
-                    n0 <= STAT_STOP; n1 <= 0; zeros;
+                    n0 <= STAT_STOP; n1 <= 4'hF; zeros;
+                    head <= 0;
+                    apply_tog <= ~apply_tog;
                 end
-                default: begin
+                4'hD: begin                   // Open Tray
+                    door <= 1;
+                    cdd_dm <= 1'b1;
+                    drv_status <= STAT_OPEN;
+                    n0 <= STAT_OPEN; n1 <= 4'hF; zeros;
+                    head <= 0;
+                    apply_tog <= ~apply_tog;
+                end
+                default: begin                // unknown command
                     n0 <= drv_status;
                 end
             endcase
         end
 
-        // fixed 75Hz exchange
+        // fixed 75Hz exchange (the frame latched here carries the regs as
+        // the commands left them -- GPGX's "process one frame ahead")
         if (wdog == BEAT) begin
             cdd_stat <= {csum, n8, n7, n6, n5, n4, n3, n2, n1, n0};
             cdd_rec  <= 1;
             rec_cnt  <= 4'd8;
             wdog     <= 0;
-            frame_go <= 0;
         end else if (rec_cnt != 0) begin
             rec_cnt <= rec_cnt - 1'b1;
         end else begin
@@ -1063,5 +1101,14 @@ always @(posedge clk) begin
         end
     end
 end
+
+// does this tick owe the delivery FSM a sector? PLAY streams and advances;
+// every other state (and any latency) re-delivers the banked sector under
+// the head (dlv_hold_req). Audio PLAY streams to the DAC.
+wire owe_this_tick =
+    (latency != 0)              ? tick_data_ok :
+    (drv_status == STAT_PLAY)   ? (disc_present &&
+                                   !(!head[31] && head >= leadout_lba)) :
+                                  tick_data_ok;
 
 endmodule
