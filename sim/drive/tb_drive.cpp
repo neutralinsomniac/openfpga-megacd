@@ -259,10 +259,63 @@ static int swap_test(){
     return fail?1:0;
 }
 
+// Seek-latency restart test.
+//
+// GPGX only charges the fixed spin-up base when no latency is already pending:
+//
+//    if (!cdd.latency) cdd.latency = 2 + 10*config.cd_latency;   // cdd.c
+//    cdd.latency += ((|dlba| * 120 * config.cd_latency) / 270000);
+//
+// so a Play re-issued while the drive is still seeking does NOT restart the
+// base -- the original countdown keeps running. Ours assigns seek_cnt
+// unconditionally, so every re-issue restarts the full 11-frame (146ms) base
+// and the head stays frozen for as long as the commands keep coming. That is
+// the shape of an FMV stutter: drv_status parked at SEEK(2) with head stalled.
+static int reseek_test(){
+    dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
+    dut->img_size = 3000*2352; dut->track_count=0; dut->cdda_wr_ready=1;
+    dut->disc_loading=0;
+    dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
+    for(int i=0;i<20;i++) tick();
+    dut->reset=0; dut->mcd_rst_n=1;
+    for(int i=0;i<20;i++) tick();
+
+    const long BEAT = 715909;
+
+    // baseline: one SEEK+PLAY, left alone -> PLAY after the 11-frame base
+    pulse_cmd(mk_seek(100));
+    long single=-1;
+    for(long b=0;b<40 && single<0;b++){
+        pulse_cmd(0x0ULL);
+        for(long c=0;c<BEAT;c++){ tick(); if((dut->dbg_cmds&0xF)==1){ single=b; break; } }
+    }
+    printf("single SEEK+PLAY      -> PLAY after %ld beats (%.0f ms)\n",
+           single, single*13.3);
+
+    // re-issued: same target, re-commanded every 2 beats for 20 beats, then
+    // left alone. Measured from the FIRST command.
+    pulse_cmd(mk_seek(500));
+    long reissued=-1, last_cmd_beat=0;
+    for(long b=0;b<60 && reissued<0;b++){
+        pulse_cmd(0x0ULL);
+        if(b<20 && (b%2)==0){ pulse_cmd(mk_seek(500)); last_cmd_beat=b; }
+        for(long c=0;c<BEAT;c++){ tick(); if((dut->dbg_cmds&0xF)==1){ reissued=b; break; } }
+    }
+    printf("re-issued every 2 beats -> PLAY after %ld beats (%.0f ms), last cmd at beat %ld\n",
+           reissued, reissued*13.3, last_cmd_beat);
+    printf("head frozen for the whole seek; extra stall vs baseline = %ld beats (%.0f ms)\n",
+           reissued-single, (reissued-single)*13.3);
+
+    if(reissued > single + 2)
+        err("re-issued SEEK+PLAY restarts the latency base (upstream does not)");
+    printf(fail ? "\n==== RESEEK TEST FAILED ====\n" : "\n==== RESEEK TEST PASSED ====\n");
+    return fail?1:0;
+}
+
 int main(int argc, char** argv){
     Verilated::commandArgs(argc,argv);
     dut = new Vmegacd_cdd_drive;
-    bool cdda_mode=false, swap_mode=false;
+    bool cdda_mode=false, swap_mode=false, reseek_mode=false;
     for(int i=1;i<argc;i++){
         // --lat N: SUSTAINED per-fetch host latency in clk, modelling real SD
         // round-trip cost rather than a one-off stall. This is the number that
@@ -275,9 +328,11 @@ int main(int argc, char** argv){
         if(!strcmp(argv[i],"--spike-len")&&i+1<argc) spike_len=atol(argv[++i]);
         if(!strcmp(argv[i],"--cdda")) cdda_mode=true;
         if(!strcmp(argv[i],"--swap")) swap_mode=true;
+        if(!strcmp(argv[i],"--reseek")) reseek_mode=true;
     }
     if(cdda_mode){ int r=cdda_test(); delete dut; return r; }
     if(swap_mode){ int r=swap_test(); delete dut; return r; }
+    if(reseek_mode){ int r=reseek_test(); delete dut; return r; }
 
     // reset
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;

@@ -235,8 +235,25 @@ wire [31:0] seek_dist   = seek_diff[31] ? (~seek_diff + 32'd1) : seek_diff;
 // distance term = |Δlba| * 7457 >> 24  (== MiSTer's |Δlba|/2250)
 wire [44:0] seek_scaled = seek_dist_r * SEEK_MULT;
 wire [31:0] seek_dterm  = seek_scaled >> SEEK_RSHIFT;
-// SEEK+PLAY carries the +11 base; SEEK+PAUSE has none (MiSTer play flag)
-wire [31:0] play_beats_raw  = {24'd0, SEEK_PLAY_BASE} + seek_dterm_r;
+// SEEK+PLAY carries the +11 base; SEEK+PAUSE has none (MiSTer play flag).
+//
+// The base is charged only when no seek is already pending, matching GPGX:
+//
+//     if (!cdd.latency) cdd.latency = 2 + 10*config.cd_latency;
+//     cdd.latency += ((|dlba| * 120 * config.cd_latency) / 270000);
+//
+// Assigning it unconditionally meant a PLAY re-issued mid-seek restarted the
+// whole 11-frame (146ms) base, so a host that re-commands while the drive is
+// still seeking could hold the head frozen indefinitely -- measured at 386ms
+// vs 146ms for a seek re-issued every 2 beats (tb_drive --reseek).
+// seek_cnt IS cdd.latency, so the guard maps directly: nonzero = a seek is
+// still pending, keep its remaining count as the base; zero = charge the base.
+// Keying off drv_status instead would misfire in the window where the count
+// has hit 0 but the status has not yet flipped to PLAY, handing a command
+// landing there a base of 0 and an instant seek.
+wire [31:0] seek_base_r     = (seek_cnt != 8'd0) ? {24'd0, seek_cnt}
+                                                : {24'd0, SEEK_PLAY_BASE};
+wire [31:0] play_beats_raw  = seek_base_r + seek_dterm_r;
 wire [31:0] pause_beats_raw = seek_dterm_r;
 
 task zeros; begin
