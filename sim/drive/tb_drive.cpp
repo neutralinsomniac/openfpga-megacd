@@ -145,10 +145,20 @@ static int cdda_test(){
         for(long c=0;c<BEAT;c++){
             tick();
             int drv = (dut->dbg_state>>28)&0xF;
-            if(drv==1){                              // PLAY: sample the current file
+            // Sample only while a fetch is actually in flight: cd_req_file is
+            // what the HOST latches to pick a bin, and it only ever looks at
+            // it while cd_req is asserted. Sampling it unconditionally also
+            // catches the few clk after a seek where the track search has not
+            // yet caught up, which the host never observes.
+            if(drv==1 && dut->cd_req){
                 int rf = dut->cd_req_file;
                 if(rf<file_lo) file_lo=rf; if(rf>file_hi) file_hi=rf;
-                if(last_file>=0 && rf!=last_file) file_flips++;
+                if(last_file>=0 && rf!=last_file){
+                    file_flips++;
+                    printf("  [trace] beat %ld tick %llu: cd_req_file %d -> %d, head=%ld, cdda_words=%ld\n",
+                           b, (unsigned long long)tk, last_file, rf,
+                           (long)(dut->dbg_state&0xFFFFF), cdda_words);
+                }
                 last_file=rf;
             }
         }

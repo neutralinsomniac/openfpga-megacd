@@ -397,7 +397,22 @@ reg  [3:0] buf_valid = 0;
 reg  [1:0] cdack_s = 0;
 reg  [1:0] fetch_st = 0;
 reg [31:0] fetch_lba;
-wire       fetch_wanted = disc_present &&
+// cur_track/cur_delta/cur_file describe srch_head, which is NOT necessarily
+// the current head: the track search takes ~6 clk to walk the TOC, so right
+// after a seek they still describe wherever the head used to be. Fetching in
+// that window computes head_file from a stale cur_delta and tags it with a
+// stale cur_file, so the drive asks the host for the wrong offset in the wrong
+// bin. The bad sector is never delivered (its buf_lba cannot match once the
+// search corrects, since two tracks only share a delta when they share a file)
+// but it costs a wasted round-trip plus a reopen away and back on every
+// track-crossing seek -- the multi-bin startup hitch.
+//
+// With no cue there is a single track and the registers are always valid;
+// srch_head is never updated in that branch, so it must be excluded or the
+// drive would never fetch at all.
+wire       toc_settled = (track_count == 7'd0) ||
+                         ((srch_st == 3'd0) && (srch_head == head));
+wire       fetch_wanted = disc_present && toc_settled &&
                           (drv_status == STAT_PLAY || drv_status == STAT_SEEK ||
                            drv_status == STAT_PAUSE || drv_status == STAT_TOC);
 // LBAs are signed: seeks into the track-1 pregap (down to -150) are part
