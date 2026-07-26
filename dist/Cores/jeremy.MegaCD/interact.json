@@ -160,12 +160,12 @@
         "value": 1
       },
       {
-        "name": "HiFi PCM",
-        "id": 61,
+        "name": "Freq. Modulation",
+        "id": 40,
         "type": "check",
         "enabled": true,
         "persist": true,
-        "address": "0x00000060",
+        "address": "0x00000040",
         "writeonly": true,
         "defaultval": 1,
         "value": 1
@@ -219,12 +219,12 @@
         ]
       },
       {
-        "name": "Freq. Modulation",
-        "id": 40,
+        "name": "HiFi PCM",
+        "id": 61,
         "type": "check",
         "enabled": true,
         "persist": true,
-        "address": "0x00000040",
+        "address": "0x00000060",
         "writeonly": true,
         "defaultval": 1,
         "value": 1
