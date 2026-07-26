@@ -776,18 +776,40 @@ int main(int argc,char**argv){
           // from. Break its cost down: how many accesses, how long each, and how
           // much of that is spent before exp_dtack_armed (i.e. waiting for the
           // slave to RELEASE a stale DTACK) versus waiting for the real answer.
-          { static long rr_n=0, rr_cyc=0, rr_pre=0; static int prev_ms=-1;
+          // ...and split it by WHICH slave answered. The ASIC ORs four DTACK
+          // sources (ASIC.vhd: EXT_DTACK_N <= REG and PRGRAM and WORDRAM and
+          // ROM), and they are not equally fast -- but only the word-RAM one is
+          // on the FMV blit path, so a per-slave split says whether optimising
+          // the ROM window (the BIOS-in-BRAM idea) would touch decoding at all.
+          // Classified by the latched MBUS address rather than by tapping the
+          // yosys-converted VHDL, using the main-CPU map:
+          //   000000-01FFFF BIOS ROM   020000-03FFFF PRG-RAM window
+          //   200000-23FFFF word RAM   400000-7FFFFF cartridge
+          { enum { S_ROM=0, S_PRG, S_WRAM, S_CART, S_OTHER, S_N };
+            static const char* nm[S_N] = {"bios","prgram","wordram","cart","other"};
+            static long n[S_N]={0}, cyc[S_N]={0};
+            static int prev_ms=-1; static int cur=S_OTHER;
             int ms = r->core_top__DOT__gen__DOT__mstate & 15;
             if(ms==5){
-              rr_cyc++;
-              if(prev_ms!=5) rr_n++;
+              if(prev_ms!=5){
+                uint32_t a = ((uint32_t)r->core_top__DOT__gen__DOT__MBUS_A) << 1;
+                cur = (a < 0x020000) ? S_ROM  : (a < 0x040000) ? S_PRG :
+                      (a >= 0x200000 && a < 0x240000) ? S_WRAM :
+                      (a >= 0x400000) ? S_CART : S_OTHER;
+                n[cur]++;
+              }
+              cyc[cur]++;
             }
             prev_ms = ms;
-            if((c%2000000)==0 && c && rr_n){
-              printf("ROMRD [%ld] n=%ld  cyc/access=%.1f  total=%ld\n",
-                     c, rr_n, (double)rr_cyc/rr_n, rr_cyc);
-              (void)rr_pre;
-              rr_n=rr_cyc=rr_pre=0; } }
+            if((c%2000000)==0 && c){
+              long tn=0, tc=0; for(int i=0;i<S_N;i++){ tn+=n[i]; tc+=cyc[i]; }
+              if(tn){
+                printf("ROMRD [%ld] n=%ld cyc/access=%.1f |", c, tn, (double)tc/tn);
+                for(int i=0;i<S_N;i++) if(n[i])
+                  printf("  %s: n=%ld %.1f clk", nm[i], n[i], (double)cyc[i]/n[i]);
+                printf("\n");
+              }
+              for(int i=0;i<S_N;i++){ n[i]=0; cyc[i]=0; } } }
           if((c%2000000)==0 && c && p_n){
             printf("PLIFE [%ld] n=%ld wait=%.1f serv=%.1f gap=%.1f\n",
                    c, p_n, (double)p_wait/p_n, (double)p_serv/p_n, (double)p_gap/p_n);

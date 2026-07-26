@@ -592,7 +592,7 @@ reg  [15:0] M68K_MBUS_D;
 reg   [7:0] Z80_MBUS_D;
 reg  [15:0] VDP_MBUS_D;
 
-reg  [23:1] MBUS_A;
+reg  [23:1] MBUS_A /* verilator public_flat_rd */;
 reg  [15:0] MBUS_DO;
 
 reg         MBUS_RNW;
