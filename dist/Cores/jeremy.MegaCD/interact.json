@@ -11,50 +11,6 @@
         "value": 1
       },
       {
-        "name": "Region",
-        "id": 99,
-        "type": "list",
-        "enabled": true,
-        "address": "0x00E00000",
-        "options": [
-          {
-            "value": "0x00000000",
-            "name": "Japan"
-          },
-          {
-            "value": "0x00000001",
-            "name": "United States"
-          },
-          {
-            "value": "0x00000002",
-            "name": "Europe"
-          }
-        ]
-      },
-      {
-        "name": "CPU Turbo",
-        "id": 399,
-        "type": "list",
-        "enabled": true,
-        "writeonly": true,
-        "defaultval": "0x00000000",
-        "address": "0x00C00000",
-        "options": [
-          {
-            "value": "0x00000000",
-            "name": "None"
-          },
-          {
-            "value": "0x00000001",
-            "name": "Medium"
-          },
-          {
-            "value": "0x00000002",
-            "name": "High"
-          }
-        ]
-      },
-      {
         "name": "Multitap",
         "id": 9,
         "type": "check",
