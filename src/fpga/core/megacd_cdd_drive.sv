@@ -98,18 +98,17 @@ localparam [25:0] BEAT = 26'd715909;      // 13.3ms @ 53.693175MHz
 // drain.
 //
 // TRIED AND REVERTED (hardware): setting this to 715909 = true 75Hz. It breaks
-// boot -- never gets past CHECKING DISC with a disc inserted -- and ALSO makes
-// BIOS audio play noticeably slow with NO disc inserted, which nothing about a
-// 2.56% timing change explains and which is NOT understood. With no disc,
-// disc_present is false so owe_inc never fires, and this tick should then only
-// be driving the STOP->NO_DISC drain and the tray dance. Do not simply retry
-// the constant; find what the audio path takes from this tick first.
+// boot -- never gets past CHECKING DISC with a disc inserted. That is the same
+// failure the delivery-beat note further down records, and it is why the
+// delivery beat is now taken from wdog instead of by retiming this constant.
 //
-// The over-delivery described below is nonetheless real and is the FMV
-// stutter's cause. The untried surgical variant is to leave THIS tick at
-// 698010 so every state machine keeps its present timing, and pace only
-// owe_inc off a separate 75Hz counter -- which bisects "boot depends on the
-// state-tick rate" against "boot depends on the delivery rate".
+// A BIOS-audio slowdown was reported alongside that build and initially blamed
+// on this tick. It was not related: it was interact.json's HiFi PCM default
+// (0) disagreeing with cs_hifi_pcm_enable's reset value (1), exposed when a
+// menu reorder moved that entry inside the display cutoff so the firmware
+// began writing it. There is NO audio dependency on this tick -- with no disc,
+// disc_present is false, owe_inc never fires, and the sub's 75Hz INT2 comes
+// from wdog/BEAT. Confirmed by an older bitstream showing the same slowdown.
 //
 // It was 698010 cycles = 76.92Hz, 2.56% fast, which over-delivers by +1.92
 // sectors/sec. A game streaming FMV overruns its read-ahead buffer at that
@@ -119,10 +118,13 @@ localparam [25:0] BEAT = 26'd715909;      // 13.3ms @ 53.693175MHz
 // incrementing in lockstep (i.e. EVERY seek is backward) about once every two
 // seconds, in cadence with the audible stutters.
 //
-// 53693175/75 = 715909 exactly, which is numerically the same as BEAT. The
-// theory was that keeping ms_tick a separate counter preserved the
-// phase-decoupling the boot header capture needs, and that only the period
-// changed. Hardware says otherwise -- see the reverted note above.
+// 53693175/75 = 715909 exactly, numerically the same as BEAT. ms_tick was
+// already a counter separate from wdog when that was tried, so independence
+// from the status frame was not what boot needed. A third variant -- a
+// dedicated DLV_TICK counter for delivery only -- was never booted at all: it
+// FAILED TIMING, because at 97% ALM there is no room for another 20-bit
+// counter. The fix that works is below: leave this tick alone and take the
+// delivery beat off wdog, which costs a comparator and no registers.
 localparam [19:0] TICK_13MS = 20'd698010;
 // Delivery beat: exact 1x, taken from the EXISTING wdog counter rather than a
 // new one. wdog already runs the 75Hz status frame (period BEAT+1 = 715910
