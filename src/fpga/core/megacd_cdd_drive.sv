@@ -136,7 +136,7 @@ localparam [25:0] BEAT = 26'd715909;      // 13.3ms @ 53.693175MHz
 //     every beat (Lunar Eternal Blue: 3-4 min to its intro FMV)
 // This costs nothing -- one constant -- and is the only remaining way to get a
 // true-1x beat that is phase-independent of the status frame.
-localparam [19:0] TICK_13MS = 20'd715909;
+localparam [19:0] TICK_13MS = 20'd698010;
 
 wire disc_present = (img_size >= 32'd2352);
 wire [31:0] leadout_lba = img_lba;        // computed at mount
@@ -685,7 +685,33 @@ reg        rpt_trk_audio = 0;
 // counter, or a held-beat register to survive the sampling instant, would both
 // solve it too -- both failed timing. ms_tick already exists and already
 // drifts against wdog, so it costs nothing.
-wire owe_inc = (ms_tick == TICK_13MS) && (drv_status == STAT_PLAY) && disc_present;
+// Delivery beat: ms_tick, rate-limited to at most ONE per status frame.
+//
+// This is the only shape that satisfies both constraints at once.
+//   RATE must be 75Hz. ms_tick alone is 76.92Hz and over-delivers by +1.92
+//   sectors/sec, which overruns a streaming game's read-ahead and makes it
+//   resync with a backward seek every ~2s -- the FMV stutter.
+//   PHASE must keep moving against the status frame. Anything phase-frozen
+//   resonates with whatever the host does on its frame interrupt: locked to
+//   wdog, Lunar Eternal Blue took 3-4 minutes to reach its intro FMV; and
+//   TICK_13MS = 715909 gives ms_tick a period of 715910 -- identical to
+//   wdog's -- which freezes it just as hard and hangs the BIOS at CHECKING
+//   DISC.
+//
+// ms_tick is faster than the frame, so every frame contains at least one of
+// its events. Taking only the first gives exactly 75Hz, while WHICH event that
+// is keeps sliding as ms_tick drifts. Costs one flag, and reuses the existing
+// wdog == BEAT comparison rather than adding another wide comparator -- which
+// matters, because at 97% ALM a dedicated counter and a held-beat register
+// both failed timing outright.
+reg  dlv_done = 0;                 // already delivered in this frame
+wire owe_inc = (ms_tick == TICK_13MS) && !dlv_done
+               && (drv_status == STAT_PLAY) && disc_present;
+always @(posedge clk) begin
+    if (reset | ~mcd_rst_n) dlv_done <= 0;
+    else if (wdog == BEAT)  dlv_done <= 0;    // new frame, re-arm
+    else if (owe_inc)       dlv_done <= 1;
+end
 // REQUEST 5 track number from the command's c4/c5 BCD digits
 wire [6:0] req_track = {3'd0,c4}*7'd10 + {3'd0,c5};
 
