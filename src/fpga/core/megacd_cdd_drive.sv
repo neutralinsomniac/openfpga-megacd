@@ -597,6 +597,27 @@ reg        rpt_trk_audio = 0;
 // delivery beat being on ms_tick, decoupled from the 75Hz status frame. The
 // FMV audio glitch is a PCM UNDERRUN (sub can't refill in time), so a slower
 // delivery would not fix it anyway; left on ms_tick to preserve boot.
+//
+// TRIED AND REJECTED (hardware): owing a sector during STAT_SEEK as well, to
+// match GPGX, which keeps the decoder running for the whole seek latency --
+//
+//     if (cdd.latency > 0) { cdd.latency--; cdc_decoder_update(0); }
+//
+// -- so the sub keeps receiving DECI at 75Hz while seeking instead of nothing
+// for the 11-frame (146ms) base. Implemented faithfully (owe_inc covering
+// SEEK, head parked on the target at command time as upstream's cdd.lba = lba,
+// head advanced only in PLAY) and verified in sim: 10 sectors decoded across an
+// 11-beat seek versus 0, all drive tests passing.
+//
+// It hangs the BIOS at CHECKING DISC on hardware. Same failure as retiming the
+// beat to wdog, and for the same reason: the boot header capture depends on
+// exactly which frames deliver, and the co-sim cannot catch it because the MCD
+// is held in reset there so drv_status never leaves STOP. Do not retry without
+// first working out what the boot handshake requires of the delivery beat.
+//
+// Note also that the FMV motivation above is weak: a PCM underrun is a
+// CPU-throughput problem, and extra DECI only helps if the sub's refill loop is
+// BLOCKED on DECI rather than short of cycles.
 wire owe_inc = (ms_tick == TICK_13MS) && (drv_status == STAT_PLAY) && disc_present;
 // REQUEST 5 track number from the command's c4/c5 BCD digits
 wire [6:0] req_track = {3'd0,c4}*7'd10 + {3'd0,c5};
