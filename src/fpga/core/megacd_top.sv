@@ -1442,10 +1442,6 @@ wire [15:0] sd_buff_addr = sd_wr ? sd_buff_addr_in[16:1] : sd_buff_addr_out[16:1
 wire [15:0] sd_buff_din;
 wire [15:0] sd_buff_dout;
 
-reg [ 2:0] datatable_div = 0;
-reg [31:0] rom_file_size = 0;
-reg [31:0] cd_img_size = 0;   // clk_74a; quasi-static once mounted
-
 reg [31:0] cd_bin_size = 0;   // CD Data slot (id 2) size after openfile
 // Data-slot table scan.
 //
@@ -1489,12 +1485,10 @@ always @(posedge clk_74a or negedge pll_core_locked) begin
 				// q now reflects the PREVIOUS address (held 2 cycles)
 				if (dt_prev < 5'd8) dbg_dtable[dt_prev[2:0]] <= datatable_q;
 				if (!dt_prev[0]) dt_id <= datatable_q;   // even word = slot id
-				else case (dt_id)                        // odd word = its size
-				32'd0: rom_file_size <= datatable_q;
-				32'd1: cd_img_size   <= datatable_q;
-				32'd2: cd_bin_size   <= datatable_q;
-				default: ;
-				endcase
+				// odd word = that slot's size. Only id 2 (CD Data) has a
+				// consumer; the BIOS and CD Image sizes reach the mount FSM
+				// through the 008A notification instead.
+				else if (dt_id == 32'd2) cd_bin_size <= datatable_q;
 			end
 		end else begin
 			// sweep done: advertise the Save slot size, then restart
