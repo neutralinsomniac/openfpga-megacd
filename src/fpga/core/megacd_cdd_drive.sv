@@ -94,7 +94,23 @@ localparam [3:0] STAT_TOC     = 4'h9;   // TOC read done = "disc ready"
 localparam [3:0] STAT_NO_DISC = 4'hB;
 
 localparam [25:0] BEAT = 26'd715909;      // 13.3ms @ 53.693175MHz
-localparam [19:0] TICK_13MS = 20'd698010; // no-disc drain tick
+// Drive tick: sector delivery beat, seek countdown, insertion dance, no-disc
+// drain. This MUST be true 1x (75Hz) because it paces delivery.
+//
+// It was 698010 cycles = 76.92Hz, 2.56% fast, which over-delivers by +1.92
+// sectors/sec. A game streaming FMV overruns its read-ahead buffer at that
+// rate and resyncs with a BACKWARD seek to re-read what it missed -- ~one
+// every 2.1s for a 4-sector buffer. Each resync pays the seek latency, and
+// that is the FMV stutter: measured on hardware as seek_cnt and backseek_cnt
+// incrementing in lockstep (i.e. EVERY seek is backward) about once every two
+// seconds, in cadence with the audible stutters.
+//
+// 53693175/75 = 715909 exactly. Note this is numerically the same as BEAT,
+// but ms_tick stays a SEPARATE counter: the boot header capture depends on the
+// delivery beat being phase-decoupled from the 75Hz status frame, and driving
+// delivery off wdog==BEAT directly is what broke the BIOS disc check before.
+// Only the period changes here, not the independence.
+localparam [19:0] TICK_13MS = 20'd715909;
 
 wire disc_present = (img_size >= 32'd2352);
 wire [31:0] leadout_lba = img_lba;        // computed at mount
@@ -605,10 +621,12 @@ reg        frame_go = 0;
 reg        rpt_trk_audio = 0;
 
 // a delivery is owed for each beat spent in PLAY with a disc present.
-// NOTE: paced off ms_tick==TICK_13MS (698010 cyc = 76.9Hz, ~2.5% fast vs true
-// 1x). Retiming this to wdog==BEAT (75Hz) BROKE the BIOS disc-check handshake
+// NOTE: paced off ms_tick==TICK_13MS, which is now a true 75Hz (see the
+// localparam). Retiming this to wdog==BEAT BROKE the BIOS disc-check handshake
 // (stuck at CHECKING DISC every boot) — the boot header capture depends on the
-// delivery beat being on ms_tick, decoupled from the 75Hz status frame. The
+// delivery beat being on ms_tick, decoupled from the 75Hz status frame; that
+// is about the counter, not the rate, so correcting ms_tick's period is a
+// different change from driving delivery off wdog. The
 // FMV audio glitch is a PCM UNDERRUN (sub can't refill in time), so a slower
 // delivery would not fix it anyway; left on ms_tick to preserve boot.
 //
