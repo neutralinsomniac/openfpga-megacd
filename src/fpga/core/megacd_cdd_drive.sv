@@ -684,7 +684,29 @@ reg        rpt_trk_audio = 0;
 // Note also that the FMV motivation above is weak: a PCM underrun is a
 // CPU-throughput problem, and extra DECI only helps if the sub's refill loop is
 // BLOCKED on DECI rather than short of cycles.
-wire owe_inc = (wdog == BEAT_DLV) && (drv_status == STAT_PLAY) && disc_present;
+// The beat is HELD, not sampled. Testing (drv_status == PLAY) at the single
+// instant wdog hits BEAT_DLV loses the whole beat whenever the drive happens
+// not to be playing right then -- and because wdog also drives the status
+// frame, that instant sits at a FIXED offset from the interrupt the host
+// synchronises its own PLAY/PAUSE pattern to. A loader that pauses in step
+// with the frame can therefore miss essentially every beat, systematically,
+// rather than losing a random few. Lunar Eternal Blue took 3-4 minutes to
+// reach its intro FMV on a build with the naive sample, and loads normally
+// without it.
+//
+// Real hardware has no such correlation: its sector boundaries come from disc
+// rotation, which is independent of host frame timing. Holding one pending
+// beat until PLAY resumes restores that -- delivery still averages exactly
+// 75Hz, a beat landing in a brief pause is honoured on resume instead of
+// vanishing, and only ONE can ever be outstanding so a long pause cannot
+// accumulate a burst.
+reg  beat_pend = 0;
+wire owe_inc = beat_pend && (drv_status == STAT_PLAY) && disc_present;
+always @(posedge clk) begin
+    if (reset | ~mcd_rst_n)      beat_pend <= 0;
+    else if (wdog == BEAT_DLV)   beat_pend <= 1;
+    else if (owe_inc)            beat_pend <= 0;
+end
 // REQUEST 5 track number from the command's c4/c5 BCD digits
 wire [6:0] req_track = {3'd0,c4}*7'd10 + {3'd0,c5};
 
