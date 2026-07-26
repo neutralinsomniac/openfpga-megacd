@@ -771,6 +771,23 @@ int main(int argc,char**argv){
             printf("MST [%ld]",c);
             for(int i=0;i<16;i++){ if(mshist[i]) printf(" %d:%ld",i,mshist[i]); mshist[i]=0; }
             printf("\n"); }
+          // MBUS_ROM_READ (state 5) is the whole 000000-7FFFFF expansion window,
+          // which on MCD includes the word-RAM view the main blits FMV frames
+          // from. Break its cost down: how many accesses, how long each, and how
+          // much of that is spent before exp_dtack_armed (i.e. waiting for the
+          // slave to RELEASE a stale DTACK) versus waiting for the real answer.
+          { static long rr_n=0, rr_cyc=0, rr_pre=0; static int prev_ms=-1;
+            int ms = r->core_top__DOT__gen__DOT__mstate & 15;
+            if(ms==5){
+              rr_cyc++;
+              if(prev_ms!=5) rr_n++;
+            }
+            prev_ms = ms;
+            if((c%2000000)==0 && c && rr_n){
+              printf("ROMRD [%ld] n=%ld  cyc/access=%.1f  total=%ld\n",
+                     c, rr_n, (double)rr_cyc/rr_n, rr_cyc);
+              (void)rr_pre;
+              rr_n=rr_cyc=rr_pre=0; } }
           if((c%2000000)==0 && c && p_n){
             printf("PLIFE [%ld] n=%ld wait=%.1f serv=%.1f gap=%.1f\n",
                    c, p_n, (double)p_wait/p_n, (double)p_serv/p_n, (double)p_gap/p_n);
