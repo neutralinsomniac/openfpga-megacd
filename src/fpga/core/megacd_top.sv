@@ -1363,6 +1363,8 @@ reg [15:0] reset_delay			 = 0;
 // registered bit here, then synchronize it once (reset_delay_done below).
 reg        reset_delay_zero	 = 1;
 reg [1:0] cs_cpu_turbo			 = 0;
+// CD access time (menu). 0 = accurate seek timing (default), 1 = fast.
+reg       cs_cd_fast             = 0;
 reg cs_multitap_enable			 = 0;
 reg cs_menu_pause_enable		 = 0;
 
@@ -1398,6 +1400,7 @@ always @(posedge clk_74a) begin
         32'h00F00000: cs_audio_filter			<= bridge_wr_data[1:0];
         32'h00A00000: cs_fm_chip                <= bridge_wr_data[0];
         32'h00C00000: cs_cpu_turbo				<= bridge_wr_data[1:0];
+        32'h00000120: cs_cd_fast                <= bridge_wr_data[0];
         32'h00000000: cs_multitap_enable 	    <= bridge_wr_data[0];
         32'h00000010: cs_ar_correction_enable 	<= bridge_wr_data[0];
         32'h00000020: begin
@@ -3262,6 +3265,7 @@ reg        toc_final_s1 = 0;
 reg        toc_final_sys /* verilator public_flat_rd */ = 0;
 reg        loading_s1 = 0;
 reg        loading_sys /* verilator public_flat_rd */ = 0;
+reg        cd_fast_s1 = 0, cd_fast_sys = 0;   // menu bit, clk_74a -> clk_sys
 // THE DISC DOES NOT EXIST UNTIL ITS TOC IS FINAL.
 //
 // A multi-bin cue needs ~21 host round-trips per audio bin to size it (APF
@@ -3294,6 +3298,8 @@ always @(posedge clk_sys) begin
 	if (toc_count_s1 == toc_track_count) toc_count_sys <= toc_count_s1;
 	toc_final_s1 <= toc_final_74;
 	toc_final_sys <= toc_final_s1;
+	cd_fast_s1  <= cs_cd_fast;
+	cd_fast_sys <= cd_fast_s1;
 	loading_s1  <= mount_loading;
 	loading_sys <= loading_s1;
 end
@@ -3329,6 +3335,7 @@ megacd_cdd_drive cdd_drive
 
 	.track_count(toc_count_sys),
 	.disc_loading(loading_sys),
+	.cd_fast_seek(cd_fast_sys),
 	.toc_addr(toc_rd_addr),
 	.toc_q(toc_rd_q),
 	.cd_req_file(cd_req_file),

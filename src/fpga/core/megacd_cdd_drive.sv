@@ -61,6 +61,15 @@ module megacd_cdd_drive
     // an MCD reset pulse mid-load cannot strand us: the drive comes up STOP and
     // re-enters the tray-open state on the next tick while it is still high.
     input             disc_loading,
+    // CD access time, mirroring GPGX's config.cd_latency user option:
+    //   0 = accurate (default): 11-frame spin-up base + distance term
+    //   1 = fast:               2-frame base, no distance term
+    // FMV streaming seeks per chunk, and at 13.3ms/frame the accurate base is
+    // 146ms of frozen head per seek, which is what an FMV stutter looks like on
+    // the overlay. Upstream exposes this as an option rather than a change
+    // because some titles NEED the delay -- GPGX notes the Wolf Team FMV games
+    // want >=12 interrupts or they hang -- so the default must stay accurate.
+    input             cd_fast_seek,
     output reg [6:0]  toc_addr,
     input      [65:0] toc_q,
     // file holding the current track (multi-bin cue): the host reopens
@@ -251,10 +260,15 @@ wire [31:0] seek_dterm  = seek_scaled >> SEEK_RSHIFT;
 // Keying off drv_status instead would misfire in the window where the count
 // has hit 0 but the status has not yet flipped to PLAY, handing a command
 // landing there a base of 0 and an instant seek.
+//
+// cd_fast_seek picks the upstream cd_latency=0 profile: base 2 (GPGX's
+// "2 + 10*config.cd_latency" with the option off) and no distance term.
+wire [7:0]  seek_base_cfg   = cd_fast_seek ? 8'd2 : SEEK_PLAY_BASE;
+wire [31:0] seek_dterm_eff  = cd_fast_seek ? 32'd0 : seek_dterm_r;
 wire [31:0] seek_base_r     = (seek_cnt != 8'd0) ? {24'd0, seek_cnt}
-                                                : {24'd0, SEEK_PLAY_BASE};
-wire [31:0] play_beats_raw  = seek_base_r + seek_dterm_r;
-wire [31:0] pause_beats_raw = seek_dterm_r;
+                                                : {24'd0, seek_base_cfg};
+wire [31:0] play_beats_raw  = seek_base_r + seek_dterm_eff;
+wire [31:0] pause_beats_raw = seek_dterm_eff;
 
 task zeros; begin
     n2 <= 0; n3 <= 0; n4 <= 0; n5 <= 0; n6 <= 0; n7 <= 0; n8 <= 0;

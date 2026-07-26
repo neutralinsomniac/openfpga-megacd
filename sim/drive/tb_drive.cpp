@@ -126,7 +126,7 @@ static uint64_t mk_seek(long L){
 // the hitching we see only on multi-bin discs like Sonic CD).
 static int cdda_test(){
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
-    dut->img_size = 3000*2352; dut->track_count=3; dut->cdda_wr_ready=1; dut->disc_loading=0;
+    dut->img_size = 3000*2352; dut->track_count=3; dut->cdda_wr_ready=1; dut->cd_fast_seek=0; dut->disc_loading=0;
     dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
     toc_set(1, /*audio*/false, 0,0, /*file*/0, /*delta*/0,    /*disc*/0);
     toc_set(2, /*audio*/true,  0,0, /*file*/1, /*delta*/1000, /*disc*/1000);
@@ -199,7 +199,7 @@ static long run_beats(long n, int* saw_status, int want){
 }
 static int swap_test(){
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
-    dut->img_size = 0; dut->track_count=1; dut->cdda_wr_ready=1; dut->disc_loading=0;
+    dut->img_size = 0; dut->track_count=1; dut->cdda_wr_ready=1; dut->cd_fast_seek=0; dut->disc_loading=0;
     dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
     toc_set(1, /*audio*/false, 0,0, /*file*/0, /*delta*/0, /*disc*/0);
     for(int i=0;i<20;i++) tick();
@@ -273,7 +273,8 @@ static int swap_test(){
 // the shape of an FMV stutter: drv_status parked at SEEK(2) with head stalled.
 static int reseek_test(){
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
-    dut->img_size = 3000*2352; dut->track_count=0; dut->cdda_wr_ready=1;
+    dut->img_size = 3000*2352; dut->track_count=0; dut->cdda_wr_ready=1; dut->cd_fast_seek=0;
+    if(getenv("FASTSEEK")) dut->cd_fast_seek=1;   // isolate: fast from t=0
     dut->disc_loading=0;
     dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
     for(int i=0;i<20;i++) tick();
@@ -306,8 +307,24 @@ static int reseek_test(){
     printf("head frozen for the whole seek; extra stall vs baseline = %ld beats (%.0f ms)\n",
            reissued-single, (reissued-single)*13.3);
 
-    if(reissued > single + 2)
+    // Only meaningful while the base exceeds the re-issue interval. Under
+    // FASTSEEK the base is 2 beats and we re-issue every 2, so the latency
+    // legitimately drains to 0 between commands and each one re-charges it --
+    // upstream's guard is likewise "no latency pending", so that is correct,
+    // not the restart bug this checks for.
+    if(!getenv("FASTSEEK") && reissued > single + 2)
         err("re-issued SEEK+PLAY restarts the latency base (upstream does not)");
+
+    // CD Access Time (menu). Checked per-invocation rather than by toggling
+    // mid-run, which is how the option is actually used -- it is a menu setting,
+    // not something that changes between seeks. FASTSEEK=1 selects GPGX's
+    // cd_latency=0 profile: base 2 and no distance term.
+    //   accurate: 11 beats = 146ms   fast: 2 beats = 27ms
+    if(getenv("FASTSEEK")){
+        if(single > 4) err("FASTSEEK set but the seek still paid the long base");
+    } else {
+        if(single < 9) err("accurate mode lost the 11-frame spin-up base");
+    }
     printf(fail ? "\n==== RESEEK TEST FAILED ====\n" : "\n==== RESEEK TEST PASSED ====\n");
     return fail?1:0;
 }
@@ -337,7 +354,7 @@ int main(int argc, char** argv){
     // reset
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
     dut->img_size = 300*2352;      // 300-sector disc, single data track
-    dut->track_count=0; dut->cdda_wr_ready=1; dut->disc_loading=0;
+    dut->track_count=0; dut->cdda_wr_ready=1; dut->cd_fast_seek=0; dut->disc_loading=0;
     dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0;   // 66-bit VlWide
     dut->cd_ack_74a=0;
     for(int i=0;i<20;i++) tick();

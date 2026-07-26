@@ -252,6 +252,26 @@
             "name": "YM3438"
           }
         ]
+      },
+      {
+        "name": "CD Access Time",
+        "id": 699,
+        "type": "list",
+        "enabled": true,
+        "persist": true,
+        "writeonly": true,
+        "address": "0x00000120",
+        "defaultval": "0x00000000",
+        "options": [
+          {
+            "value": "0x00000000",
+            "name": "Accurate"
+          },
+          {
+            "value": "0x00000001",
+            "name": "Fast"
+          }
+        ]
       }
     ],
     "messages": []
