@@ -124,17 +124,20 @@ localparam [25:0] BEAT = 26'd715909;      // 13.3ms @ 53.693175MHz
 // phase-decoupling the boot header capture needs, and that only the period
 // changed. Hardware says otherwise -- see the reverted note above.
 localparam [19:0] TICK_13MS = 20'd698010;
-// Delivery beat, SEPARATE from the state tick above. 53693175/75 = 715909
-// exactly, i.e. true 1x, so the drive stops over-delivering by +1.92
-// sectors/sec and games stop resyncing with a backward seek every ~2s.
+// Delivery beat: exact 1x, taken from the EXISTING wdog counter rather than a
+// new one. wdog already runs the 75Hz status frame (period BEAT+1 = 715910
+// cycles = 74.9999Hz), so comparing against a mid-period value gives a true
+// 75Hz delivery beat that is still half a frame away from the frame emission.
 //
-// Deliberately a second counter rather than retiming TICK_13MS: doing the
-// latter broke boot AND slowed BIOS audio with no disc inserted, by a
-// mechanism that is still not understood (see the note above). This variant
-// is provably inert in that failing case -- owe_inc is gated on disc_present,
-// so with no disc this counter reaches nothing at all. Every state machine
-// (drain, tray dance, seek countdown) keeps its existing 76.9Hz timing.
-localparam [19:0] DLV_TICK  = 20'd715909;
+// It has to come from wdog because the design has no room: at 97% ALM and
+// 19347 registers, adding a separate 20-bit counter for this failed timing
+// outright. This costs one comparator and no registers.
+//
+// Phase matters here, not just rate. Driving delivery off wdog==BEAT -- i.e.
+// coincident with the frame emission -- broke the BIOS disc check before; the
+// half-frame offset keeps the two apart, which is what the boot header capture
+// was documented to need.
+localparam [25:0] BEAT_DLV  = 26'd357954;   // BEAT/2
 
 wire disc_present = (img_size >= 32'd2352);
 wire [31:0] leadout_lba = img_lba;        // computed at mount
@@ -149,7 +152,6 @@ reg [25:0] wdog = 0;
 reg        send_d = 0;
 reg  [3:0] rec_cnt = 0;
 reg [19:0] ms_tick = 0;
-reg [19:0] dlv_tick = 0;   // free-running 75Hz delivery beat
 reg  [3:0] latency = 4'd10;
 
 // playback state
@@ -675,7 +677,7 @@ reg        rpt_trk_audio = 0;
 // Note also that the FMV motivation above is weak: a PCM underrun is a
 // CPU-throughput problem, and extra DECI only helps if the sub's refill loop is
 // BLOCKED on DECI rather than short of cycles.
-wire owe_inc = (dlv_tick == DLV_TICK) && (drv_status == STAT_PLAY) && disc_present;
+wire owe_inc = (wdog == BEAT_DLV) && (drv_status == STAT_PLAY) && disc_present;
 // REQUEST 5 track number from the command's c4/c5 BCD digits
 wire [6:0] req_track = {3'd0,c4}*7'd10 + {3'd0,c5};
 
@@ -733,7 +735,6 @@ always @(posedge clk) begin
         rec_cnt  <= 0;
         send_d   <= 0;
         ms_tick  <= 0;
-        dlv_tick <= 0;
         latency  <= 4'd10;
         door     <= 0;
         head     <= 0;
@@ -848,9 +849,6 @@ always @(posedge clk) begin
         end else begin
             ms_tick <= ms_tick + 1'b1;
         end
-
-        // delivery beat free-runs independently of the state tick
-        dlv_tick <= (dlv_tick == DLV_TICK) ? 20'd0 : dlv_tick + 1'b1;
 
         // rebuild the report payload just before each frame emit (~19us,
         // build takes ~5us worst case), and immediately after a REQUEST so
