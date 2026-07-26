@@ -1857,9 +1857,21 @@ wire [31:0] dbg_hexval = {dbg_gfx_rate, dbg_glen,
 wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
                          (dbg_y < 10'd54) ? {dbg_wracc_rate, dbg_m68k_smp} :
                          (dbg_y < 10'd66) ? {dbg_wrbusy_duty, dbg_s68k_smp} :
-                         // datatable dump: rows 4..11 = raw words 0..7 of
-                         // the APF data slot id/size table
-                         (dbg_y < 10'd78)  ? dbg_dtable[0] :
+                         // row 4: FMV/decode pipeline rates. These counters
+                         // were already computed but never displayed, and they
+                         // are the whole path a decoded frame takes: sub writes
+                         // word RAM -> banks hand over -> main reads word RAM
+                         // -> main writes VDP.
+                         //   VV = VDP writes/s >>13   (blit destination)
+                         //   RR = word-RAM reads/s >>13 (blit source)
+                         //   DD = DMNA assertions/s   (bank handovers; ~3C =
+                         //        one per frame, 00 = no double-buffering)
+                         //   G  = GFX-engine in-flight duty /8 (7 = pegged)
+                         // Replaces the APF datatable word-0 dump, which was
+                         // for diagnosing the mount and is now solved (and the
+                         // scan matches on slot id, so a raw word is moot).
+                         (dbg_y < 10'd78)  ? {dbg_vdpw_rate, dbg_wrrd_rate,
+                                              dbg_dmna_rate, 5'd0, dbg_gron_duty} :
                          (dbg_y < 10'd90)  ? dbg_dtable[1] :
                          (dbg_y < 10'd102) ? dbg_dtable[2] :
                          (dbg_y < 10'd114) ? dbg_dtable[3] :
