@@ -597,7 +597,19 @@ reg        rpt_trk_audio = 0;
 // delivery beat being on ms_tick, decoupled from the 75Hz status frame. The
 // FMV audio glitch is a PCM UNDERRUN (sub can't refill in time), so a slower
 // delivery would not fix it anyway; left on ms_tick to preserve boot.
-wire owe_inc = (ms_tick == TICK_13MS) && (drv_status == STAT_PLAY) && disc_present;
+// A sector is owed every frame while PLAYING **and while SEEKING**. GPGX keeps
+// the CDC decoder running for the whole seek latency:
+//
+//     if (cdd.latency > 0) { cdd.latency--; cdc_decoder_update(0); }
+//
+// so the sub-CPU keeps receiving DECI at 75Hz throughout. Delivering nothing
+// while seeking, as this did, leaves the sub-CPU with no decoder interrupt for
+// the entire 11-frame (146ms) base -- long enough to starve an FMV title's PCM
+// feed once per seek. head is parked at the target for the duration (see the
+// seek command handlers), so the sector decoded during the latency is the
+// target's, matching upstream's already-updated cdd.lba.
+wire owe_inc = (ms_tick == TICK_13MS) && disc_present &&
+               (drv_status == STAT_PLAY || drv_status == STAT_SEEK);
 // REQUEST 5 track number from the command's c4/c5 BCD digits
 wire [6:0] req_track = {3'd0,c4}*7'd10 + {3'd0,c5};
 
@@ -777,7 +789,10 @@ always @(posedge clk) begin
 
         // sector delivered: advance the head (the consumed half is naturally
         // refetched: after head++ the lba->half mapping asks it for head+1)
-        if (dlv_advance) begin
+        // ...but only PLAY advances it. While seeking, the same target sector
+        // is re-decoded each frame without moving, exactly as upstream
+        // re-reads cdd.lba for the whole latency.
+        if (dlv_advance && drv_status == STAT_PLAY) begin
             if (head != leadout_lba) head <= head + 1'b1;
             else drv_status <= STAT_PAUSE;  // ran into leadout
         end
@@ -895,6 +910,13 @@ always @(posedge clk) begin
                 4'h3: begin                   // SEEK + PLAY
                     if (disc_present) begin
                         seek_target <= comm_lba;
+                        // park the head on the target NOW, as upstream does
+                        // (cdd.lba = lba, before the latency runs). The seek
+                        // latency then re-decodes that sector each frame, the
+                        // prefetch bank fills the target ahead of time, and a
+                        // seek chained off this one measures its distance from
+                        // here rather than from the stale position.
+                        head <= comm_lba;
                         seek_to_play <= 1;
                         seek_cnt <= play_beats_r;
                         drv_status <= STAT_SEEK;
@@ -907,6 +929,7 @@ always @(posedge clk) begin
                 4'h4: begin                   // SEEK + PAUSE
                     if (disc_present) begin
                         seek_target <= comm_lba;
+                        head <= comm_lba;     // as above
                         seek_to_play <= 0;
                         seek_cnt <= pause_beats_r;
                         drv_status <= STAT_SEEK;
