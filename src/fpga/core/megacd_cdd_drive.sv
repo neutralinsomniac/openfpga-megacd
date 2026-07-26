@@ -95,7 +95,21 @@ localparam [3:0] STAT_NO_DISC = 4'hB;
 
 localparam [25:0] BEAT = 26'd715909;      // 13.3ms @ 53.693175MHz
 // Drive tick: sector delivery beat, seek countdown, insertion dance, no-disc
-// drain. This MUST be true 1x (75Hz) because it paces delivery.
+// drain.
+//
+// TRIED AND REVERTED (hardware): setting this to 715909 = true 75Hz. It breaks
+// boot -- never gets past CHECKING DISC with a disc inserted -- and ALSO makes
+// BIOS audio play noticeably slow with NO disc inserted, which nothing about a
+// 2.56% timing change explains and which is NOT understood. With no disc,
+// disc_present is false so owe_inc never fires, and this tick should then only
+// be driving the STOP->NO_DISC drain and the tray dance. Do not simply retry
+// the constant; find what the audio path takes from this tick first.
+//
+// The over-delivery described below is nonetheless real and is the FMV
+// stutter's cause. The untried surgical variant is to leave THIS tick at
+// 698010 so every state machine keeps its present timing, and pace only
+// owe_inc off a separate 75Hz counter -- which bisects "boot depends on the
+// state-tick rate" against "boot depends on the delivery rate".
 //
 // It was 698010 cycles = 76.92Hz, 2.56% fast, which over-delivers by +1.92
 // sectors/sec. A game streaming FMV overruns its read-ahead buffer at that
@@ -105,12 +119,11 @@ localparam [25:0] BEAT = 26'd715909;      // 13.3ms @ 53.693175MHz
 // incrementing in lockstep (i.e. EVERY seek is backward) about once every two
 // seconds, in cadence with the audible stutters.
 //
-// 53693175/75 = 715909 exactly. Note this is numerically the same as BEAT,
-// but ms_tick stays a SEPARATE counter: the boot header capture depends on the
-// delivery beat being phase-decoupled from the 75Hz status frame, and driving
-// delivery off wdog==BEAT directly is what broke the BIOS disc check before.
-// Only the period changes here, not the independence.
-localparam [19:0] TICK_13MS = 20'd715909;
+// 53693175/75 = 715909 exactly, which is numerically the same as BEAT. The
+// theory was that keeping ms_tick a separate counter preserved the
+// phase-decoupling the boot header capture needs, and that only the period
+// changed. Hardware says otherwise -- see the reverted note above.
+localparam [19:0] TICK_13MS = 20'd698010;
 
 wire disc_present = (img_size >= 32'd2352);
 wire [31:0] leadout_lba = img_lba;        // computed at mount
