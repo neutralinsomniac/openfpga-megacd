@@ -632,6 +632,35 @@ int main(int argc,char**argv){
         if((c%50000000)==0 && c) printf("PADCNT [%ld] padvar=%ld padport=%ld\n",c,padvar_rd,padport_rd);
         static bool sub_started=false;
         if(!sub_started && spc!=0){ sub_started=true; printf("[%ld] SUB RELEASED: first sub addr=%06X\n",c,spc); }
+        // MCD_RST_N (= ASIC ERES_N) holds the whole sub system -- sub 68000 and
+        // the CDD drive -- in reset. ASIC.vhd reloads RST_CNT and drops it on
+        // every MAIN_RST_EXEC/SUB_RST_EXEC, so a main that keeps pulsing the
+        // reset register can starve the sub of any window to run in. Report
+        // edges plus a duty summary: if it is mostly HIGH the sub is out of
+        // reset and stuck for some other reason, if it is toggling the main is
+        // resetting it in a loop, if it never rises the release never happens.
+        { static int rst_prev=-1; static long rst_hi=0, edges=0;
+          int rn = dut->rootp->core_top__DOT__MCD_RST_N;
+          if(rn) rst_hi++;
+          if(rn!=rst_prev){
+              if(rst_prev>=0 && edges<20)
+                  printf("[%ld] MCD_RST_N %d -> %d (main=%06X sub=%06X)\n",c,rst_prev,rn,mpc,spc);
+              edges++; rst_prev=rn; }
+          if((c%2000000)==0 && c)
+              printf("MCDRST [%ld] high=%.1f%% edges=%ld now=%d sbrq=%d\n",
+                     c, 100.0*rst_hi/2000000.0, edges, rn,
+                     dut->rootp->core_top__DOT__MCD__DOT__asic__DOT__sbrq), rst_hi=0; }
+        // SBRQ is the main's bus request for the sub. ASIC.vhd:2631/2638 make it
+        // halt the sub 68000 outright (GEN_S68K_HALT <= SBRQ), and it RESETS TO
+        // '1' -- so the sub is born halted and only runs once the main writes
+        // $A12001 with bit1 clear. If this never falls, the sub can be fully out
+        // of reset and still never fetch an instruction.
+        { static int sb_prev=-1; static long sb_edges=0;
+          int sb = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT__sbrq;
+          if(sb!=sb_prev){
+              if(sb_edges<12)
+                  printf("[%ld] SBRQ %d -> %d (main=%06X sub=%06X)\n",c,sb_prev,sb,mpc,spc);
+              sb_edges++; sb_prev=sb; } }
         static uint32_t sub_last=0; static long sub_stuck=0;
         if(spc==sub_last) sub_stuck++; else { sub_stuck=0; sub_last=spc; }
         if(sub_stuck==2000000){ printf("[%ld] sub parked at %06X (main=%06X)\n",c,spc,mpc); }

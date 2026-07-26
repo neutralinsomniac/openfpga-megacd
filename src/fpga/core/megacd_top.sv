@@ -2886,7 +2886,7 @@ wire        MCD_PRG_OE_N /* verilator public_flat_rd */, MCD_PRG_WRL_N, MCD_PRG_
 wire [13:1] MCD_BRAM_ADDR;
 wire  [7:0] MCD_BRAM_DO, MCD_BRAM_DI;
 wire        MCD_BRAM_WE;
-wire        MCD_RST_N;
+wire        MCD_RST_N /* verilator public_flat_rd */;
 
 MCD MCD
 (

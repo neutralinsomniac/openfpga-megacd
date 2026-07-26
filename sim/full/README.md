@@ -216,6 +216,36 @@ explicitly connected in the SV instantiations, or sim and Quartus diverge.
 NEXT: long boot run — watch SRES release, sub BIOS boot, CDD stub comm
 (no-disc model), and the CD-player screen NOT freezing (cursor alive).
 
+## Long boot run DONE: the sub is held by SBRQ, not by reset
+
+200M cycles (~1.3s emulated, 56 frames) with +bios=bios_scd2.hex and a disc
+mounted. The sub never runs, and the earlier note above that it is "still in
+reset" is WRONG:
+
+    [4046]  MCD_RST_N 0 -> 1        and stays high 100% of every window
+    [2]     SBRQ 0 -> 1             and never falls again, all 200M cycles
+
+ASIC.vhd:2631/2638 halt the sub outright off SBRQ (GEN_S68K_HALT <= SBRQ ->
+S68K_HALT_N), and SBRQ RESETS TO '1' (ASIC.vhd:537). So the sub 68000 is born
+halted, comes out of reset almost immediately, and simply never gets to fetch
+— dbg_s68k_a stays 0 the whole run. Anything reading that signal as "the sub
+is in reset" is misreading it.
+
+The main does drive the register: at 15,685,622 it writes $A12000 with bit0=0,
+which pulses MAIN_RST_EXEC (the brief MCD_RST_N dip) and latches SBRQ=1. That
+is the normal "request the sub bus, hold it in reset" step before loading
+PRG-RAM, and the main really is loading PRG-RAM afterwards (the ROMRD split
+shows prgram accesses appear at that point). What never happens is the
+matching release write with bit1 clear.
+
+Not a run-length problem: the 128KB PRG-RAM clear costs ~11M cycles a pass,
+which is why 20-40M runs looked ambiguous, but 200M covers many passes.
+
+Consequence for profiling: sim/full CANNOT reach word RAM, because nothing
+touches it until sub/game code runs. Every workload it can currently produce
+is BIOS ROM plus PRG-RAM. It is therefore not a vehicle for decoding-speed
+work until the SBRQ release is understood. sim/m2 remains the sub-side path.
+
 ## Cursor soft-lock (2026-07-21) — current state
 The CD-player screen renders fully (sim + hardware identical: TRACK 0,
 00:00, NO DISC, cursor) but ignores input. Root: the SUB's main loop is

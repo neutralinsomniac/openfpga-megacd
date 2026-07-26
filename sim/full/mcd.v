@@ -3459,7 +3459,7 @@ module asic_Brtl(clk, rst_n, enable, s68k_a, s68k_di, s68k_as_n, s68k_rnw, s68k_
   wire saor;
   wire [15:0] sb;
   wire [1023:0] sba;
-  wire sbrq;
+  wire sbrq /* verilator public_flat_rd */;
   wire [3:0] sc0;
   wire [3:0] sc1;
   wire [5:0] sc_cnt;
