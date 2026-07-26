@@ -110,12 +110,15 @@ localparam [2:0] FSM_PALL = 3'd4;
 localparam [2:0] FSM_REF  = 3'd5;
 localparam [2:0] FSM_GRANT= 3'd6;
 
-// init-sequence cycle counter (MODE_RESET/LDM/PRE phases only)
+// init-sequence cycle counter. One command is issued per 9-cycle step, at
+// STATE_START; the step boundary (STATE_LAST) is where the init sequencer
+// advances. 9 cycles @107.4MHz = 84ns per step, which covers tRP (20ns) and
+// tRFC (66ns) between consecutive init commands with margin.
 localparam STATE_IDLE  = 4'd0;
 localparam STATE_START = 4'd1;
 localparam STATE_LAST  = 4'd8;
 
-reg  [3:0] state;
+reg  [3:0] state = STATE_IDLE;
 reg  [2:0] fsm = FSM_IDLE;
 reg  [3:0] dly;
 reg [22:1] a;
@@ -193,21 +196,81 @@ localparam MODE_LDM    = 2'b10;
 localparam MODE_PRE    = 2'b11;
 
 // initialization
-reg [1:0] mode;
+//
+// mode MUST have a power-up value, and the sequencer MUST be able to run
+// while it reads MODE_NORMAL. The two blocks are mutually gating: `mode` is
+// only ever written from `state == STATE_LAST` below, and `state` only
+// advances while the main block is in its init branch. With `mode`
+// uninitialized it powers up 2'b00 == MODE_NORMAL on Cyclone V, state stays
+// pinned at STATE_IDLE, STATE_LAST never arrives, and mode is never
+// written -- the whole init sequence is dead and no PRECHARGE, AUTO_REFRESH
+// or LOAD_MODE is ever issued. The chip then runs on whatever its mode
+// register powered up with, which JEDEC leaves undefined.
+//
+// That is not academic: the mode register survives an FPGA reconfiguration
+// (the Pocket keeps the SDRAM powered between core loads), so the core
+// inherits a valid CL3 mode register from whatever core ran before it. That
+// is the "load a different core first, then MegaCD boots" report.
+//
+// The fix is init_active: a single flop that powers up set and owns the bus
+// until the sequence has actually run, so the sequencer no longer depends on
+// mode to bootstrap itself. It also replaces the `mode != MODE_NORMAL`
+// compare in the main block's branch select, so that select gets cheaper,
+// not more expensive -- this file's command path is pin-bound and was
+// already at 9.470ns against a 9.312ns period (see grant() above).
+reg [1:0] mode = MODE_NORMAL;
 reg [4:0] reset=5'h1f;
-always @(posedge clk) begin
-	reg init_old=0;
-	init_old <= init;
+reg       init_active = 1;
 
-	if(init_old & ~init) reset <= 5'h1f;
+// JEDEC power-up: at least 100us of stable clock with NOPs on the bus before
+// the first command. clk is the 107.386MHz RAM clock, so 100us is 10739
+// cycles; 2^14 gives ~153us. Timed from the deassertion of `init`
+// (~pll_core_locked) rather than from configuration, because the PLL output
+// is not a stable clock until it locks. Costs 153us once at boot, against a
+// BIOS download that does not start for tens of ms.
+reg [13:0] pwrup = 0;
+reg        pwrup_done = 0;
+
+// Command-issue enable, registered so neither the 14-input AND above nor the
+// mode compare lands in the SDRAM_nRAS/nCAS/nWE cone. Being a cycle late is
+// exactly right: mode is written on the STATE_LAST edge, so this settles
+// during STATE_IDLE and is stable by STATE_START, where commands issue.
+reg cmd_en = 0;
+
+always @(posedge clk) begin
+	cmd_en <= pwrup_done && (mode != MODE_NORMAL);
+
+	if(init) begin
+		// held while the PLL is unlocked: no counting, no commands
+		reset       <= 5'h1f;
+		pwrup       <= 0;
+		pwrup_done  <= 0;
+		init_active <= 1;
+		mode        <= MODE_NORMAL;
+	end
+	else if(~pwrup_done) begin
+		pwrup <= pwrup + 1'd1;
+		if(&pwrup) pwrup_done <= 1;
+	end
 	else if(state == STATE_LAST) begin
 		if(reset != 0) begin
 			reset <= reset - 5'd1;
-			if(reset == 14)     mode <= MODE_PRE;
+			// PRECHARGE ALL first, then 27 AUTO_REFRESH, then LOAD_MODE --
+			// JEDEC order. It used to be 17 refreshes, PRECHARGE, 10
+			// refreshes, LOAD_MODE; refreshing a chip that has never been
+			// precharged is out of spec, and the whole point of this block
+			// is to stop depending on undefined power-up behaviour.
+			// reset == 31 is the bootstrap step: mode still reads
+			// MODE_NORMAL there and cmd_en is low, so it issues NOPs and
+			// exists only to select MODE_PRE for the step after it.
+			if(reset == 31)     mode <= MODE_PRE;
 			else if(reset == 3) mode <= MODE_LDM;
 			else                mode <= MODE_RESET;
 		end
-		else mode <= MODE_NORMAL;
+		else begin
+			mode        <= MODE_NORMAL;
+			init_active <= 0;
+		end
 	end
 end
 
@@ -292,14 +355,22 @@ always @(posedge clk) begin
 	SDRAM_DQ <= 'Z;
 	{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_NOP;
 
-	if (mode != MODE_NORMAL) begin
-		// init sequencer (original command pattern)
+	// init_active, not `mode != MODE_NORMAL`: mode reads MODE_NORMAL both at
+	// power-up and after every `init` pulse, and gating on it meant state
+	// never advanced, so the sequencer above never got a STATE_LAST to write
+	// mode from. See the long note there -- that deadlock is what left the
+	// chip's mode register unprogrammed.
+	if (init_active) begin
+		// init sequencer
 		state <= state + 1'd1;
 		if(state == STATE_LAST) state <= STATE_IDLE;
 		row_open <= 0;
 		fsm <= FSM_IDLE;
 		ram_req <= 0;
-		if (state == STATE_START) begin
+		// cmd_en holds commands off until the 100us power-up window closes
+		// and a real init phase is selected, so the first command the chip
+		// ever sees is PRECHARGE ALL.
+		if (state == STATE_START && cmd_en) begin
 			SDRAM_BA <= 2'b00;
 			if (mode == MODE_LDM) begin
 				{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_LOAD_MODE;
