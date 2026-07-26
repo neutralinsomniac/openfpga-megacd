@@ -4,6 +4,36 @@ Goal: Verilate the entire megacd core so the real MAIN 68000 (CD-player
 code) drives the sub via real commands, faithfully reproducing the
 CD-player freeze for in-sim debugging.
 
+## Running it (READ THIS FIRST)
+
+    ./obj_dir/tb_full +bios=bios_scd2.hex --cd "/path/to/game.cue" --cycles 40000000
+
+`+bios=` is NOT optional and there is no warning if you forget it. Without
+it the sim SDRAM has no BIOS image, the main 68000 executes empty memory,
+and everything still *looks* alive -- frames render, VBL advances, the
+mstate histogram fills in, the address bus wanders plausibly. Every number
+you collect is meaningless. An entire profiling session was lost to this.
+
+Use `bios_scd2.hex`. It is byte-identical to us_scd2_9306.bin, the BIOS the
+core actually runs on hardware (verified: 65536/65536 words). `bios_us.hex`
+is an older US BIOS that additionally demands an export machine --
+
+    0007BA  MOVE.B $A10001,D0     ; version register
+    0007C0  ANDI.B #$C0,D0
+    0007C4  CMPI.B #$80,D0        ; bit7=1 export, bit6=0 NTSC
+    0007C8  BNE.S  $07CC          ; mismatch -> error, then BRA.S * at $07FA
+
+-- and the core drives .EXPORT(|region_req), where region_req is only ever
+assigned from a CARTRIDGE header (hdr_u/hdr_e/hdr_j). On a CD boot no cart
+loads, so it stays 0 = domestic and that BIOS hangs at $07FA forever. Not a
+core bug; hardware runs the scd2 BIOS, which has no such check.
+
+Also note the "MAIN EXCEPTION VECTOR FETCH" message is a heuristic that
+fires on the first address-bus value in 0x08..0xFF after 1M cycles. The
+BIOS copying its vector table into work RAM ($48..$72 then $FFFD0x) trips
+it during a perfectly healthy boot. Confirm against the main PC before
+believing it.
+
 ## Toolchain (proven)
 yosys -m ghdl converts VHDL -> Verilog; Verilator builds it with the
 native SV/Verilog. See sim/m2/ for the working MCD-only sub-BIOS sim.
