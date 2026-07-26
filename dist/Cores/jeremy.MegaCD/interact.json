@@ -161,7 +161,7 @@
       },
       {
         "name": "HiFi PCM",
-        "id": 60,
+        "id": 61,
         "type": "check",
         "enabled": true,
         "persist": true,
