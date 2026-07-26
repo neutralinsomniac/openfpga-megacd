@@ -1362,7 +1362,6 @@ reg [15:0] reset_delay			 = 0;
 // parts of the design left reset a cycle before others. Reduce it to one
 // registered bit here, then synchronize it once (reset_delay_done below).
 reg        reset_delay_zero	 = 1;
-reg [1:0] cs_cpu_turbo			 = 0;
 // CD access time (menu). 0 = accurate seek timing (default), 1 = fast.
 reg       cs_cd_fast             = 0;
 reg cs_multitap_enable			 = 0;
@@ -1399,7 +1398,12 @@ always @(posedge clk_74a) begin
       casex (bridge_addr)
         32'h00F00000: cs_audio_filter			<= bridge_wr_data[1:0];
         32'h00A00000: cs_fm_chip                <= bridge_wr_data[0];
-        32'h00C00000: cs_cpu_turbo				<= bridge_wr_data[1:0];
+        // 0x00C00000 (CPU Turbo) intentionally absent: this core has no
+        // turbo. gen.sv hardcodes the 68000 divider (/7) and has no TURBO
+        // port -- the Genesis core's system.sv is what uses it, for
+        // VCLKMAX/VCLKMID. The register here was written and never read, so
+        // the menu entry accepted a setting the hardware ignored. Removed
+        // from interact.json too; do not re-add without wiring gen.sv.
         32'h00000120: cs_cd_fast                <= bridge_wr_data[0];
         32'h00000000: cs_multitap_enable 	    <= bridge_wr_data[0];
         32'h00000010: cs_ar_correction_enable 	<= bridge_wr_data[0];
