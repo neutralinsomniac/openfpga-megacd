@@ -28,7 +28,7 @@ disagree with the methods that produced this.
 # Setup
 - Download the latest [release](https://github.com/neutralinsomniac/openfpga-megacd/releases) and extract it to the root of your Pocket's SD card
 - Grab a BIOS and throw it in `/Assets/megacd/common/<whatever>.bin` - the filename technically doesn't matter. Just make sure it ends in .bin
-- Note: I tested everything with BIOS `us_scd2_9306.bin`, md5sum `eb26d7930b3b864a9f56539c20e40c63`
+- Note: I have confirmed that 'Sega CD (U) - Model 2 v2.11x (2.00) (1993).bin' (md5sum ecc837c31d77b774c6e27e38f828aa9a) works
 - Load the MegaCD core, choose your BIOS .bin when prompted
 - Menu -> Core Settings -> Load CD Image -> choose your .cue
 - For first boot only: hit B after the CHECKING DISC/PRESS START shows to get into the BIOS menu. Choose Memory and format your SRAM. Then you can choose "CDROM" to boot
@@ -42,11 +42,7 @@ copy your bios .bin to something like `shining_force.bin` and dedicate the entir
 # Known issues
 
 ## Lunar Eternal Blue
-- FMV audio isn't perfectly synced - this issue exists in the MiSTer upstream core as well
+- FMV audio isn't perfectly synced - this issue exists in the MiSTer upstream core as well, may just be a bad rip
 
 ## Popful Mail
 - Needs the SRAM to be formatted to avoid a crash
-- Intro FMV stutters every few seconds - upstream does this as well, but not as severe
-
-## Sonic CD
-- Slight FMV stuttering in a few places
