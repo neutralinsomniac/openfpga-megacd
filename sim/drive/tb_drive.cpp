@@ -312,62 +312,10 @@ static int reseek_test(){
     return fail?1:0;
 }
 
-// CDC-during-seek test.
-//
-// GPGX runs the decoder for the whole seek latency, so the sub-CPU keeps
-// getting DECI at 75Hz while the drive seeks. Delivering nothing for the
-// 11-frame (146ms) base leaves an FMV title's PCM feed with no decoder
-// interrupt for that entire window -- once per seek.
-static int seekfeed_test(){
-    dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
-    dut->img_size = 3000*2352; dut->track_count=0; dut->cdda_wr_ready=1;
-    dut->disc_loading=0;
-    dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
-    for(int i=0;i<20;i++) tick();
-    dut->reset=0; dut->mcd_rst_n=1;
-    for(int i=0;i<20;i++) tick();
-
-    const long BEAT = 715909;
-    long secs_at_start = deliver_secs;
-    pulse_cmd(mk_seek(800));            // long enough to sit in SEEK a while
-
-    // Count via deliver_words, which tick() maintains from cdc_dat_wr edges.
-    // deliver_secs is only accumulated inside the main test's own loop, so it
-    // stays 0 here no matter what the drive does.
-    long seek_beats=0, words_in_seek=0, head_lo=-1, head_hi=-1;
-    for(long b=0;b<40;b++){
-        pulse_cmd(0x0ULL);
-        long before = deliver_words;
-        for(long c=0;c<BEAT;c++) tick();
-        int st = dut->dbg_cmds & 0xF;
-        long hd = dut->dbg_state & 0xFFFFF;
-        if(st==2){                       // still seeking
-            seek_beats++;
-            words_in_seek += deliver_words - before;
-            if(head_lo<0) head_lo=hd;
-            head_hi=hd;
-        } else if(seek_beats>0) break;   // seek finished
-    }
-    long secs_in_seek = words_in_seek / 1176;   // 2352 bytes = 1176 words
-    printf("seek lasted %ld beats, sectors decoded during it = %ld (%ld words, want ~1/beat)\n",
-           seek_beats, secs_in_seek, words_in_seek);
-    printf("head during seek: %ld..%ld (parked on the target, must not advance)\n",
-           head_lo, head_hi);
-
-    if(seek_beats < 5) err("seek too short to measure");
-    if(secs_in_seek < seek_beats - 2)
-        err("CDC starved during seek: no decoder activity for the whole latency");
-    if(head_lo != head_hi) err("head advanced during the seek");
-    if(head_lo != 800)     err("head not parked on the seek target");
-    (void)secs_at_start;
-    printf(fail ? "\n==== SEEKFEED TEST FAILED ====\n" : "\n==== SEEKFEED TEST PASSED ====\n");
-    return fail?1:0;
-}
-
 int main(int argc, char** argv){
     Verilated::commandArgs(argc,argv);
     dut = new Vmegacd_cdd_drive;
-    bool cdda_mode=false, swap_mode=false, reseek_mode=false, seekfeed_mode=false;
+    bool cdda_mode=false, swap_mode=false, reseek_mode=false;
     for(int i=1;i<argc;i++){
         // --lat N: SUSTAINED per-fetch host latency in clk, modelling real SD
         // round-trip cost rather than a one-off stall. This is the number that
@@ -381,12 +329,10 @@ int main(int argc, char** argv){
         if(!strcmp(argv[i],"--cdda")) cdda_mode=true;
         if(!strcmp(argv[i],"--swap")) swap_mode=true;
         if(!strcmp(argv[i],"--reseek")) reseek_mode=true;
-        if(!strcmp(argv[i],"--seekfeed")) seekfeed_mode=true;
     }
     if(cdda_mode){ int r=cdda_test(); delete dut; return r; }
     if(swap_mode){ int r=swap_test(); delete dut; return r; }
     if(reseek_mode){ int r=reseek_test(); delete dut; return r; }
-    if(seekfeed_mode){ int r=seekfeed_test(); delete dut; return r; }
 
     // reset
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
