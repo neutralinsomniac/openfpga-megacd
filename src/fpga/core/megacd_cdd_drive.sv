@@ -69,6 +69,11 @@ module megacd_cdd_drive
     // the overlay. Upstream exposes this as an option rather than a change
     // because some titles NEED the delay -- GPGX notes the Wolf Team FMV games
     // want >=12 interrupts or they hang -- so the default must stay accurate.
+    //
+    // Status after the delivery-rate fix: FMV is stutter-free on ACCURATE on
+    // hardware, so this is a fallback rather than something to reach for. The
+    // stutter was never really the seek base; it was the backward resyncs the
+    // over-delivery provoked, and each resync merely paid that base.
     input             cd_fast_seek,
     output reg [6:0]  toc_addr,
     input      [65:0] toc_q,
