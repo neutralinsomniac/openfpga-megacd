@@ -494,7 +494,7 @@ core_bridge_cmd icb (
     // mount FSM to openfile it (reopen_req is level-held until the file
     // matches). cd_req_file is clk_sys but stable while cd_req is held.
     reg         reopen_req = 0;
-    reg  [4:0]  reopen_file = 0;
+    reg  [6:0]  reopen_file = 0;
     wire [6:0]  cd_req_file;
     // 2FF + stability filter: cur_file comes from the clk_sys track search
     // and can change while a request is pending
@@ -504,10 +504,10 @@ always @(posedge clk_74a) begin
     crf_s1 <= cd_req_file;
     crf_s2 <= crf_s1;
     if (crf_s1 == crf_s2) crf_stable <= crf_s2;
-    if (reopen_req && {2'd0, opened_file} == crf_stable) reopen_req <= 0;
+    if (reopen_req && opened_file == crf_stable) reopen_req <= 0;
     case (cdf_st)
     2'd0: if (cdreq_s[1] && (!mount_use_slot2
-                             || crf_stable == {2'd0, opened_file})) begin
+                             || crf_stable == opened_file)) begin
         // drive fetch, its bin already open: serve it (top priority)
         tds_offset     <= cd_req_offset;
         tds_bridgeaddr <= {18'h1C000, cd_req_slot, 12'h000}; // 0x7000_{slot}000
@@ -524,7 +524,7 @@ always @(posedge clk_74a) begin
         // came) so the mount never serviced the reopen — the CHECKING-DISC
         // deadlock. This makes forward progress structural, not timing-luck.
         if (cdreq_s[1] && mount_use_slot2) begin
-            reopen_file <= crf_stable[4:0];
+            reopen_file <= crf_stable;
             reopen_req <= 1;
         end
         if (mnt_rd && !mnt_rd_done) begin
@@ -568,17 +568,21 @@ always @(posedge clk_74a) begin
         cd_buf[bridge_addr[13:2]] <= cd_buf_wd;   // {slot[1:0], word[9:0]}
 end
 
-// mount parse buffer: 4KB at bridge 0x7200_0000, raw big-endian packing
+// mount parse buffer: 16KB at bridge 0x7200_0000, raw big-endian packing
 // (byte 0 of the file in bits [31:24]); written by the host during the
-// mount sniff read, read by the cue parser
-reg [31:0] parse_buf [0:1023];
+// mount sniff read, read by the cue parser. 16KB because a cue references
+// one FILE per track and a Red Book disc allows 99 tracks: Lunar's 52-FILE
+// cue is 6.5KB, which the old 4KB buffer silently truncated at ~track 33 —
+// every later track fell off the disc and the game hung mid-intro waiting
+// for track 52 to play.
+reg [31:0] parse_buf [0:4095];
 always @(posedge clk_74a) begin
     if (bridge_wr && bridge_addr[31:24] == 8'h72)
-        parse_buf[bridge_addr[11:2]] <= bridge_endian_little ?
+        parse_buf[bridge_addr[13:2]] <= bridge_endian_little ?
             {bridge_wr_data[7:0], bridge_wr_data[15:8], bridge_wr_data[23:16], bridge_wr_data[31:24]} :
             bridge_wr_data;
 end
-reg [9:0]  pbuf_addr;
+reg [11:0] pbuf_addr;
 reg [31:0] pbuf_q;
 always @(posedge clk_74a) pbuf_q <= parse_buf[pbuf_addr];
 
@@ -626,12 +630,14 @@ wire [6:0]  toc_rd_addr;
 reg  [65:0] toc_rd_q;
 always @(posedge clk_sys) toc_rd_q <= toc_ram_b[toc_rd_addr];
 
-// file table: up to 32 FILE entries per cue. Names live in parse_buf
-// (resident after mount) as {offset, length} pointers.
-reg [19:0] files_nm  [0:31];   // {name_off[11:0], name_len[7:0]}
-reg [19:0] files_secs[0:31];   // file length in 2352-byte sectors
-reg [4:0]  files_addr;
-reg [19:0] files_nm_q, files_secs_q;
+// file table: up to 128 FILE entries per cue (a Red Book disc allows 99
+// tracks, one FILE each). Names live in parse_buf (resident after mount)
+// as {offset, length} pointers.
+reg [21:0] files_nm  [0:127];  // {name_off[13:0], name_len[7:0]}
+reg [19:0] files_secs[0:127];  // file length in 2352-byte sectors
+reg [6:0]  files_addr;
+reg [21:0] files_nm_q;
+reg [19:0] files_secs_q;
 // Two-phase mount: the per-file size probe is ~30 host round-trips per
 // file, so on real hardware a multi-bin cue takes seconds before the
 // whole TOC is known. Disc-present must NOT wait for all of that or the
@@ -642,10 +648,10 @@ reg [19:0] files_nm_q, files_secs_q;
 // present-at-boot; then probe files 1..N-1 in the background and refine
 // the TOC. Background probing yields slot 2 to drive fetches via M_IDLE
 // (reopen_req has priority), so track-1 reads are never starved.
-reg [31:0] fsecs_valid = 0;    // per-file "size probed" mask (else fallback)
+reg [127:0] fsecs_valid = 0;   // per-file "size probed" mask (else fallback)
 reg        lay_prelim = 0;     // current layout is preliminary (more to come)
 reg        pb_active = 0;      // background phase-2 probe running
-reg [5:0]  pb_next = 0;        // next file index to background-probe
+reg [6:0]  pb_next = 0;        // next file index to background-probe
 // Background probing must never starve the drive: the BIOS reads track 1
 // (file 0) throughout CHECKING DISC and boot, and openfiling an audio bin
 // to probe it swaps file 0 out of the single slot. So phase 2 only starts
@@ -684,7 +690,7 @@ reg [3:0]  mnt_term = 0;   // overlay: 1=started, B=READY reached, C=FAILED
 // cue parser state
 localparam CP_FETCH=3'd0, CP_FETCH_W=3'd1, CP_EVAL=3'd2, CP_DONE=3'd3;
 reg [2:0]  cp_st;
-reg [11:0] cp_p;          // byte pointer into parse_buf
+reg [13:0] cp_p;          // byte pointer into parse_buf
 reg [7:0]  cp_ch;
 // line scanner: 0=at line start (skip ws, collect 2-char key), then per-key
 localparam LN_START=4'd0, LN_KEY2=4'd1, LN_SKIP=4'd2,
@@ -703,8 +709,8 @@ reg [1:0]  cp_msf_pos;    // 0=mm 1=ss 2=ff
 reg [24:0] mnt_tmo;       // per-file size watchdog (~0.45s @74MHz)
 reg        cp_is_pgap;    // current MSF belongs to a PREGAP directive
 reg [11:0] cp_pend_pgap;  // PREGAP seen for the current track
-reg [5:0]  cp_files;      // FILE entries seen (file index = cp_files-1)
-reg [11:0] cp_fname_off;  // name capture: offset of first char
+reg [7:0]  cp_files;      // FILE entries seen (file index = cp_files-1)
+reg [13:0] cp_fname_off;  // name capture: offset of first char
 reg [7:0]  cp_fname_len;
 reg [19:0] cp_i00;        // INDEX 00 (in-file gap start), file-relative
 reg        cp_i00_v;      // INDEX 00 seen for the current track
@@ -718,10 +724,10 @@ reg        mp_found;
 reg [9:0]  bp_o;          // output byte index in the openfile param area
 reg [2:0]  bp_ph;
 reg [7:0]  bp_src;
-reg [4:0]  mnt_file;      // file being opened (phase B / reopen)
+reg [6:0]  mnt_file;      // file being opened (phase B / reopen)
 reg        mnt_reopen = 0;
-reg [4:0]  opened_file = 0;
-reg [11:0] bp_nm_off;
+reg [6:0]  opened_file = 0;
+reg [13:0] bp_nm_off;
 reg [7:0]  bp_nm_len;
 // per-file size divider + layout pass
 reg [31:0] fdiv_in;       // dividend: size from 008A or the datatable
@@ -741,7 +747,7 @@ reg        pr_ok;
 // instead of paying the 2ms size-notification grace and reseeding [0,2^20)
 // from scratch. Without this a drive fetch arriving mid-probe costs all the
 // round-trips already spent, and a busy drive can starve the refine forever.
-reg [4:0]  pr_file;
+reg [6:0]  pr_file;
 reg        pr_valid = 0;
 reg        mnt_rd_err = 0;       // result of the last mount-channel read
 reg [6:0]  lay_t;
@@ -823,8 +829,8 @@ always @(posedge clk_74a) begin
             mnt_offset <= 0;
             // round DOWN to a whole word: a read past EOF (even one byte,
             // from rounding up an unaligned cue size) is a firmware error
-            mnt_len <= (dataslot_update_size < 32'd4096)
-                       ? {dataslot_update_size[31:2], 2'b00} : 32'd4096;
+            mnt_len <= (dataslot_update_size < 32'd16384)
+                       ? {dataslot_update_size[31:2], 2'b00} : 32'd16384;
             mnt_rd <= 1;
             tds_id <= 16'd1;         // sniff reads the CD slot itself
             mnt_term <= 4'h1;
@@ -853,8 +859,8 @@ always @(posedge clk_74a) begin
             // into slot 2 (opened_file follows); if the drive then needs
             // file 0 back mid-probe, pb_yield aborts us straight back here
             // and the reopen above wins.
-            mnt_file <= pb_next[4:0];
-            files_addr <= pb_next[4:0];
+            mnt_file <= pb_next;
+            files_addr <= pb_next;
             mnt_reopen <= 0;
             mnt_st <= M_BPATH_TAB;
         end
@@ -882,11 +888,11 @@ always @(posedge clk_74a) begin
     end
     M_PARSE: begin
         case (cp_st)
-        CP_FETCH: begin pbuf_addr <= cp_p[11:2]; cp_st <= CP_FETCH_W; end
+        CP_FETCH: begin pbuf_addr <= cp_p[13:2]; cp_st <= CP_FETCH_W; end
         CP_FETCH_W: cp_st <= CP_EVAL;
         CP_EVAL: begin
-            if (pbuf_byte==8'h00 || cp_p==12'hFFF ||
-                {20'd0,cp_p} >= mnt_len) cp_st <= CP_DONE;
+            if (pbuf_byte==8'h00 || cp_p==14'h3FFF ||
+                {18'd0,cp_p} >= mnt_len) cp_st <= CP_DONE;
             else begin
                 cp_p <= cp_p + 1'b1;
                 cp_st <= CP_FETCH;
@@ -911,8 +917,8 @@ always @(posedge clk_74a) begin
                     end else if (pbuf_byte==8'h0A) cp_ln <= LN_START;
                 LN_FNAME:
                     if (pbuf_byte==8'h22) begin
-                        if (cp_files < 6'd32) begin
-                            files_nm[cp_files[4:0]] <= {cp_fname_off, cp_fname_len};
+                        if (cp_files < 8'd128) begin
+                            files_nm[cp_files[6:0]] <= {cp_fname_off, cp_fname_len};
                             cp_files <= cp_files + 1'b1;
                         end
                         cp_ln <= LN_SKIP;
@@ -982,7 +988,7 @@ always @(posedge clk_74a) begin
                             // M_LAYOUT rewrites it once sizes are known
                             toc_wr_addr <= cp_track;
                             toc_wr_data <= {cp_audio, cp_pgap8, cp_pre01,
-                                            {2'd0, cp_files[4:0]-5'd1},
+                                            cp_files[6:0]-7'd1,
                                             20'd0, cp_raw[19:0]};
                             toc_wr_en <= 1;
                             cp_pend_pgap <= 0;
@@ -1046,7 +1052,7 @@ always @(posedge clk_74a) begin
         // files_nm_q latency, then latch the name pointer
         mp_ph <= mp_ph + 1'b1;
         if (mp_ph == 2'd2) begin
-            bp_nm_off <= files_nm_q[19:8];
+            bp_nm_off <= files_nm_q[21:8];
             bp_nm_len <= files_nm_q[7:0];
             bp_o <= 0; bp_ph <= 0;
             mp_ph <= 0;
@@ -1064,14 +1070,14 @@ always @(posedge clk_74a) begin
                 mnt_st <= M_BTAIL;
             end else begin
                 fbuf_addr <= {2'd0, bp_o[7:2]};           // dir source word
-                pbuf_addr <= (bp_nm_off + {2'd0, bp_o - mp_dirlen}) >> 2;
+                pbuf_addr <= (bp_nm_off + {4'd0, bp_o - mp_dirlen}) >> 2;
                 bp_ph <= 3'd1;
             end
         end
         3'd1: bp_ph <= 3'd2;
         3'd2: begin : bpsrc
-            reg [11:0] nidx;
-            nidx = bp_nm_off + {2'd0, bp_o - mp_dirlen};
+            reg [13:0] nidx;
+            nidx = bp_nm_off + {4'd0, bp_o - mp_dirlen};
             if (bp_o >= mp_dirlen + {2'd0, bp_nm_len})
                 bp_src <= 8'h00;                          // terminator
             else if (bp_o < mp_dirlen)
@@ -1233,12 +1239,12 @@ always @(posedge clk_74a) begin
                 // now sized. Lay out a preliminary TOC — file 0 exact, the
                 // rest fallback — and assert the disc present-at-boot. If
                 // this is the only file, the preliminary layout is final.
-                lay_prelim <= (cp_files > 6'd1);
+                lay_prelim <= (cp_files > 8'd1);
                 lay_t <= 7'd1; lay_ph <= 0;
                 lay_delta <= 0; lay_disc_end <= 0;
                 lay_prev_file <= 7'h7F;
                 mnt_st <= M_LAYOUT;
-            end else if (pb_next + 6'd1 < cp_files) begin
+            end else if ({1'b0, pb_next} + 8'd1 < cp_files) begin
                 // PHASE 2: more audio bins to size — yield through M_IDLE
                 pb_next <= pb_next + 1'b1;
                 mnt_st <= M_IDLE;
@@ -1272,7 +1278,7 @@ always @(posedge clk_74a) begin
         3'd1: lay_ph <= 3'd2;
         3'd2: begin
             lay_e <= toc_a_q;
-            files_addr <= toc_a_q[44:40];
+            files_addr <= toc_a_q[46:40];
             lay_ph <= 3'd3;
         end
         3'd3: lay_ph <= 3'd4;
@@ -1297,7 +1303,7 @@ always @(posedge clk_74a) begin
             // exact size once the file is probed; until then (preliminary
             // layout, or a background-probe still pending) fall back to
             // "this track's start + ~6 min" so the disc has a usable extent
-            lay_disc_end <= d + (fsecs_valid[lay_e[44:40]] ? files_secs_q
+            lay_disc_end <= d + (fsecs_valid[lay_e[46:40]] ? files_secs_q
                                  : (lay_e[19:0] + 20'd27000));
             lay_prev_file <= lay_e[46:40];
             if (lay_t == cp_tmax) lay_ph <= 3'd5;
