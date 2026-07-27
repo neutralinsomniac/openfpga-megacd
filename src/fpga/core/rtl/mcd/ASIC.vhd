@@ -617,6 +617,12 @@ begin
 						when "00101" => null;	--$A1200A Reserved
 						when "00110" => null;	--$A1200C Stop watch (read only)
 						when "00111" =>			--$A1200E Communication flag
+							-- deliberately NOT gated on UDS/LDS: real hardware
+							-- ignores the lane strobes here, so a byte write to
+							-- either $A1200E or $A1200F sets CFM from the
+							-- (68000-mirrored) data byte. Verified upstream via
+							-- mcd-verificator; Space Ace and Dragon's Lair rely
+							-- on the odd-address form ("!LWR is ignored").
 							CFM <= EXT_VDI(15 downto 8);
 						when "01000" =>			--$A12010 Communication command 0
 							if EXT_LDS_N = '0' then
@@ -945,6 +951,10 @@ begin
 							when "0000110" =>			--$FF800C Stop Watch
 								SW_CLR <= '1';
 							when "0000111" =>			--$FF800E Communication flag
+								-- deliberately NOT gated on UDS/LDS (see the
+								-- $A1200E note): byte writes to $FF800E or
+								-- $FF800F both set CFS, per mcd-verificator
+								-- ("!LDS and !UDS are ignored").
 								CFS <= S68K_DI(7 downto 0);
 							when "0001000" => null;	--$FF8010 Communication command 0 (read only)
 							when "0001001" => null;	--$FF8012 Communication command 1 (read only)
