@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 
 static Vmegacd_cdd_drive* dut;
 static vluint64_t tk = 0;
@@ -31,6 +32,13 @@ static bool     req_d = false;
 
 // ---- mock cd_buf: 1-cycle read latency; value encodes file byte offset ----
 static uint32_t buf_addr_d = 0;
+// real-bin mode: serve sector fetches from an actual disc image
+static FILE*   bin_data = nullptr;
+static uint8_t binbuf[4][2368];
+// CDDA sector capture (edge-exact, lives in tick() so no word is missed)
+static bool     cap_on = false, cap_ready = false;
+static long     cap_secw = 0, cap_head = -1;
+static uint16_t cap_sec[1176];
 // When set, the mock returns a REAL MODE1/2352 sync (00 FF*10 00) in the first
 // 12 bytes of every sector, so the drive's sync check sees a well-formed data
 // sector. Left off by default: the other tests encode the file offset in every
@@ -69,7 +77,12 @@ static void tick(){
     uint32_t slot = (a >> 10) & 3, word = a & 0x3FF;
     // present previous-cycle address' data (1-cycle latency modelled below)
     uint32_t bslot = (buf_addr_d >> 10) & 3, bword = buf_addr_d & 0x3FF;
-    if (mock_valid_sync && bword < 3)
+    if (bin_data)
+        dut->cd_buf_q = ((uint32_t)binbuf[bslot][bword*4])
+                      | ((uint32_t)binbuf[bslot][bword*4+1] << 8)
+                      | ((uint32_t)binbuf[bslot][bword*4+2] << 16)
+                      | ((uint32_t)binbuf[bslot][bword*4+3] << 24);
+    else if (mock_valid_sync && bword < 3)
         dut->cd_buf_q = (bword==0) ? 0xFFFFFF00u        // bytes 00 FF FF FF
                       : (bword==1) ? 0xFFFFFFFFu        // bytes FF FF FF FF
                                    : 0x00FFFFFFu;       // bytes FF FF FF 00
@@ -86,6 +99,12 @@ static void tick(){
         if (((off/2352) & 3) != s) err("cd_req_slot != (lba & 3)");
         slot_off[s] = off;
         slot_file[s] = dut->cd_req_file;
+        if (bin_data){
+            memset(binbuf[s], 0, 2352);
+            fseek(bin_data, off, SEEK_SET);
+            size_t got = fread(binbuf[s], 1, 2352, bin_data);
+            (void)got;
+        }
         long lba = off/2352; if(lba > g_max_fetch_lba) g_max_fetch_lba = lba;
         fetch_idx++;
     }
@@ -105,7 +124,14 @@ static void tick(){
     if (datwr && !datwr_d){ deliver_words++; g_dlv_file = slot_file[bslot]; }
     datwr_d = datwr;
     bool cddawr = dut->cdc_cdda_wr;
-    if (cddawr && !cddawr_d) cdda_words++;
+    if (cddawr && !cddawr_d){
+        cdda_words++;
+        if (cap_on){
+            if (cap_secw==0) cap_head = dut->dbg_state & 0xFFFFF;
+            if (cap_secw<1176) cap_sec[cap_secw] = dut->cdc_data;
+            if (++cap_secw==1176){ cap_secw=0; cap_ready=1; }
+        }
+    }
     cddawr_d = cddawr;
 
     // TOC RAM model (1-cycle latency, matching altsyncram read port)
@@ -517,6 +543,214 @@ static int gap_test(){
     return fail?1:0;
 }
 
+// End-of-track auto-pause (Shining Force CD title-jingle / intro handoff).
+// GPGX ground truth (headless libretro run of shining.cue, CDD logging): the
+// game plays track 2 with an exact INDEX 01 seek (cmd 3006331900); while it
+// plays, the BIOS rotates REQUEST polls 2000/2001/2002 (abs time / rel time /
+// track number) one per 75Hz frame, and sends Pause (cmd 6) ~4 frames after
+// the track-number report flips to the next track -- upstream's drive parks
+// ~5 sectors into the 150-frame silent gap, so nothing of track 3 is heard.
+// This test replays that exact host sequence against the real Shining Force
+// TOC numbers and fails if ANY nonzero CDDA word is delivered at/after the
+// track 2 -> gap boundary (bleed), or if the reports would make the BIOS
+// pause late (track report not flipping when the head crosses).
+// CD_DAC FIFO model (CDDA_FIFO.v numbers): 1280-word capacity, drains one
+// stereo sample per ~1217 clk (44.1kHz @ 53.693175MHz), WRITE_READY while
+// filled <= 1280-588. Two cdc_cdda_wr edges = one 32-bit FIFO word.
+static long dacfifo_filled = 0, dacfifo_drain = 0;
+static int  dacfifo_halfword = 0;
+static void dacfifo_tick(){
+    bool w = dut->cdc_cdda_wr;
+    static bool w_d = false;
+    if (w && !w_d){ if(++dacfifo_halfword == 2){ dacfifo_halfword=0; dacfifo_filled++; } }
+    w_d = w;
+    if (++dacfifo_drain >= 1217){ dacfifo_drain = 0; if (dacfifo_filled) dacfifo_filled--; }
+    dut->cdda_wr_ready = (dacfifo_filled <= (1280-588)) ? 1 : 0;
+}
+
+static int jingle_test(){
+    dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
+    dut->img_size = 200000u*2352u; dut->track_count=3; dut->cdda_wr_ready=1;
+    dut->cd_fast_seek=0; dut->disc_loading=0;
+    dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
+    // shining.cue, single bin: t2 INDEX00 29195 INDEX01 29344 (pre01 149),
+    // t3 INDEX00 29945 INDEX01 30095 (pre01 150). Boundary under test: 29945.
+    toc_set(1, /*audio*/false, 0,   0, /*file*/0, /*delta*/0, /*disc*/0);
+    toc_set(2, /*audio*/true,  0, 149, /*file*/0, /*delta*/0, /*disc*/29344);
+    toc_set(3, /*audio*/true,  0, 150, /*file*/0, /*delta*/0, /*disc*/30095);
+    for(int i=0;i<20;i++) tick();
+    dut->reset=0; dut->mcd_rst_n=1;
+    for(int i=0;i<20;i++) tick();
+
+    const long BEAT = 715909;
+    const long T2_END = 29945, T3_START = 30095;
+    pulse_cmd(mk_seek(29750));           // late in the jingle (track 2 proper)
+
+    long gap_words=0, gap_nz=0, t3_words=0, t3_nz=0;
+    long cross_beat=-1, flip_beat=-1, pause_beat=-1, dm_head=-1;
+    int  rot=0; bool cw=false, dm_d=dut->cdd_dm;
+    for(long b=0;b<400;b++){
+        uint64_t cmd;
+        if(pause_beat<0 && flip_beat>=0 && b >= flip_beat+4){
+            cmd = 0x6; pause_beat = b;   // BIOS auto-pause, 4 frames after flip
+        } else {
+            cmd = 0x2 | ((uint64_t)(rot)<<12); rot = (rot+1)%3;
+        }
+        pulse_cmd(cmd);
+        for(long c=0;c<BEAT;c++){
+            tick();
+            dacfifo_tick();
+            long h = dut->dbg_state & 0xFFFFF;
+            if(cross_beat<0 && h >= T2_END) cross_beat = b;
+            bool dm = dut->cdd_dm;
+            if(dm && !dm_d && dm_head<0 && b>2) dm_head = h;
+            dm_d = dm;
+            bool w = dut->cdc_cdda_wr;
+            if(w && !cw){
+                if(h >= T2_END && h < T3_START){ gap_words++; if(dut->cdc_data) gap_nz++; }
+                if(h >= T3_START)              { t3_words++;  if(dut->cdc_data) t3_nz++; }
+            }
+            cw = w;
+        }
+        // reply to this beat's poll (latched at the beat edge just passed)
+        int n1=(dut->cdd_stat>>4)&0xF, n2=(dut->cdd_stat>>8)&0xF, n3=(dut->cdd_stat>>12)&0xF;
+        if(flip_beat<0 && n1==2 && (n2*10+n3)==3) flip_beat = b;
+        if(pause_beat>=0 && b >= pause_beat+40) break;
+    }
+    long head_end = dut->dbg_state & 0xFFFFF;
+    int  drv = (dut->dbg_cmds) & 0xF;
+    printf("--- jingle results ---\n");
+    printf("head crossed %ld at beat %ld; track report flipped to 03 at beat %ld\n",
+           T2_END, cross_beat, flip_beat);
+    printf("cdd_dm went 1 at head=%ld (want %ld)\n", dm_head, T2_END);
+    printf("pause sent at beat %ld; final head=%ld status=%d (want gap park: %ld..%ld, status 4)\n",
+           pause_beat, head_end, drv, T2_END, T3_START);
+    printf("gap  CDDA words=%ld nonzero=%ld (want 0 nonzero)\n", gap_words, gap_nz);
+    printf("t3   CDDA words=%ld nonzero=%ld (want NONE AT ALL)\n", t3_words, t3_nz);
+
+    if(cross_beat<0)                err("head never reached the track 2 end boundary");
+    if(flip_beat<0)                 err("track-number report never flipped to 03");
+    // the BIOS polls track number only every 3rd frame (2000/2001/2002
+    // rotation), so a flip can surface up to 3 beats after the crossing --
+    // GPGX has the identical poll latency (pause landed at crossing+4/5)
+    if(cross_beat>=0 && flip_beat>=0 && flip_beat > cross_beat+3)
+                                    err("track report flipped LATE -> BIOS auto-pause would be late");
+    if(dm_head<0)                   err("cdd_dm never rose at the track end");
+    if(dm_head>=0 && (dm_head < T2_END-1 || dm_head > T2_END+2))
+                                    err("cdd_dm rose at the wrong head position");
+    if(pause_beat<0)                err("pause was never sent (no flip seen)");
+    if(drv!=4)                      err("drive not PAUSED at the end");
+    if(head_end < T2_END || head_end >= T3_START)
+                                    err("pause did not park the head inside the gap");
+    if(gap_nz != 0)                 err("gap leaked nonzero CDDA (bleed)");
+    if(t3_words != 0 || t3_nz != 0) err("track 3 was reached/delivered before the pause (bleed)");
+
+    printf(fail ? "\n==== JINGLE TEST FAILED ====\n" : "\n==== JINGLE TEST PASSED ====\n");
+    return fail?1:0;
+}
+
+// Delivered-content audit against the REAL disc image. The jingle test above
+// proves the protocol (reports/flag/pause) is right; this proves (or refutes)
+// that the SAMPLES delivered at head H are actually file[H]. Motivated by the
+// Shining Force CD bleed forensics: the rip's INDEX 00 gaps are digitally
+// silent, yet pre-d8b0da45 hardware audibly played "2s of the next track"
+// during the gap -- impossible unless the delivered content is offset from
+// the head by about a pregap (+150). Plays the tail of the title jingle
+// (track 2) from the real bin and byte-compares every delivered CDDA sector
+// against file[head], file[head+149] and file[head+150].
+static int content_test(const char* binpath){
+    bin_data = fopen(binpath, "rb");
+    if(!bin_data){ printf("FAIL: cannot open %s\n", binpath); return 1; }
+    fseek(bin_data, 0, SEEK_END);
+    long fsz = ftell(bin_data);
+
+    dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
+    dut->img_size = (uint32_t)fsz; dut->track_count=4; dut->cdda_wr_ready=1;
+    dut->cd_fast_seek=0; dut->disc_loading=0;
+    dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
+    toc_set(1, /*audio*/false, 0,   0, 0, 0, 0);
+    toc_set(2, /*audio*/true,  0, 149, 0, 0, 29344);
+    toc_set(3, /*audio*/true,  0, 150, 0, 0, 30095);
+    toc_set(4, /*audio*/true,  0, 150, 0, 0, 31578);
+    for(int i=0;i<20;i++) tick();
+    dut->reset=0; dut->mcd_rst_n=1;
+    for(int i=0;i<20;i++) tick();
+
+    const long BEAT = 715909;
+    cap_on = true; cap_ready = false; cap_secw = 0;
+    pulse_cmd(mk_seek(29750));           // tail of the jingle (track 2)
+
+    long m_h=0, m_h149=0, m_h150=0, m_none=0, gap_z=0, gap_nz=0;
+    for(long b=0;b<380;b++){
+        pulse_cmd(0x0ULL);
+        for(long c=0;c<BEAT;c++){
+            tick();
+            dacfifo_tick();
+            if(cap_ready){
+                cap_ready = false;
+                long h_start = cap_head;
+                uint16_t* cursec = cap_sec;
+                {
+                    if(h_start>=29750 && h_start<29945){
+                        uint8_t fb[3][2352];
+                        long offs[3] = {h_start, h_start+149, h_start+150};
+                        int verdict=-1;
+                        for(int k=0;k<3;k++){
+                            fseek(bin_data, offs[k]*2352L, SEEK_SET);
+                            if(fread(fb[k],1,2352,bin_data)!=2352) memset(fb[k],0xAA,2352);
+                            bool ok=true;
+                            for(int wd=0; wd<1176 && ok; wd++){
+                                uint16_t e = (uint16_t)fb[k][wd*2] | ((uint16_t)fb[k][wd*2+1]<<8);
+                                if(cursec[wd]!=e) ok=false;
+                            }
+                            if(ok){ verdict=k; break; }
+                        }
+                        if(verdict==0) m_h++;
+                        else if(verdict==1) m_h149++;
+                        else if(verdict==2) m_h150++;
+                        else {
+                            if(m_none==0){
+                                int fd=-1;
+                                for(int wd=0; wd<1176 && fd<0; wd++){
+                                    uint16_t e = (uint16_t)fb[0][wd*2] | ((uint16_t)fb[0][wd*2+1]<<8);
+                                    if(cursec[wd]!=e) fd=wd;
+                                }
+                                printf("  first mismatching sector: head=%ld first diff word=%d\n", h_start, fd);
+                                for(int wd=(fd<3?0:fd-3); wd<fd+5 && wd<1176; wd++){
+                                    uint16_t e = (uint16_t)fb[0][wd*2] | ((uint16_t)fb[0][wd*2+1]<<8);
+                                    printf("    w%-4d dlv=%04x file[h]=%04x file[h+150]=%04x\n",
+                                           wd, cursec[wd], e,
+                                           (uint16_t)fb[2][wd*2] | ((uint16_t)fb[2][wd*2+1]<<8));
+                                }
+                            }
+                            m_none++;
+                        }
+                    } else if(h_start>=29945 && h_start<30095){
+                        bool z=true;
+                        for(int wd=0; wd<1176 && z; wd++) if(cursec[wd]) z=false;
+                        if(z) gap_z++; else gap_nz++;
+                    }
+                }
+            }
+        }
+        if((dut->dbg_state & 0xFFFFF) >= 30100) break;
+    }
+    cap_on = false;
+    printf("--- content audit (track 2 tail, real bin) ---\n");
+    printf("sectors matching file[head]     : %ld  (correct)\n", m_h);
+    printf("sectors matching file[head+149] : %ld  (SHIFTED)\n", m_h149);
+    printf("sectors matching file[head+150] : %ld  (SHIFTED)\n", m_h150);
+    printf("sectors matching none           : %ld\n", m_none);
+    printf("gap sectors zero/nonzero        : %ld/%ld\n", gap_z, gap_nz);
+    if(m_h < 100)           err("too few correct sectors delivered");
+    if(m_h149 || m_h150)    err("delivered content is OFFSET from the head");
+    if(m_none)              err("delivered content matches nothing in the file");
+    if(gap_nz)              err("gap leaked nonzero CDDA");
+    printf(fail ? "\n==== CONTENT TEST FAILED ====\n" : "\n==== CONTENT TEST PASSED ====\n");
+    fclose(bin_data); bin_data=nullptr;
+    return fail?1:0;
+}
+
 static int swap_test(){
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
     dut->img_size = 0; dut->track_count=1; dut->cdda_wr_ready=1; dut->cd_fast_seek=0; dut->disc_loading=0;
@@ -666,7 +900,8 @@ static int reseek_test(){
 int main(int argc, char** argv){
     Verilated::commandArgs(argc,argv);
     dut = new Vmegacd_cdd_drive;
-    bool cdda_mode=false, swap_mode=false, reseek_mode=false, pause_mode=false, scan_mode=false, binswap_mode=false, integ_mode=false, gap_mode=false;
+    bool cdda_mode=false, swap_mode=false, reseek_mode=false, pause_mode=false, scan_mode=false, binswap_mode=false, integ_mode=false, gap_mode=false, jingle_mode=false;
+    const char* content_bin=nullptr;
     for(int i=1;i<argc;i++){
         // --lat N: SUSTAINED per-fetch host latency in clk, modelling real SD
         // round-trip cost rather than a one-off stall. This is the number that
@@ -685,6 +920,8 @@ int main(int argc, char** argv){
         if(!strcmp(argv[i],"--binswap")) binswap_mode=true;
         if(!strcmp(argv[i],"--integ")) integ_mode=true;
         if(!strcmp(argv[i],"--gap")) gap_mode=true;
+        if(!strcmp(argv[i],"--jingle")) jingle_mode=true;
+        if(!strcmp(argv[i],"--content")&&i+1<argc) content_bin=argv[++i];
     }
     if(cdda_mode){ int r=cdda_test(); delete dut; return r; }
     if(swap_mode){ int r=swap_test(); delete dut; return r; }
@@ -694,6 +931,8 @@ int main(int argc, char** argv){
     if(binswap_mode){ int r=binswap_test(); delete dut; return r; }
     if(integ_mode){ int r=integ_test(); delete dut; return r; }
     if(gap_mode){ int r=gap_test(); delete dut; return r; }
+    if(jingle_mode){ int r=jingle_test(); delete dut; return r; }
+    if(content_bin){ int r=content_test(content_bin); delete dut; return r; }
 
     // reset
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
