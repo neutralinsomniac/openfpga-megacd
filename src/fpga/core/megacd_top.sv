@@ -2685,9 +2685,9 @@ assign joystick_0 = {
     cont1_key_s[8],  // X
     cont1_key_s[14], // mode
     lightgun_enabled  ? 1'b0 : cont1_key_s[15], // start
-    cont1_key_s[4],  // B
-    cont1_key_s[5],  // C
-    cont1_key_s[7],  // A
+    cont1_key_s[4],  // C (Pocket A)
+    cont1_key_s[5],  // B (Pocket B)
+    cont1_key_s[7],  // A (Pocket Y)
     cont1_key_s[0],                                        // up
     cont1_key_s[1],                                        // down
     cont1_key_s[2],                                        // left
@@ -2700,9 +2700,9 @@ assign joystick_1 = {
     cont2_key_s[8],  // X
     cont2_key_s[14], // mode
     cont2_key_s[15], // start
-    cont2_key_s[4],  // B
-    cont2_key_s[5],  // C
-    cont2_key_s[7],  // A
+    cont2_key_s[4],  // C (Pocket A)
+    cont2_key_s[5],  // B (Pocket B)
+    cont2_key_s[7],  // A (Pocket Y)
     cont2_key_s[0],  // up
     cont2_key_s[1],  // down
     cont2_key_s[2],  // left
@@ -2715,9 +2715,9 @@ assign joystick_2 = {
     cont3_key_s[8],  // X
     cont3_key_s[14], // mode
     cont3_key_s[15], // start
-    cont3_key_s[4],  // B
-    cont3_key_s[5],  // C
-    cont3_key_s[7],  // A
+    cont3_key_s[4],  // C (Pocket A)
+    cont3_key_s[5],  // B (Pocket B)
+    cont3_key_s[7],  // A (Pocket Y)
     cont3_key_s[0],  // up
     cont3_key_s[1],  // down
     cont3_key_s[2],  // left
@@ -2730,9 +2730,9 @@ assign joystick_3 = {
     cont4_key_s[8],  // X
     cont4_key_s[14], // mode
     cont4_key_s[15], // start
-    cont4_key_s[4],  // B
-    cont4_key_s[5],  // C
-    cont4_key_s[7],  // A
+    cont4_key_s[4],  // C (Pocket A)
+    cont4_key_s[5],  // B (Pocket B)
+    cont4_key_s[7],  // A (Pocket Y)
     cont4_key_s[0],  // up
     cont4_key_s[1],  // down
     cont4_key_s[2],  // left
@@ -2896,11 +2896,10 @@ gen gen
 	// 3-button pad (MiSTer default): the model-2 BIOS mishandles 6-button
 	// probing in the CD player (cursor won't move)
 	.J3BUT(1'b1),
-	// MiSTer gen.sv expects bit6=C/bit5=B; the Pocket builder packs bit6=B/bit5=C
-	.JOY_1({joystick_0[11:7], joystick_0[5], joystick_0[6], joystick_0[4:0]}),
-	.JOY_2({joystick_1[11:7], joystick_1[5], joystick_1[6], joystick_1[4:0]}),
-	.JOY_3({joystick_2[11:7], joystick_2[5], joystick_2[6], joystick_2[4:0]}),
-	.JOY_4({joystick_3[11:7], joystick_3[5], joystick_3[6], joystick_3[4:0]}),
+	.JOY_1(joystick_0[11:0]),
+	.JOY_2(joystick_1[11:0]),
+	.JOY_3(joystick_2[11:0]),
+	.JOY_4(joystick_3[11:0]),
 	.JOY_5(12'h000),
 	.MULTITAP(3'b000),
 
