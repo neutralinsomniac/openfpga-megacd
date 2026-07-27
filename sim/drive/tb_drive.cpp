@@ -467,6 +467,56 @@ static int integ_test(){
     return fail?1:0;
 }
 
+// In-file INDEX 00 gap (pre01): GPGX holds the "no audio playing" flag from
+// the previous track's end until INDEX 01 and gates the DAC on it, so the
+// gap's file content is NEVER heard -- it plays as silence. Regression for
+// the Shining Force CD symptom of ~2s of the next song bleeding through
+// after the intro. Two-sided: the gap must be silent AND the track proper
+// must still deliver real file bytes (a mute that never lifts would pass a
+// one-sided check).
+static int gap_test(){
+    dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
+    dut->img_size = 4000*2352; dut->track_count=2; dut->cdda_wr_ready=1;
+    dut->cd_fast_seek=1; dut->disc_loading=0;
+    dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
+    // single-file cue: track 2 audio, INDEX 01 at disc 2000, 150-sector
+    // in-file INDEX 00 region before it (region start 1850)
+    toc_set(1, /*audio*/false, 0,   0, /*file*/0, /*delta*/0, /*disc*/0);
+    toc_set(2, /*audio*/true,  0, 150, /*file*/0, /*delta*/0, /*disc*/2000);
+    for(int i=0;i<20;i++) tick();
+    dut->reset=0; dut->mcd_rst_n=1;
+    for(int i=0;i<20;i++) tick();
+
+    const long BEAT = 715909;
+    pulse_cmd(mk_seek(1830));            // late in the data track
+    long gap_words=0, gap_nz=0, post_words=0, post_nz=0;
+    bool cw=false;
+    for(long b=0;b<200;b++){
+        pulse_cmd(0x0ULL);
+        for(long c=0;c<BEAT;c++){
+            tick();
+            bool w = dut->cdc_cdda_wr;
+            if(w && !cw){
+                long h = dut->dbg_state & 0xFFFFF;
+                if(h >= 1850 && h < 2000){ gap_words++;  if(dut->cdc_data) gap_nz++; }
+                if(h >= 2004 && h < 2050){ post_words++; if(dut->cdc_data) post_nz++; }
+            }
+            cw = w;
+        }
+        if((dut->dbg_state & 0xFFFFF) >= 2050) break;
+    }
+    printf("gap  (1850..1999): %ld CDDA words, %ld nonzero (want 0 nonzero)\n",
+           gap_words, gap_nz);
+    printf("track (2004..2049): %ld CDDA words, %ld nonzero (want mostly nonzero)\n",
+           post_words, post_nz);
+    if(gap_words < 1000) err("gap was not delivered through the CDDA path at all");
+    if(gap_nz != 0)      err("in-file INDEX 00 gap leaked file audio (GPGX plays silence)");
+    if(post_nz < post_words/2) err("track proper is silent past INDEX 01 (mute never lifted)");
+
+    printf(fail ? "\n==== GAP TEST FAILED ====\n" : "\n==== GAP TEST PASSED ====\n");
+    return fail?1:0;
+}
+
 static int swap_test(){
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
     dut->img_size = 0; dut->track_count=1; dut->cdda_wr_ready=1; dut->cd_fast_seek=0; dut->disc_loading=0;
@@ -616,7 +666,7 @@ static int reseek_test(){
 int main(int argc, char** argv){
     Verilated::commandArgs(argc,argv);
     dut = new Vmegacd_cdd_drive;
-    bool cdda_mode=false, swap_mode=false, reseek_mode=false, pause_mode=false, scan_mode=false, binswap_mode=false, integ_mode=false;
+    bool cdda_mode=false, swap_mode=false, reseek_mode=false, pause_mode=false, scan_mode=false, binswap_mode=false, integ_mode=false, gap_mode=false;
     for(int i=1;i<argc;i++){
         // --lat N: SUSTAINED per-fetch host latency in clk, modelling real SD
         // round-trip cost rather than a one-off stall. This is the number that
@@ -634,6 +684,7 @@ int main(int argc, char** argv){
         if(!strcmp(argv[i],"--scan")) scan_mode=true;
         if(!strcmp(argv[i],"--binswap")) binswap_mode=true;
         if(!strcmp(argv[i],"--integ")) integ_mode=true;
+        if(!strcmp(argv[i],"--gap")) gap_mode=true;
     }
     if(cdda_mode){ int r=cdda_test(); delete dut; return r; }
     if(swap_mode){ int r=swap_test(); delete dut; return r; }
@@ -642,6 +693,7 @@ int main(int argc, char** argv){
     if(scan_mode){ int r=scan_test(); delete dut; return r; }
     if(binswap_mode){ int r=binswap_test(); delete dut; return r; }
     if(integ_mode){ int r=integ_test(); delete dut; return r; }
+    if(gap_mode){ int r=gap_test(); delete dut; return r; }
 
     // reset
     dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;

@@ -217,6 +217,17 @@ assign cd_req_file = cur_file;
 // sector is inside the NEXT track's virtual pregap: silence, not file data
 wire in_pregap = !head[31] && (head[19:0] >= pgap_lo) && (head[19:0] < pgap_hi)
                  && (head[31:20] == 12'd0);
+// audio-track position before its INDEX 01: the in-file INDEX 00 region.
+// GPGX holds the "no audio playing" flag (0x36) through it and its DAC gate
+// reads samples only while that flag is low, so the gap's FILE CONTENT is
+// never heard -- it plays as silence for the pre01 duration. Delivering the
+// file bytes here instead is audible on rips whose INDEX 00 regions carry
+// the head of the next song: Shining Force CD played ~2s of the next track
+// after its intro (pre01 = 149 frames = the 2s heard) before this gate.
+// Together with in_pregap (the virtual window before INDEX 00) this covers
+// the whole [prev track end, INDEX 01) span, exactly like upstream's flag.
+wire aud_gap = cur_audio && !head[31] && (head[31:20] == 12'd0) &&
+               (head[19:0] < cur_start);
 assign dbg_pos = {n1, cur_audio, in_pregap, cur_track[5:0], dbg_seek_lba};
 assign dbg_integ = {dbg_badsync_cnt, dbg_badsync_lba, cur_audio, in_pregap, 2'b00};
 // disc LBA -> file LBA for fetch/delivery
@@ -460,7 +471,7 @@ wire [31:0] hf1 = head_file + 32'd1;
 wire [31:0] hf2 = head_file + 32'd2;
 wire [31:0] hf3 = head_file + 32'd3;
 wire       head_banked = buf_valid[hf0[1:0]] && buf_lba[hf0[1:0]] == hf0[20:0];
-wire       want_head = !head[31] && !in_pregap && !head_banked;
+wire       want_head = !head[31] && !in_pregap && !aud_gap && !head_banked;
 wire       want_next = !hf1[31] && !in_pregap &&
                        !(buf_valid[hf1[1:0]] && buf_lba[hf1[1:0]] == hf1[20:0]);
 // deep look-ahead only when head is positive, not in a pregap window, and the
@@ -577,7 +588,7 @@ always @(posedge clk) begin
         dlv_w  <= 0;
         dlv_slot <= head_file[1:0];
         dlv_neg  <= head[31];
-        dlv_pgap <= in_pregap && !head[31];   // virtual pregap: silence
+        dlv_pgap <= (in_pregap || aud_gap) && !head[31];  // pregap: silence
         dlv_aud  <= (cur_audio || in_pregap) && !head[31];
         dlv_hold <= dlv_hold_req;
         dlv_stamp <= apply_tog;
@@ -660,7 +671,7 @@ wire [6:0] req_track = {3'd0,c4}*7'd10 + {3'd0,c5};
 // to the DAC and null-ticks the CDC, per upstream's "audio blocks are still
 // sent to CDC as well".
 wire tick_data_ok = disc_present && toc_settled && !head[31] && !in_pregap &&
-                    !cur_audio && head_banked;
+                    !aud_gap && !cur_audio && head_banked;
 reg  [3:0] dec_tick_hold = 0;   // 8-clk stretcher for cdc_dec_tick
 
 always @(posedge clk) begin
