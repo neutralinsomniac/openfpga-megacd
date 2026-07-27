@@ -623,7 +623,13 @@ begin
 							-- (68000-mirrored) data byte. Verified upstream via
 							-- mcd-verificator; Space Ace and Dragon's Lair rely
 							-- on the odd-address form ("!LWR is ignored").
-							CFM <= EXT_VDI(15 downto 8);
+							-- And like CFS below, the latched value comes from
+							-- the LOW data byte even on word writes (upstream
+							-- mem68k.c "Mortal Kombat" note: byte.h = data &
+							-- 0xff) -- for byte writes the 68000's lane
+							-- mirroring makes the two reads identical, so only
+							-- move.w with differing bytes can tell.
+							CFM <= EXT_VDI(7 downto 0);
 						when "01000" =>			--$A12010 Communication command 0
 							if EXT_LDS_N = '0' then
 								CC(0)(7 downto 0) <= EXT_VDI(7 downto 0);
