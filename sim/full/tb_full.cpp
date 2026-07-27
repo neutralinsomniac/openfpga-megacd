@@ -35,8 +35,19 @@ static FILE* fopen_fat(const char* path){
 }
 static vluint64_t t=0; double sc_time_stamp(){return t;}
 
+// graceful stop: SIGTERM/SIGINT set the flag, the main loop breaks and the
+// normal end-of-run dumps (PRG RAM, work RAM, PC rings) still execute
+#include <signal.h>
+static volatile sig_atomic_t g_stop = 0;
+static void on_stop(int){ g_stop = 1; }
+// distinct-address rings, filled in the main loop, dumped at exit
+uint32_t g_mring[65536], g_sring[65536];
+uint64_t g_mri = 0, g_sri = 0;
+
 int main(int argc,char**argv){
     Verilated::commandArgs(argc,argv);
+    signal(SIGTERM, on_stop);
+    signal(SIGINT,  on_stop);
     long maxc = 40000000;
     for(int i=1;i<argc;i++) if(!strcmp(argv[i],"--cycles")&&i+1<argc) maxc=atol(argv[++i]);
 
@@ -52,7 +63,7 @@ int main(int argc,char**argv){
     dut->port_tran_sck=0; dut->port_tran_sd=0; dut->dbg_rx=0; dut->user2=0;
 
     bool did_reset_exit=false;
-    for(long c=0;c<maxc;c++){
+    for(long c=0;c<maxc && !g_stop;c++){
         dut->clk_74a = !dut->clk_74a;
         // once PLL is locked + SDRAM preloaded, APF "Reset Exit" -> reset_n=1
         if(!did_reset_exit && c==4000){
@@ -85,6 +96,25 @@ int main(int argc,char**argv){
               if(!psi){ psi=true; const char* e=getenv("PRESS_START");
                         if(e) sscanf(e,"%ld,%ld",&ps0,&ps1); }
               if(ps0>=0 && c>=ps0 && c<ps1) k |= 1u<<15; }
+            // MASH_FROM=<cycle>: alternate Genesis C (Pocket A, bit4) and B
+            // (bit5) presses to advance dialogue -- 5-frame press, 70-frame
+            // cycle, mirroring the GPGX ground-truth runner's masher
+            { static long mf=-1; static bool mfi=false;
+              if(!mfi){ mfi=true; const char* e=getenv("MASH_FROM");
+                        if(e) mf=atol(e); }
+              if(mf>=0 && c>=mf){
+                  long ph = ((c-mf)/3580000) % 70;
+                  if(ph<5) k |= 1u<<4;
+                  else if(ph>=35 && ph<40) k |= 1u<<5;
+              } }
+            // START_PULSES=from,until : press START for 10 frames every 300
+            // frames inside the window (title screen -> menu -> FMV skip)
+            { static long sp0=-1, sp1=-1; static bool spi=false;
+              if(!spi){ spi=true; const char* e=getenv("START_PULSES");
+                        if(e) sscanf(e,"%ld,%ld",&sp0,&sp1); }
+              if(sp0>=0 && c>=sp0 && c<sp1){
+                  if((((c-sp0)/3580000)%300)<10) k |= 1u<<15;
+              } }
             dut->cont1_key = k;
         }
 
@@ -115,7 +145,7 @@ int main(int argc,char**argv){
             { static bool tpi=false; if(!tpi){ tpi=true;
                 const char* e=getenv("TOCPOST_AT"); if(e) tocpost_at=atol(e); } }
             if(c==tocpost_at){
-                for(int t=1;t<=30;t++){
+                for(int t=1;t<=60;t++){
                     auto& w=dut->rootp->core_top__DOT__toc_ram_b[t];
                     uint64_t lo=((uint64_t)w[1]<<32)|w[0]; uint32_t hi=w[2];
                     printf("  TOCAT[%d]: audio=%d pgap=%d pre01=%d file=%d delta=%d disc_lba=%d\n",
@@ -470,6 +500,15 @@ int main(int argc,char**argv){
 
         uint32_t mpc = dut->rootp->core_top__DOT__dbg_m68k_a & 0xFFFFFF;
         uint32_t spc = dut->rootp->core_top__DOT__dbg_s68k_a & 0xFFFFFF;
+
+        // ---- last-64K distinct-address rings (both CPUs), dumped at exit.
+        // Sized to hold several rounds of the Lunar RPC livelock (~120 Hz)
+        // so the frozen loop can be read straight out of the dump.
+        { static uint32_t lm=0xFFFFFFFF, ls=0xFFFFFFFF;
+          extern uint32_t g_mring[65536], g_sring[65536];
+          extern uint64_t g_mri, g_sri;
+          if(mpc!=lm){ g_mring[g_mri++ & 65535]=mpc; lm=mpc; }
+          if(spc!=ls){ g_sring[g_sri++ & 65535]=spc; ls=spc; } }
         auto* r = dut->rootp;
 
         // PCTRACE=<file>: dump the sub-CPU's distinct-PC sequence once it is
@@ -837,6 +876,30 @@ int main(int argc,char**argv){
           // framed, decode + DTTRG counters) and the seek/backseek counters.
           // The stall shows up as head frozen with drv_status=4 while the
           // seek counters stop and the framed header stops tracking head.
+          // ---- Lunar-freeze auto-detect: the drive parked in PAUSE with a
+          // frozen head for >3 emulated seconds after boot is the RPC
+          // livelock (GPGX resumes within ~100ms of every pause). Break out
+          // so the end-of-run dumps capture the deadlock, hours early.
+          { static long frz_since=-1;
+            if((c%2000000)==0 && c>10000000000L){
+              auto& R = *r;
+              unsigned st  = R.core_top__DOT__cdd_drive__DOT__drv_status;
+              unsigned hd  = R.core_top__DOT__cdd_drive__DOT__head & 0xFFFFF;
+              unsigned aud = R.core_top__DOT__cdd_drive__DOT__cur_audio;
+              unsigned lc0 = R.core_top__DOT__cdd_drive__DOT__dbg_last_real_c0;
+              static unsigned lhd=0xFFFFFFF;
+              if(st==4 && hd==lhd && aud && lc0==6){
+                  if(frz_since<0) frz_since=c;
+                  else if(c-frz_since > 650000000L){
+                      printf("[%ld] FREEZE DETECTED: drive paused, head=%u "
+                             "static for >3s emulated -- stopping for dumps\n",
+                             c, hd);
+                      fflush(stdout);
+                      g_stop=1;
+                  }
+              } else frz_since=-1;
+              lhd=hd;
+            } }
           { static bool on = getenv("CDTRACE")!=nullptr;
             if(on && (c%2000000)==0 && c){
               auto& R = *r;
@@ -955,6 +1018,26 @@ int main(int argc,char**argv){
                 fclose(fp); }
 #endif
         printf("wrote prgram_end.bin\n");
+    }
+    {   // work RAM (64KB at $FF0000) + distinct-PC rings for the freeze
+        FILE*fp;
+#ifndef REALSD
+        fp=fopen("wram_end.bin","wb");
+        if(fp){ for(uint32_t w=0x400000;w<0x408000;w++){
+                    uint16_t v=dut->rootp->core_top__DOT__sdram__DOT__mem[w];
+                    fputc(v>>8,fp); fputc(v&0xFF,fp); }
+                fclose(fp); printf("wrote wram_end.bin\n"); }
+#endif
+        fp=fopen("subpc_ring.txt","w");
+        if(fp){ uint64_t n = g_sri<65536 ? g_sri : 65536;
+                for(uint64_t i=g_sri-n;i<g_sri;i++) fprintf(fp,"%06X\n",g_sring[i&65535]);
+                fclose(fp); printf("wrote subpc_ring.txt (%llu entries, %llu total)\n",
+                                   (unsigned long long)n,(unsigned long long)g_sri); }
+        fp=fopen("mainpc_ring.txt","w");
+        if(fp){ uint64_t n = g_mri<65536 ? g_mri : 65536;
+                for(uint64_t i=g_mri-n;i<g_mri;i++) fprintf(fp,"%06X\n",g_mring[i&65535]);
+                fclose(fp); printf("wrote mainpc_ring.txt (%llu entries, %llu total)\n",
+                                   (unsigned long long)n,(unsigned long long)g_mri); }
     }
     printf("ST2 word-RAM selftest: ph=%d err=%d\n",
            dut->rootp->core_top__DOT__st2_ph, dut->rootp->core_top__DOT__st2_err);
