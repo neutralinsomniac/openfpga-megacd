@@ -256,6 +256,8 @@ endfunction
 
 wire [3:0] curtrk_bcd10 = div10(cur_track);
 wire [3:0] curtrk_bcd1  = mod10(cur_track);
+// head past the last track = the lead-out (GPGX: cdd.index >= cdd.toc.last)
+wire in_leadout = !head[31] && (head >= leadout_lba);
 wire [3:0] last_bcd10   = (track_count==0) ? 4'd0 : div10(track_count);
 wire [3:0] last_bcd1    = (track_count==0) ? 4'd1 : mod10(track_count);
 
@@ -900,12 +902,16 @@ always @(posedge clk) begin
                 msf_lba <= leadout_lba + 32'd150; msf_start <= 1; rpt_st <= 3'd2;
             end
             K_TRK_REQ: begin    // REQUEST 2: full payload
-                n2 <= curtrk_bcd10; n3 <= curtrk_bcd1;
+                // GPGX: track number reads 0x0A0A ("AA") once the head is
+                // past the last track (index >= toc.last), i.e. the lead-out
+                n2 <= in_leadout ? 4'hA : curtrk_bcd10;
+                n3 <= in_leadout ? 4'hA : curtrk_bcd1;
                 n4 <= 0; n5 <= 0; n6 <= 0; n7 <= 0; n8 <= 0;
                 rpt_st <= 3'd0;
             end
             K_TRK_STAT: begin   // Get-Status with RS1==2: RS2-3 only (GPGX)
-                n2 <= curtrk_bcd10; n3 <= curtrk_bcd1;
+                n2 <= in_leadout ? 4'hA : curtrk_bcd10;
+                n3 <= in_leadout ? 4'hA : curtrk_bcd1;
                 rpt_st <= 3'd0;
             end
             K_FIRSTLAST: begin
