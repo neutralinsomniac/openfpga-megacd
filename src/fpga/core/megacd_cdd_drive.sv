@@ -793,12 +793,21 @@ always @(posedge clk) begin
                 end
                 // scanning disc
                 if (drv_status == STAT_SCAN && disc_present) begin
-                    if (!scan_rev) begin
-                        if (head + {24'd0, SCAN_STEP} >= leadout_lba) begin
+                    if (!scan_rev) begin : scan_fwd
+                        // step first, then bound-check the NEW position like
+                        // upstream. The compare must not run unsigned: a head
+                        // parked in the track-1 pregap (negative, a real BIOS
+                        // boot position) would wrap past leadout_lba and
+                        // teleport to end-of-disc; upstream clamps it to 0.
+                        reg [31:0] nh;
+                        nh = head + {24'd0, SCAN_STEP};
+                        if (nh[31]) begin
+                            head <= 0;                // start of first track
+                        end else if (nh >= leadout_lba) begin
                             head <= leadout_lba;      // end of disc
                             drv_status <= STAT_END;
                             cdd_dm     <= 1'b1;
-                        end else head <= head + {24'd0, SCAN_STEP};
+                        end else head <= nh;
                     end else begin
                         if ($signed(head) <= $signed({24'd0, SCAN_STEP})) begin
                             head <= 0;                // start of first track
@@ -1020,7 +1029,11 @@ always @(posedge clk) begin
                     apply_tog <= ~apply_tog;
                 end
                 4'h2: begin                   // Report TOC infos (type in c3)
-                    if (disc_present) begin
+                    // invalid request codes (7..F) touch NOTHING upstream --
+                    // no RS0/RS1, no payload. Assigning n1 here for them left
+                    // RS1=0xF poisoned, which the next Get-Status would
+                    // misread as "seeking has ended".
+                    if (disc_present && c3 <= 4'h6) begin
                         n0 <= drv_status;
                         n1 <= c3;
                         case (c3)
@@ -1036,9 +1049,9 @@ always @(posedge clk) begin
                             rpt_kind <= K_TRKSTART; rpt_st <= 3'd1;
                         end
                         4'h6: begin rpt_kind <= K_ERRINFO;   rpt_st <= 3'd1; end
-                        default: ; // invalid request: regs unchanged (GPGX)
+                        default: ; // unreachable (c3 <= 6 gated above)
                         endcase
-                    end else begin
+                    end else if (c3 <= 4'h6) begin
                         // no-disc: zeroed payload (stub heritage; proven
                         // boot path -- documented divergence)
                         n0 <= drv_status; n1 <= c3; zeros;
