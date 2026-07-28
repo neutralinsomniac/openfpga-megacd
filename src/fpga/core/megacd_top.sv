@@ -2041,7 +2041,11 @@ always @(posedge current_pix_clk) begin
         video_rgb_reg[7:0]   <= (lg_target && lightgun_enabled && show_crosshair) ? {8{lg_target[2]}} : blue;
 
         // bring-up debug overlay, gated behind the "Debug Overlay" core
-        // setting (0x110); quasi-static config bit, safe to sample here
+        // setting (0x110); quasi-static config bit, safe to sample here.
+        // Excluded from synthesis (EWJ-SE fix): the work-RAM read cache
+        // needs the ~LABs this renderer and its feeder counters cost; the
+        // overlay remains available in Verilator builds.
+`ifdef VERILATOR
         if (cs_debug_overlay) begin
         // 4 blocks top-left — sub-CPU alive, CDD command
         // seen, word-RAM requested, word-RAM completed (green=yes, red=no)
@@ -2094,6 +2098,7 @@ always @(posedge current_pix_clk) begin
             end
         end
         end // cs_debug_overlay
+`endif
     end
 
     // count ACTIVE lines only — dbg_y counted blanking lines before, which
@@ -2168,23 +2173,24 @@ assign MCD_PRG_DI   = sdr_do;
 wire [15:0] GEN_MEM_DO;
 wire        GEN_MEM_BUSY /* verilator public_flat_rd */;
 
-// ---- BIOS ROM cache (32KB, direct-mapped) --------------------------------
+// ---- BIOS ROM cache (16KB, direct-mapped) --------------------------------
 // The main CPU executes from and blits from the MCD ROM window; serving it
 // from SDRAM cost ~43 clk_sys (~10 CPU wait cycles) per word and starved
 // the main to ~25% throughput during the BIOS boot animations. A full
 // 128KB BRAM copy needs 128 M10K blocks and overflows the device (fitter:
-// 325/308); a 16Kx19 direct-mapped cache (16 data + 2 tag + 1 valid packed
-// per entry = exactly 32 M10K) serves hits in 2 cycles. The animations
-// re-blit the same ROM assets every frame, so steady-state hit rate is
-// ~100%; misses fall through to the (open-row) SDRAM path and fill.
-reg [18:0] bios_cache [0:16383];
+// 325/308); a direct-mapped cache serves hits in 2 cycles, misses fall
+// through to the (open-row) SDRAM path and fill. Halved from 16K to 8K
+// entries (19->20 bits/entry, 3-bit tag) to free ~18 M10K for the work-RAM
+// read cache (EWJ-SE fix): during gameplay the ROM window is nearly idle,
+// and the boot animations' hot blit set still mostly fits in 16KB.
+reg [19:0] bios_cache [0:8191];
 reg        bc_flushing = 1;
-reg [13:0] bc_flush_a = 0;
+reg [12:0] bc_flush_a = 0;
 
 reg        brom_busy /* verilator public_flat_rd */ = 0;
 reg        brom_hold = 0;
 reg  [2:0] bc_st = 0;
-reg [18:0] bc_q;
+reg [19:0] bc_q;
 reg [15:0] brom_dout;
 reg [15:0] bc_addr;
 reg        bc_miss_req = 0;
@@ -2198,7 +2204,7 @@ always @(posedge clk_sys) begin
 		brom_busy <= 0; brom_hold <= 0; bc_st <= 0; bc_miss_req <= 0;
 		bc_flushing <= 1; bc_flush_a <= 0;
 	end else if (bc_flushing) begin
-		bios_cache[bc_flush_a] <= 19'd0;
+		bios_cache[bc_flush_a] <= 20'd0;
 		{bc_flushing, bc_flush_a} <= {1'b1, bc_flush_a} + 1'b1;
 	end else begin
 		case (bc_st)
@@ -2207,11 +2213,11 @@ always @(posedge clk_sys) begin
 			// live bus address, hit/miss decided next cycle (2-cycle hits)
 			brom_busy <= 1;
 			bc_addr   <= GEN_VA[16:1];
-			bc_q      <= bios_cache[GEN_VA[14:1]];
+			bc_q      <= bios_cache[GEN_VA[13:1]];
 			bc_st     <= BC_CHECK;
 		end
 		BC_CHECK: begin
-			if (bc_q[18] && bc_q[17:16] == bc_addr[15:14]) begin
+			if (bc_q[19] && bc_q[18:16] == bc_addr[15:13]) begin
 				brom_dout <= bc_q[15:0];
 				brom_busy <= 0;
 				brom_hold <= 1;
@@ -2224,12 +2230,95 @@ always @(posedge clk_sys) begin
 		BC_MISS: if (p1_rom_done) begin
 			bc_miss_req <= 0;
 			brom_dout   <= p1_dout;
-			bios_cache[bc_addr[13:0]] <= {1'b1, bc_addr[15:14], p1_dout};
+			bios_cache[bc_addr[12:0]] <= {1'b1, bc_addr[15:13], p1_dout};
 			brom_busy   <= 0;
 			brom_hold   <= 1;
 			bc_st       <= 0;
 		end
 		default: bc_st <= 0;
+		endcase
+	end
+end
+
+// ---- Genesis work-RAM read cache (32KB, direct-mapped) -------------------
+// EWJ-SE investigation: the game's 68K code executes from work RAM, and its
+// per-frame sound service collapses when the average access cost rises by
+// ~2-3 SDRAM clocks over the port-1 baseline (sim cliff between +sdlat1=12
+// and 14; on hardware, refresh + cross-port contention during CD loads push
+// past it — jingles crawl, notes stick keyed-on). A full 64KB BRAM copy
+// needs 64 M10K (8Kx1 mode) and overflows the device (fitter: 315/308 even
+// at 16K entries); this 8Kx19 cache (16 data + 2 tag + 1 valid, 19 M10K)
+// serves read hits in 3 cycles.
+// Write-through: writes go to SDRAM port 1 as before and update a matching
+// entry in place (byte-merged); misses fall through to port 1 and fill.
+// Index = word addr [13:1], tag = addr[15:14].
+reg [18:0] gwc [0:8191];
+reg        gwc_flushing = 1;
+reg [12:0] gwc_flush_a = 0;
+reg [18:0] gwc_q;
+reg        gwc_busy /* verilator public_flat_rd */ = 0;
+reg        gwc_hold = 0;
+reg [15:0] gwc_dout;
+reg [14:0] gwc_a;
+reg  [1:0] gwc_st = 0;
+reg        gwc_fill_pend = 0;    // miss fill when port-1 read completes
+
+wire gw_acc = ~GEN_RAM_CE_N & (~GEN_OE_N | ~GEN_WRL_N | ~GEN_WRH_N);
+wire gw_rd  = ~GEN_RAM_CE_N & ~GEN_OE_N;
+
+localparam GWC_CHECK = 2'd1, GWC_MISS = 2'd2;
+
+always @(posedge clk_sys) begin
+	if (~gw_acc) gwc_hold <= 0;
+	if (reset | bios_download) begin
+		gwc_busy <= 0; gwc_hold <= 0; gwc_st <= 0;
+		gwc_fill_pend <= 0;
+		gwc_flushing <= 1; gwc_flush_a <= 0;
+	end else if (gwc_flushing) begin
+		gwc[gwc_flush_a] <= 19'd0;
+		{gwc_flushing, gwc_flush_a} <= {1'b1, gwc_flush_a} + 1'b1;
+	end else begin
+		case (gwc_st)
+		2'd0: begin
+			if (gw_acc & ~gwc_hold) begin
+				gwc_a <= GEN_VA[15:1];
+				gwc_q <= gwc[GEN_VA[13:1]];
+				if (gw_rd) begin
+					gwc_busy <= 1;         // read: lookup, decide next cycle
+					gwc_st   <= GWC_CHECK;
+				end else begin
+					// write: port 1 carries it (RDY comes from there). Cache
+					// policy kept mux-free for area: a full-word write
+					// allocates the slot outright, a byte write invalidates
+					// it (no read-merge datapath).
+					gwc_hold <= 1;
+					if (GEN_WRL_N | GEN_WRH_N)
+						gwc[GEN_VA[13:1]] <= 19'd0;
+					else
+						gwc[GEN_VA[13:1]] <= {1'b1, GEN_VA[15:14], GEN_VDO};
+				end
+			end
+		end
+		GWC_CHECK: begin
+			if (gwc_q[18] && gwc_q[17:16] == gwc_a[14:13]) begin
+				gwc_dout <= gwc_q[15:0];
+				gwc_busy <= 0;
+				gwc_hold <= 1;
+				gwc_st   <= 0;
+			end else begin
+				gwc_fill_pend <= 1;        // ask port 1 to fetch it
+				gwc_st        <= GWC_MISS;
+			end
+		end
+		GWC_MISS: if (p1_ram_done) begin
+			gwc_fill_pend <= 0;
+			gwc_dout <= p1_dout;
+			gwc[gwc_a[12:0]] <= {1'b1, gwc_a[14:13], p1_dout};
+			gwc_busy <= 0;
+			gwc_hold <= 1;
+			gwc_st   <= 0;
+		end
+		default: gwc_st <= 0;
 		endcase
 	end
 end
@@ -2259,6 +2348,9 @@ reg  [15:0] p1_din;
 reg  [15:0] p1_dout /* verilator public_flat_rd */;
 
 wire p1_ram_acc = ~GEN_RAM_CE_N & (~GEN_OE_N | ~GEN_WRL_N | ~GEN_WRH_N);
+wire p1_wr_acc  = ~GEN_RAM_CE_N & (~GEN_WRL_N | ~GEN_WRH_N);
+reg  gw_wr_ack = 0;
+reg  p1_ram_done = 0;
 wire p1_rom_acc = ~GEN_ROM_CE_N & ~GEN_OE_N;
 
 always @(posedge clk_sys) begin
@@ -2266,6 +2358,8 @@ always @(posedge clk_sys) begin
 	old_b1 <= GEN_MEM_BUSY;
 	p1_rom_done <= 0;  // one-cycle completion pulse to the ROM cache
 	if (~p1_ram_acc) p1_ram_hold <= 0;
+	if (~p1_wr_acc)  gw_wr_ack <= 0;
+	p1_ram_done <= 0;
 	if (~bc_miss_req) p1_rom_hold <= 0;
 	if (reset | bios_download) begin
 		p1_act <= 0; p1_started <= 0;
@@ -2273,14 +2367,21 @@ always @(posedge clk_sys) begin
 		p1_ram_busy <= 0; p1_rom_busy <= 0;
 		p1_ram_hold <= 0; p1_rom_hold <= 0;
 	end else if (!p1_act) begin
-		if (p1_ram_acc & ~p1_ram_hold) begin
+		// Work-RAM traffic: writes (write-through) and read-cache misses.
+		// wr_ack tracks acceptance of the CURRENT bus write so RDY can no
+		// longer alias a previous access's drain (see hazard note above the
+		// cache: a >28clk drain overlapping the 68K's next access previously
+		// false-accepted it — stale read data / lost writes at high SDRAM
+		// latency).
+		if ((p1_wr_acc & ~gw_wr_ack | gwc_fill_pend) & ~p1_ram_hold) begin
 			p1_act  <= 1; p1_started <= 0; p1_owner <= 0;
 			p1_addr <= {9'b010000000, GEN_VA[15:1]};
 			p1_din  <= GEN_VDO;
-			p1_rd   <= ~GEN_OE_N;
+			p1_rd   <= ~p1_wr_acc;
 			p1_wrl  <= ~GEN_WRL_N;
 			p1_wrh  <= ~GEN_WRH_N;
 			p1_ram_busy <= 1;
+			if (p1_wr_acc) gw_wr_ack <= 1;
 		end else if (bc_miss_req & ~p1_rom_hold) begin
 			p1_act  <= 1; p1_started <= 0; p1_owner <= 1;
 			p1_addr <= {8'b01111000, bc_addr};
@@ -2290,7 +2391,7 @@ always @(posedge clk_sys) begin
 		if (GEN_MEM_BUSY) p1_started <= 1;
 		if (p1_started & old_b1 & ~GEN_MEM_BUSY) begin
 			p1_dout <= GEN_MEM_DO;
-			if (!p1_owner) begin p1_ram_busy <= 0; p1_ram_hold <= 1; end
+			if (!p1_owner) begin p1_ram_busy <= 0; p1_ram_hold <= 1; p1_ram_done <= 1; end
 			else          begin p1_rom_done <= 1; p1_rom_hold <= 1; end
 			p1_act <= 0; p1_rd <= 0; p1_wrl <= 0; p1_wrh <= 0;
 		end
@@ -2935,7 +3036,7 @@ gen gen
 	.OBJ_LIMIT_HIGH(cs_obj_limit_high_enable),
 
 	.RAM_CE_N(GEN_RAM_CE_N),
-	.RAM_RDY(~p1_ram_busy),
+	.RAM_RDY(~(gwc_busy | gw_wr_ack)),
 	.RFS(),
 	.RFS_RDY(1'b1),
 
@@ -2961,8 +3062,8 @@ assign GEN_DTACK_N = MCD_DTACK_N & CART_DTACK_N;
 reg [15:0] GEN_MEM_DO_R;
 always @(posedge clk_sys) begin
 	reg old_bsy;
-	old_bsy <= p1_ram_busy;
-	if(old_bsy & ~p1_ram_busy) GEN_MEM_DO_R <= p1_dout;
+	old_bsy <= gwc_busy;
+	if(old_bsy & ~gwc_busy) GEN_MEM_DO_R <= gwc_dout;
 end
 
 ///////////////////////////////////////////////

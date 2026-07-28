@@ -511,6 +511,117 @@ int main(int argc,char**argv){
           if(spc!=ls){ g_sring[g_sri++ & 65535]=spc; ls=spc; } }
         auto* r = dut->rootp;
 
+        // ---- SNDTRACE=1: Genesis-side sound-driver activity trace ----
+        // Logs YM2612 register writes (address-latch reconstructed per bank),
+        // YM status reads seen by the Z80 (poll rate + flag value), 68K-side
+        // writes into Z80 RAM (driver upload, mailbox, DAC buffer fills), Z80
+        // BUSREQ duty, and a coarse Z80 PC-region histogram. Built for the
+        // EWJ-SE "jingle late / note stuck" investigation.
+        {
+            static bool si=false, st=false;
+            if(!si){ si=true; const char* e=getenv("SNDTRACE"); st = e && *e=='1'; }
+            if(st){
+                static uint32_t wc_prev=0; static int ymaddr[2]={-1,-1};
+                static long dacn=0, keyon_n=0;
+                uint32_t wc = r->core_top__DOT__gen__DOT__DBG_FM_WR_CNT;
+                if(wc!=wc_prev){
+                    int port = r->core_top__DOT__gen__DOT__DBG_FM_WR_PORT;
+                    int d    = r->core_top__DOT__gen__DOT__DBG_FM_WR_DATA;
+                    int bank = (port>>1)&1;
+                    if(wc != wc_prev+1)
+                        printf("[%ld] YMWR MISSED %u events\n", c, wc-wc_prev-1);
+                    if(!(port&1)) ymaddr[bank]=d;
+                    else {
+                        int reg=ymaddr[bank];
+                        if(bank==0 && reg==0x2A){
+                            if((dacn++ & 1023)==0)
+                                printf("[%ld] YMDAC 1024 samples (last=%02X)\n",c,d);
+                        } else if(bank==0 && reg==0x27){
+                            static long tick_n=0; static long tick_c0=0;
+                            if(tick_n==0) tick_c0=c;
+                            tick_n++;
+                            if((tick_n & 255)==0)
+                                printf("[%ld] YMTICK reg27<=%02X  #%ld  avg period %.0f cyc (%.1f Hz)\n",
+                                       c,d,tick_n,(double)(c-tick_c0)/tick_n,
+                                       214800000.0*tick_n/(double)(c-tick_c0));
+                        } else if(bank==0 && reg==0x28){
+                            keyon_n++;
+                            printf("[%ld] YMKEY %02X (keyon #%ld)\n",c,d,keyon_n);
+                        } else if(reg<0x30 || (reg&0xF0)==0xB0 || (reg&0xF0)==0xA0){
+                            printf("[%ld] YMWR p%d reg%02X=%02X\n",c,bank,reg,d);
+                        }
+                    }
+                    wc_prev=wc;
+                }
+                static uint32_t rc_prev=0; static int fd_prev=-1; static long rd_n=0;
+                uint32_t rc = r->core_top__DOT__gen__DOT__DBG_FM_RD_CNT;
+                if(rc!=rc_prev){
+                    int fd=r->core_top__DOT__gen__DOT__DBG_FM_RD_DATA;
+                    rd_n += rc-rc_prev;
+                    if(fd!=fd_prev){
+                        printf("[%ld] YMRD status=%02X (reads=%ld)\n",c,fd,rd_n);
+                        fd_prev=fd;
+                    }
+                    rc_prev=rc;
+                }
+                static uint32_t zc_prev=0; static long dacfill=0; static int za_prev=-2;
+                static long burst=0;
+                static long beat_n=0;           // Z80 INT handler beat: Z80-side write to 003E/003F
+                uint32_t zc = r->core_top__DOT__gen__DOT__DBG_ZRAM_WR_CNT;
+                if(zc!=zc_prev){
+                    int a=r->core_top__DOT__gen__DOT__DBG_ZRAM_WR_A;
+                    int d=r->core_top__DOT__gen__DOT__DBG_ZRAM_WR_D;
+                    int src=r->core_top__DOT__gen__DOT__DBG_ZRAM_WR_SRC;
+                    if(!src && a==0x003E) beat_n++;
+                    if(src){
+                        if(a==za_prev+1){
+                            burst++;
+                            if((burst & 511)==0)
+                                printf("[%ld] Z80RAM 68K burst ... %04X=%02X (%ld so far)\n",c,a,d,burst);
+                        } else {
+                            if(burst>2) printf("[%ld] Z80RAM 68K burst ended at %04X (%ld writes)\n",c,za_prev,burst);
+                            burst=0;
+                            printf("[%ld] Z80RAM 68K wr %04X=%02X\n",c,a,d);
+                        }
+                        za_prev=a;
+                    }
+                    zc_prev=zc;
+                }
+                static int rst_prev=-1, rq_prev=-1;
+                int rq=r->core_top__DOT__gen__DOT__Z80_BUSRQ_N;
+                int ak=r->core_top__DOT__gen__DOT__Z80_BUSAK_N;
+                int rs=r->core_top__DOT__gen__DOT__Z80_RESET_N;
+                if(rs!=rst_prev){ printf("[%ld] Z80 RESET_N=%d\n",c,rs); rst_prev=rs; }
+                static long akl=0, rql=0, tot=0;
+                static long zloop=0, zother=0;
+                tot++; if(!ak) akl++; if(!rq) rql++;
+                int za = r->core_top__DOT__gen__DOT__Z80_A;
+                if(za>=0x0210 && za<0x0220) zloop++; else zother++;
+                // VINT pulses, and pulses that pass entirely while the Z80 is
+                // bus-mastered away or held in reset (missed-beat candidates)
+                static int vint_prev=0; static long vint_n=0, vint_masked=0;
+                static int cur_pulse_free=0;
+                int vint=r->core_top__DOT__gen__DOT__Z80_VINT;
+                if(vint && !vint_prev){ vint_n++; cur_pulse_free=0; }
+                if(vint && ak && rs) cur_pulse_free=1;
+                if(!vint && vint_prev){ if(!cur_pulse_free) vint_masked++; }
+                vint_prev=vint;
+                // longest contiguous busak-held span in this stat window
+                static long ak_span=0, ak_span_max=0;
+                if(!ak){ ak_span++; if(ak_span>ak_span_max) ak_span_max=ak_span; }
+                else ak_span=0;
+                static long next_stat=0;
+                if(c>=next_stat){
+                    if(next_stat) printf("[%ld] SNDSTAT busak%%=%.2f busrq%%=%.2f fmreads=%ld dac=%ld z80@tick%%=%.1f beats=%ld vint=%ld vint_masked=%ld akspanmax=%ld\n",
+                           c,100.0*akl/tot,100.0*rql/tot,rd_n,dacn,100.0*zloop/(zloop+zother+1),
+                           beat_n,vint_n,vint_masked,ak_span_max);
+                    akl=rql=tot=0; zloop=zother=0;
+                    beat_n=0; vint_n=0; vint_masked=0; ak_span_max=0;
+                    next_stat=c+214800000;
+                }
+            }
+        }
+
         // PCTRACE=<file>: dump the sub-CPU's distinct-PC sequence once it is
         // out of reset. Diffing this between the disc and no-disc runs finds
         // the exact instruction where the two boots diverge -- every
@@ -941,6 +1052,7 @@ int main(int argc,char**argv){
           { enum { S_ROM=0, S_PRG, S_WRAM, S_CART, S_OTHER, S_N };
             static const char* nm[S_N] = {"bios","prgram","wordram","cart","other"};
             static long n[S_N]={0}, cyc[S_N]={0};
+            static long ph_unarmed[S_N]={0}, ph_armed[S_N]={0};
             static int prev_ms=-1; static int cur=S_OTHER;
             int ms = r->core_top__DOT__gen__DOT__mstate & 15;
             if(ms==5){
@@ -952,8 +1064,16 @@ int main(int argc,char**argv){
                 n[cur]++;
               }
               cyc[cur]++;
+              if(r->core_top__DOT__gen__DOT__exp_dtack_armed) ph_armed[cur]++;
+              else ph_unarmed[cur]++;
             }
             prev_ms = ms;
+            if((c%2000000)==0 && c && n[S_WRAM])
+              printf("WRPHASE [%ld] wordram n=%ld stale-release=%.1f armed-wait=%.1f\n",
+                     c, n[S_WRAM],
+                     (double)ph_unarmed[S_WRAM]/n[S_WRAM],
+                     (double)ph_armed[S_WRAM]/n[S_WRAM]),
+              ph_unarmed[S_WRAM]=0, ph_armed[S_WRAM]=0;
             if((c%2000000)==0 && c){
               long tn=0, tc=0; for(int i=0;i<S_N;i++){ tn+=n[i]; tc+=cyc[i]; }
               if(tn){

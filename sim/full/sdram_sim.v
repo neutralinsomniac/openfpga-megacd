@@ -25,8 +25,16 @@ module sdram #(parameter INIT="") (
     reg [1023:0] biosf;
     initial if ($value$plusargs("bios=%s", biosf)) $readmemh(biosf, mem);
 
-    localparam LAT = 10;
-    reg [3:0] b0=0,b1=0,b2=0;
+    // +sdlat=N overrides the per-access latency (default 10);
+    // +sdlat0/1/2=N override a single port (0=PRG, 1=gen work RAM/BIOS, 2=word RAM)
+    integer LAT, LAT0, LAT1, LAT2;
+    initial begin
+        if (!$value$plusargs("sdlat=%d", LAT)) LAT = 10;
+        if (!$value$plusargs("sdlat0=%d", LAT0)) LAT0 = LAT;
+        if (!$value$plusargs("sdlat1=%d", LAT1)) LAT1 = LAT;
+        if (!$value$plusargs("sdlat2=%d", LAT2)) LAT2 = LAT;
+    end
+    reg [7:0] b0=0,b1=0,b2=0;
     reg r0=0,r1=0,r2=0;
 
     // per-port edge-triggered access with latency
@@ -40,7 +48,7 @@ module sdram #(parameter INIT="") (
     always @(posedge clk) begin
         // port 0
         if (!b0 && !r0 && (rd0|wrl0|wrh0) && !(pr0)) begin
-            r0<=1; b0<=LAT;
+            r0<=1; b0<=LAT0[7:0];
             if (wrl0) mem[addr0][7:0]  <= din0[7:0];
             if (wrh0) mem[addr0][15:8] <= din0[15:8];
         end else if (r0) begin
@@ -49,7 +57,7 @@ module sdram #(parameter INIT="") (
         pr0 <= (rd0|wrl0|wrh0);
 
         if (!b1 && !r1 && (rd1|wrl1|wrh1) && !pr1) begin
-            r1<=1; b1<=LAT;
+            r1<=1; b1<=LAT1[7:0];
             if (wrl1) mem[addr1][7:0]  <= din1[7:0];
             if (wrh1) mem[addr1][15:8] <= din1[15:8];
         end else if (r1) begin
@@ -58,7 +66,7 @@ module sdram #(parameter INIT="") (
         pr1 <= (rd1|wrl1|wrh1);
 
         if (!b2 && !r2 && (rd2|wrl2|wrh2) && !pr2) begin
-            r2<=1; b2<=LAT;
+            r2<=1; b2<=LAT2[7:0];
             if (wrl2) mem[addr2][7:0]  <= din2[7:0];
             if (wrh2) mem[addr2][15:8] <= din2[15:8];
         end else if (r2) begin

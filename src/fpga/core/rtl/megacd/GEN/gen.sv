@@ -298,7 +298,7 @@ wire        VBUS_BGACK_N;
 wire        M68K_EXINT;
 wire        M68K_HINT;
 wire        M68K_VINT /* verilator public_flat_rd */;
-wire        Z80_VINT;
+wire        Z80_VINT /* verilator public_flat_rd */;
 
 wire        vram_req;
 wire        vram_we_u = vram_we & ~vram_u_n;
@@ -602,6 +602,8 @@ wire [15:0] MBUS_DI;
 reg         MBUS_ASEL_N;
 
 reg  [15:0] NO_DATA;
+reg         exp_dtack_armed /* verilator public_flat_rd */;
+wire        DBG_EXT_DTACK_N /* verilator public_flat_rd */ = DTACK_N;
 
 reg         ROM_SEL;
 reg         RAM_SEL;
@@ -635,7 +637,6 @@ localparam 	MBUS_IDLE         = 0,
 always @(posedge MCLK) begin
 	reg [8:0] refresh_timer;
 	reg rfs_pend;
-	reg exp_dtack_armed;
 
 	if (reset) begin
 		M68K_MBUS_DTACK_N <= 1;
@@ -959,15 +960,15 @@ assign DBG_M68K_A = {M68K_A,1'b0};
 //--------------------------------------------------------------
 // CPU Z80
 //--------------------------------------------------------------
-reg         Z80_RESET_N;
-reg         Z80_BUSRQ_N;
-wire        Z80_BUSAK_N;
+reg         Z80_RESET_N /* verilator public_flat_rd */;
+reg         Z80_BUSRQ_N /* verilator public_flat_rd */;
+wire        Z80_BUSAK_N /* verilator public_flat_rd */;
 wire        Z80_MREQ_N;
 wire        Z80_RFSH_N;
 reg         Z80_WAIT_N;
 wire        Z80_RD_N;
 wire        Z80_WR_N;
-wire [15:0] Z80_A;
+wire [15:0] Z80_A /* verilator public_flat_rd */;
 wire  [7:0] Z80_DO;
 wire        Z80_IO = ~Z80_MREQ_N & (~Z80_RD_N | ~Z80_WR_N);
 wire        Z80_IO_PRE = ~Z80_MREQ_N & Z80_RFSH_N;
@@ -1142,6 +1143,41 @@ always @(posedge MCLK) begin
 	end
 end
 
+
+// sim instrumentation: event counters + last-event payloads for the sound
+// path (YM2612 writes/reads, Z80-RAM writes). A C++ testbench polls the
+// counters and logs a line per event; excluded from synthesis.
+`ifdef VERILATOR
+reg [31:0] DBG_FM_WR_CNT /* verilator public_flat_rd */;
+reg  [1:0] DBG_FM_WR_PORT /* verilator public_flat_rd */;
+reg  [7:0] DBG_FM_WR_DATA /* verilator public_flat_rd */;
+reg [31:0] DBG_FM_RD_CNT /* verilator public_flat_rd */;
+reg  [7:0] DBG_FM_RD_DATA /* verilator public_flat_rd */;
+reg [31:0] DBG_ZRAM_WR_CNT /* verilator public_flat_rd */;
+reg [12:0] DBG_ZRAM_WR_A /* verilator public_flat_rd */;
+reg  [7:0] DBG_ZRAM_WR_D /* verilator public_flat_rd */;
+reg        DBG_ZRAM_WR_SRC /* verilator public_flat_rd */;  // 1 = 68K-side write
+
+always @(posedge MCLK) begin
+	reg z80_zbus_dtack_old;
+	if (FM_SEL & ZBUS_WE) begin
+		DBG_FM_WR_CNT  <= DBG_FM_WR_CNT + 1'd1;
+		DBG_FM_WR_PORT <= ZBUS_A[1:0];
+		DBG_FM_WR_DATA <= ZBUS_DO;
+	end
+	if (ZRAM_SEL & ZBUS_WE) begin
+		DBG_ZRAM_WR_CNT <= DBG_ZRAM_WR_CNT + 1'd1;
+		DBG_ZRAM_WR_A   <= ZBUS_A[12:0];
+		DBG_ZRAM_WR_D   <= ZBUS_DO;
+		DBG_ZRAM_WR_SRC <= ~Z80_BUSAK_N;
+	end
+	z80_zbus_dtack_old <= Z80_ZBUS_DTACK_N;
+	if (z80_zbus_dtack_old & ~Z80_ZBUS_DTACK_N & FM_SEL & Z80_WR_N) begin
+		DBG_FM_RD_CNT  <= DBG_FM_RD_CNT + 1'd1;
+		DBG_FM_RD_DATA <= ZBUS_DI;
+	end
+end
+`endif
 
 //-----------------------------------------------------------------------
 // Z80 BANK REGISTER
