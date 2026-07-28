@@ -28,7 +28,10 @@ disagree with the methods that produced this.
 # Setup
 - Download the latest [release](https://github.com/neutralinsomniac/openfpga-megacd/releases) and extract it to the root of your Pocket's SD card
 - Grab a BIOS and throw it in `/Assets/megacd/common/<whatever>.bin` - the filename technically doesn't matter. Just make sure it ends in .bin
-- Note: I have confirmed that 'Sega CD (U) - Model 2 v2.11x (2.00) (1993).bin' (md5sum ecc837c31d77b774c6e27e38f828aa9a) works
+  - I recommend [this](https://github.com/valerino/MiSTer_MegaCD_bios_select/blob/main/games/MegaCD/RegionFree/cd_bios.rom) region-free patched BIOS
+  - I've tested the following stock BIOS's:
+    - U.S.: `Sega CD (U) - Model 2 v2.11x (2.00) (1993).bin` (md5sum `ecc837c31d77b774c6e27e38f828aa9a`)
+    - Japan: `Mega-CD (J(UE)) - Model 2 v2.00 (1993).bin` (md5sum `683a8a9e273662561172468dfa2858eb`) (thank you [@dji85](https://github.com/dji85) for pointing this one out!)
 - Load the MegaCD core, choose your BIOS .bin when prompted
 - Menu -> Core Settings -> Load CD Image -> choose your .cue
 - For first boot only: hit B after the CHECKING DISC/PRESS START shows to get into the BIOS menu. Choose Memory and format your SRAM. Then you can choose "CDROM" to boot
