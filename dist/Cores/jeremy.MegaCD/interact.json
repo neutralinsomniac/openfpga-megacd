@@ -11,17 +11,6 @@
         "value": 1
       },
       {
-        "name": "Multitap",
-        "id": 9,
-        "type": "check",
-        "enabled": true,
-        "persist": true,
-        "address": "0x00000000",
-        "writeonly": true,
-        "defaultval": 0,
-        "value": 1
-      },
-      {
         "name": "Lightgun",
         "id": 70,
         "type": "check",

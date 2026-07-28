@@ -338,7 +338,16 @@ always @(*) begin
 end
 
 always @(posedge RESET or posedge CLK) begin
-	reg [16:0] JTMR;
+	// JTMR only ever feeds "> 11600", and 11600 fits in 14 bits, so the
+	// original 17-bit saturating counter + 17-bit magnitude comparator was
+	// paying for range it could not use. Latching a sticky flag on the
+	// equality instead is bit-identical in behaviour (the flag reads 1 on
+	// exactly the cycle the old counter would have read 11601, and both
+	// stay set until the falling TH edge clears them) and drops a 17-bit
+	// compare to a 14-bit one. Worth ~10 ALMs per pad, and this core fits
+	// with nothing to spare -- see the packing-effort note in megacd.qsf.
+	reg [13:0] JTMR;
+	reg        JEXP;
 	reg  [7:0] FLTMR;
 
 	reg THd;
@@ -348,6 +357,7 @@ always @(posedge RESET or posedge CLK) begin
 		DTACK_N <= 1;
 		TH   <= 0;
 		JCNT <= 0;
+		JEXP <= 0;
 	end
 	else if(CE) begin
 	
@@ -359,11 +369,17 @@ always @(posedge RESET or posedge CLK) begin
 		else if(FLTMR == 210) TH <= 1;
 	
 		THd <= TH;
-		if(JTMR > 11600 || J3BUT) JCNT <= 0;
+		if(JEXP || J3BUT) JCNT <= 0;
 		if(~THd & TH) JCNT <= JCNT + 1'd1;
 
-		if(~&JTMR) JTMR <= JTMR + 1'd1;
-		if(THd & ~TH) JTMR <= 0;
+		if(~JEXP) begin
+			if(JTMR == 14'd11600) JEXP <= 1;
+			else JTMR <= JTMR + 1'd1;
+		end
+		if(THd & ~TH) begin
+			JTMR <= 0;
+			JEXP <= 0;
+		end
 
 		if(~SEL) DTACK_N <= 1;
 		else if(SEL & DTACK_N) begin

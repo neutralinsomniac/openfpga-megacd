@@ -1370,7 +1370,6 @@ reg [15:0] reset_delay			 = 0;
 reg        reset_delay_zero	 = 1;
 // CD access time (menu). 0 = accurate seek timing (default), 1 = fast.
 reg       cs_cd_fast             = 0;
-reg cs_multitap_enable			 = 0;
 reg cs_menu_pause_enable		 = 0;
 
 // Video 
@@ -1411,7 +1410,11 @@ always @(posedge clk_74a) begin
         // the menu entry accepted a setting the hardware ignored. Removed
         // from interact.json too; do not re-add without wiring gen.sv.
         32'h00000120: cs_cd_fast                <= bridge_wr_data[0];
-        32'h00000000: cs_multitap_enable 	    <= bridge_wr_data[0];
+        // 0x00000000 (Multitap) intentionally absent, same story as turbo:
+        // MULTITAP is tied to 3'b000 at the gen instance below, so the
+        // register was written and never read and teamplayer/fourway were
+        // synthesized away. Removed from interact.json too; do not re-add
+        // without also driving MULTITAP.
         32'h00000010: cs_ar_correction_enable 	<= bridge_wr_data[0];
         32'h00000020: begin
           cs_composite_enable <= bridge_wr_data[0];
@@ -2899,9 +2902,8 @@ gen gen
 	.EN_BGB(1'b1),
 	.EN_SPR(1'b1),
 
-	// 3-button pad (MiSTer default): the model-2 BIOS mishandles 6-button
-	// probing in the CD player (cursor won't move)
-	.J3BUT(1'b1),
+	// 0 = 6-button pads (the signal is active-high "three button").
+	.J3BUT(1'b0),
 	.JOY_1(joystick_0[11:0]),
 	.JOY_2(joystick_1[11:0]),
 	.JOY_3(joystick_2[11:0]),
