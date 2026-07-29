@@ -44,10 +44,36 @@ static void on_stop(int){ g_stop = 1; }
 uint32_t g_mring[65536], g_sring[65536];
 uint64_t g_mri = 0, g_sri = 0;
 
+// ---- FRAMEPERF=1 accumulators -------------------------------------------
+// The 2M-cycle profiler lines below average over ~0.56 of a frame, which is
+// useless for a symptom that comes and goes WITH the picture (Sonic CD's
+// gameplay slowdown). These are filled by the same profiling blocks but
+// printed and cleared once per VBLANK, next to a hash of the frame that was
+// just scanned out: a repeated hash IS a dropped game frame, so one stream
+// says both "did the game keep up this frame" and "where did the main
+// 68000's bus time go while it didn't".
+int  g_frameperf = 0;
+long g_fp_ms[16] = {0};        // mstate cycle histogram (main bus machine)
+long g_fp_sn[5] = {0};         // MBUS_ROM_READ accesses, per slave
+long g_fp_sc[5] = {0};         // ... and cycles, per slave
+long g_fp_vbus = 0;            // VDP VBUS-DMA (68K-bus read) cycles
+long g_fp_dma  = 0;            // any-VDP-DMA cycles
+long g_fp_wracc = 0;           // word-RAM accesses (either bank, rd or wr)
+long g_fp_prgacc = 0;          // sub PRG-RAM reads
+long g_fp_p1n = 0, g_fp_p1c = 0; // Genesis work-RAM SDRAM port: grants, cycles
+// Whole-bus-cycle cost in 68000 clocks, per slave (0..4 as above, 5 = a bus
+// cycle that never entered the expansion window: work RAM, VDP, IO...).
+// The state-5 residency above is only part of a bus cycle; THIS is what the
+// CPU actually pays, so it is the number to compare against real hardware's
+// 4-clock minimum.
+long g_fp_bcn[6] = {0}, g_fp_bcc[6] = {0};
+long g_fp_wrchit = 0, g_fp_wrcmiss = 0;  // word-RAM read-cache, this frame
+
 int main(int argc,char**argv){
     Verilated::commandArgs(argc,argv);
     signal(SIGTERM, on_stop);
     signal(SIGINT,  on_stop);
+    g_frameperf = getenv("FRAMEPERF") != nullptr;
     long maxc = 40000000;
     for(int i=1;i<argc;i++) if(!strcmp(argv[i],"--cycles")&&i+1<argc) maxc=atol(argv[++i]);
 
@@ -115,6 +141,18 @@ int main(int argc,char**argv){
               if(sp0>=0 && c>=sp0 && c<sp1){
                   if((((c-sp0)/3580000)%300)<10) k |= 1u<<15;
               } }
+            // HOLD=<hexmask>,<from>,<until> (and HOLD2= for a second window):
+            // hold arbitrary buttons for a cycle range, e.g. HOLD=8,<c>,<c>
+            // holds RIGHT -- what "hold right off the start of Palmtree
+            // Panic" needs. cont1_key bits (megacd_top.sv:2793): 0 up,
+            // 1 down, 2 left, 3 right, 4 C, 5 B, 7 A, 15 start.
+            { static long h0[2]={-1,-1}, h1[2]={0,0}; static unsigned hm[2]={0,0};
+              static bool hi=false;
+              if(!hi){ hi=true;
+                const char* e[2] = { getenv("HOLD"), getenv("HOLD2") };
+                for(int i=0;i<2;i++) if(e[i])
+                    sscanf(e[i],"%x,%ld,%ld",&hm[i],&h0[i],&h1[i]); }
+              for(int i=0;i<2;i++) if(h0[i]>=0 && c>=h0[i] && c<h1[i]) k |= hm[i]; }
             dut->cont1_key = k;
         }
 
@@ -467,6 +505,79 @@ int main(int argc,char**argv){
                 int vb=dut->rootp->core_top__DOT__vblank_sys;
                 int hb=dut->rootp->core_top__DOT__hblank;
                 if(vb && !vb_prev){
+                    // ---- FRAMEPERF=1: one line per scanned-out frame ----
+                    // rep=1 means this frame is pixel-identical to the last
+                    // one, i.e. the game did not produce a new picture in
+                    // time. Percentages are of the frame's clk_sys cycles.
+                    if(g_frameperf && frame>0 && maxx>0){
+                        uint64_t h=1469598103934665603ULL;
+                        for(int y=0;y<maxy;y++)
+                            for(int x=0;x<maxx*3;x++){
+                                h ^= ((const uint8_t*)fb[y])[x];
+                                h *= 1099511628211ULL; }
+                        static uint64_t ph=0; static long fc0=0;
+                        long fcyc = c-fc0; if(fcyc<1) fcyc=1;
+                        double pc = 100.0/(double)fcyc;
+                        static const char* snm[5]={"bios","prg","wram","cart","oth"};
+                        printf("FP f=%ld c=%ld rep=%d hash=%016llx | ms",
+                               frame, c, h==ph ? 1 : 0, (unsigned long long)h);
+                        for(int i=0;i<16;i++) if(g_fp_ms[i])
+                            printf(" %d:%.1f", i, g_fp_ms[i]*pc);
+                        printf(" | romrd");
+                        for(int i=0;i<5;i++) if(g_fp_sn[i])
+                            printf(" %s:%ld@%.0f", snm[i], g_fp_sn[i],
+                                   (double)g_fp_sc[i]/g_fp_sn[i]);
+                        printf(" | bc");
+                        { static const char* bnm[6]={"bios","prg","wram","cart",
+                                                     "oth","nonexp"};
+                          for(int i=0;i<6;i++) if(g_fp_bcn[i])
+                              printf(" %s:%ld@%.2f", bnm[i], g_fp_bcn[i],
+                                     (double)g_fp_bcc[i]/g_fp_bcn[i]); }
+                        { static uint32_t h0=0, m0=0;
+                          uint32_t h=dut->rootp->core_top__DOT__dbg_wrc_hit;
+                          uint32_t m=dut->rootp->core_top__DOT__dbg_wrc_miss;
+                          g_fp_wrchit=h-h0; g_fp_wrcmiss=m-m0; h0=h; m0=m; }
+                        printf(" | wrc h=%ld m=%ld", g_fp_wrchit, g_fp_wrcmiss);
+                        // SDRAM cost split per port: row hits / ACTIVATEs /
+                        // PRECHARGE+ACTIVATEs, and cycles spent queued behind
+                        // the single engine. p0=sub PRG-RAM, p1=Genesis work
+                        // RAM + BIOS window, p2=word RAM (lowest priority).
+                        { auto& R = *dut->rootp;
+                          uint32_t cur[13] = {
+                            R.core_top__DOT__sdram__DOT__dbg_hit0,
+                            R.core_top__DOT__sdram__DOT__dbg_act0,
+                            R.core_top__DOT__sdram__DOT__dbg_pre0,
+                            R.core_top__DOT__sdram__DOT__dbg_wait0,
+                            R.core_top__DOT__sdram__DOT__dbg_hit1,
+                            R.core_top__DOT__sdram__DOT__dbg_act1,
+                            R.core_top__DOT__sdram__DOT__dbg_pre1,
+                            R.core_top__DOT__sdram__DOT__dbg_wait1,
+                            R.core_top__DOT__sdram__DOT__dbg_hit2,
+                            R.core_top__DOT__sdram__DOT__dbg_act2,
+                            R.core_top__DOT__sdram__DOT__dbg_pre2,
+                            R.core_top__DOT__sdram__DOT__dbg_wait2,
+                            R.core_top__DOT__sdram__DOT__dbg_ref };
+                          static uint32_t prev[13] = {0};
+                          printf(" | sd");
+                          for(int p=0;p<3;p++)
+                              printf(" p%d:%u/%u/%u,w%u", p,
+                                     cur[p*4+0]-prev[p*4+0], cur[p*4+1]-prev[p*4+1],
+                                     cur[p*4+2]-prev[p*4+2], cur[p*4+3]-prev[p*4+3]);
+                          printf(" ref=%u", cur[12]-prev[12]);
+                          for(int i=0;i<13;i++) prev[i]=cur[i]; }
+                        printf(" | vbus=%.1f dma=%.1f | wracc=%ld prgrd=%ld"
+                               " | p1=%ld@%.1f\n",
+                               g_fp_vbus*pc, g_fp_dma*pc, g_fp_wracc, g_fp_prgacc,
+                               g_fp_p1n, g_fp_p1n ? (double)g_fp_p1c/g_fp_p1n : 0.0);
+                        ph=h; fc0=c;
+                        memset(g_fp_ms,0,sizeof g_fp_ms);
+                        memset(g_fp_sn,0,sizeof g_fp_sn);
+                        memset(g_fp_sc,0,sizeof g_fp_sc);
+                        g_fp_vbus=g_fp_dma=g_fp_wracc=g_fp_prgacc=0;
+                        g_fp_p1n=g_fp_p1c=0;
+                        memset(g_fp_bcn,0,sizeof g_fp_bcn);
+                        memset(g_fp_bcc,0,sizeof g_fp_bcc);
+                    }
                     bool press_win = (c>=1140000000 && c<1200000000) ||
                                      (c>=1220000000 && c<1280000000) ||
                                      (c>=1390000000 && c<1450000000);
@@ -906,8 +1017,8 @@ int main(int argc,char**argv){
           int w = r->core_top__DOT__WR0_RD | r->core_top__DOT__WR0_WR |
                   r->core_top__DOT__WR1_RD | r->core_top__DOT__WR1_WR;
           int p = !r->core_top__DOT__MCD_PRG_OE_N;
-          if(w && !w_prev) wr_acc++;
-          if(p && !p_prev) prg_acc++;
+          if(w && !w_prev){ wr_acc++; g_fp_wracc++; }
+          if(p && !p_prev){ prg_acc++; g_fp_prgacc++; }
           w_prev=w; p_prev=p; }
         if((c%2000000)==0 && c){ printf("TRAF [%ld] wram_acc=%ld prg_rd=%ld\n",c,wr_acc,prg_acc); wr_acc=0; prg_acc=0; }
         // WR0 request lifecycle: req rise -> grant (RDY fall) -> done (RDY
@@ -937,9 +1048,12 @@ int main(int argc,char**argv){
             vb_p=vb; }
           static int g1_p=0; static long g1_rise=0, g1_serv=0, g1_gap=0, g1_fall=0, g1_n=0;
           { int g1 = r->core_top__DOT__p1_act;
-            if(g1 && !g1_p){ if(g1_fall) g1_gap += c-g1_fall; g1_rise=c; }
+            if(g1 && !g1_p){ if(g1_fall) g1_gap += c-g1_fall; g1_rise=c; g_fp_p1n++; }
             if(!g1 && g1_p){ g1_fall=c; g1_serv += c-g1_rise; g1_n++; }
+            if(g1) g_fp_p1c++;
             g1_p=g1; }
+          { if(r->core_top__DOT__gen__DOT__vdp__DOT__dma_vbus) g_fp_vbus++;
+            if(r->core_top__DOT__gen__DOT__vdp__DOT__in_dma)   g_fp_dma++; }
           if((c%2000000)==0 && c){
             if(vb_n) printf("VBUS [%ld] n=%ld avg=%.0f max=%ld\n",c,vb_n,(double)vb_sum/vb_n,vb_max);
             if(g1_n) printf("P1 [%ld] n=%ld serv=%.1f gap=%.1f\n",c,g1_n,(double)g1_serv/g1_n,(double)g1_gap/g1_n);
@@ -1031,6 +1145,25 @@ int main(int argc,char**argv){
             } }
           static long mshist[16]={0};
           mshist[r->core_top__DOT__gen__DOT__mstate & 15]++;
+          g_fp_ms[r->core_top__DOT__gen__DOT__mstate & 15]++;
+          // whole-bus-cycle CPU-clock cost, tagged by the slave that answered
+          { static int bprev=-1; static long bclk=0; static int btag=-1;
+            int ms = r->core_top__DOT__gen__DOT__mstate & 15;
+            if(bprev==0 && ms!=0){ bclk=0; btag=-1; }
+            if(ms!=0){
+              if(ms==5 && btag<0){
+                uint32_t a = ((uint32_t)r->core_top__DOT__gen__DOT__MBUS_A) << 1;
+                btag = (a < 0x020000) ? 0 : (a < 0x040000) ? 1 :
+                       (a >= 0x200000 && a < 0x240000) ? 2 :
+                       (a >= 0x400000) ? 3 : 4;
+              }
+              if(r->core_top__DOT__gen__DOT__M68K_CLKENp) bclk++;
+            }
+            if(bprev!=0 && ms==0){
+              int t = btag<0 ? 5 : btag;
+              g_fp_bcn[t]++; g_fp_bcc[t]+=bclk;
+            }
+            bprev=ms; }
           if((c%2000000)==0 && c){
             printf("MST [%ld]",c);
             for(int i=0;i<16;i++){ if(mshist[i]) printf(" %d:%ld",i,mshist[i]); mshist[i]=0; }
@@ -1061,9 +1194,9 @@ int main(int argc,char**argv){
                 cur = (a < 0x020000) ? S_ROM  : (a < 0x040000) ? S_PRG :
                       (a >= 0x200000 && a < 0x240000) ? S_WRAM :
                       (a >= 0x400000) ? S_CART : S_OTHER;
-                n[cur]++;
+                n[cur]++; g_fp_sn[cur]++;
               }
-              cyc[cur]++;
+              cyc[cur]++; g_fp_sc[cur]++;
               if(r->core_top__DOT__gen__DOT__exp_dtack_armed) ph_armed[cur]++;
               else ph_unarmed[cur]++;
             }
