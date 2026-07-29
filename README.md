@@ -42,10 +42,31 @@ Until I implement support for the CD Backup RAM Cart, you can create "banks" of 
 filename. The Analogue Pocket treats the BIOS's filename as your save destination in the Saves folder, so you could say,
 copy your bios .bin to something like `shining_force.bin` and dedicate the entirety of SRAM to that one game.
 
+# General Development Approach
+The design of this core was originally derived entirely from MiSTer sources, including the CD drive emulation. After
+fighting numerous accuracy issues with CD access, the CD emulation was re-written based on the [Genesis Plus GX](https://github.com/ekeeke/genesis-plus-gx) CD drive
+emulation, which resulted in significantly improved stability and accuracy.
+
+I am now using Genesis Plus GX as a ground-truth source of accuracy for the entire core. GPGX is considered to be a
+highly accurate core, and as a bonus it can be easily instrumented and scripted with full introspection into the core's
+state at any point.
+
+As part of this development process, I had AI adapt the Analogue Pocket core sources to [Verilator](https://www.veripool.org/verilator/), which is an open
+source Verilog simulator. This allows me to run and fully introspect the Analogue Pocket core (albeit at a
+*significantly* reduced speed - it can take hours to run through tens of seconds of emulation) to bring the core closer
+and closer to our target Genesis Plus GX accuracy. This has already paid dividends in identifying the root cause of
+several bugs and performance discrepencies.
+
 # Known issues
 
+## Hot-swapping BIOS
+- Currently the core doesn't like it if you switch the BIOS while it's running. If you need to hot-switch BIOS, quit the core first.
+
+## Sonic CD
+- Freqent slowdowns caused by heavy work RAM access - our work RAM access is not well optimized yet. Actively working on it
+
 ## Lunar Eternal Blue
-- FMV audio isn't perfectly synced - this issue exists in the MiSTer upstream core as well, may just be a bad rip
+- FMV audio isn't perfectly synced - this issue exists in the MiSTer [upstream](https://github.com/MiSTer-devel/MegaCD_MiSTer/issues/11) core as well. It's on the list to investigate/fix
 
 ## Popful Mail
-- Needs the SRAM to be formatted to avoid a crash
+- Needs the SRAM to be formatted to avoid a crash - This is not a limitation of this core; it's just how the game works.
