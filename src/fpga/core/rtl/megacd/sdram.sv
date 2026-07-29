@@ -275,12 +275,27 @@ always @(posedge clk) begin
 end
 
 // access manager + command generator (single engine)
+//
+// ROW/COLUMN SPLIT. The row is the HIGH address bits and the column the LOW
+// ones, so a row is 512 consecutive words (1KB) and a sequential stream --
+// which is what every client here does: 68000 instruction fetch, PRG-RAM
+// fetch, blits -- stays inside one open row and issues CAS only.
+//
+// It used to be the other way round (row = ta[13:1], column = ta[22:14]).
+// That is a valid bijection, so nothing malfunctioned, but it put CONSECUTIVE
+// words in DIFFERENT rows of the same bank: every sequential access found the
+// bank open on the wrong row and paid PRECHARGE + ACTIVATE + CAS (~13 cycles)
+// instead of CAS (~8). The open-row engine could therefore never hit for the
+// access pattern it was written for. Measured on the main 68000's word-RAM
+// path, which is where it hurts most -- Sonic CD executes its entire game
+// loop out of word RAM, ~19.4k fetches a frame, and was spending 82% of the
+// CPU's frame budget on them.
 task do_cas(input [1:0] tba, input [22:1] ta, input [15:0] tdin, input twe, input [1:0] tdqm);
 begin
 	{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= twe ? CMD_WRITE : CMD_READ;
 	if (twe) SDRAM_DQ <= tdin;
 	SDRAM_BA <= tba;
-	SDRAM_A  <= {tdqm, 2'b00, ta[22:14]};
+	SDRAM_A  <= {tdqm, 2'b00, ta[9:1]};
 	dly <= twe ? DLY_WR : DLY_CL;
 	fsm <= FSM_CAS;
 end
@@ -290,8 +305,8 @@ task do_act(input [1:0] tba, input [22:1] ta);
 begin
 	{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_ACTIVE;
 	SDRAM_BA <= tba;
-	SDRAM_A  <= ta[13:1];
-	open_row[tba] <= ta[13:1];
+	SDRAM_A  <= ta[22:10];
+	open_row[tba] <= ta[22:10];
 	row_open[tba] <= 1'b1;
 	dly <= DLY_RCD;
 	fsm <= FSM_ACT;
@@ -337,7 +352,7 @@ begin
 	we   <= twr;
 	dqm  <= twr ? ~tmask : 2'b00;
 	ram_req <= idx;
-	row_hit  <= row_open[taddr[24:23]] && (open_row[taddr[24:23]] == taddr[13:1]);
+	row_hit  <= row_open[taddr[24:23]] && (open_row[taddr[24:23]] == taddr[22:10]);
 	row_busy <= row_open[taddr[24:23]];
 	fsm <= FSM_GRANT;
 end

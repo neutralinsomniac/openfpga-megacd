@@ -2173,69 +2173,43 @@ assign MCD_PRG_DI   = sdr_do;
 wire [15:0] GEN_MEM_DO;
 wire        GEN_MEM_BUSY /* verilator public_flat_rd */;
 
-// ---- BIOS ROM cache (16KB, direct-mapped) --------------------------------
-// The main CPU executes from and blits from the MCD ROM window; serving it
-// from SDRAM cost ~43 clk_sys (~10 CPU wait cycles) per word and starved
-// the main to ~25% throughput during the BIOS boot animations. A full
-// 128KB BRAM copy needs 128 M10K blocks and overflows the device (fitter:
-// 325/308); a direct-mapped cache serves hits in 2 cycles, misses fall
-// through to the (open-row) SDRAM path and fill. Halved from 16K to 8K
-// entries (19->20 bits/entry, 3-bit tag) to free ~18 M10K for the work-RAM
-// read cache (EWJ-SE fix): during gameplay the ROM window is nearly idle,
-// and the boot animations' hot blit set still mostly fits in 16KB.
-reg [19:0] bios_cache [0:8191];
-reg        bc_flushing = 1;
-reg [12:0] bc_flush_a = 0;
-
+// ---- BIOS ROM window: plain SDRAM pass-through ----------------------------
+// This used to be an 8K-entry direct-mapped cache (the boot-animation fix).
+// Its M10K went to double the word-RAM read cache instead: Sonic CD's
+// gameplay slowdown traced to main-68K word-RAM latency (probe build
+// confirmed on hardware), and during gameplay the ROM window carries ~2
+// reads per frame — the cache was earning nothing where it hurts. The BIOS
+// boot animations drop back to SDRAM speed (they were time-locked anyway;
+// they render at a reduced rate as they did before the cache existed).
+// The state machine shape is kept: every read is now a "miss" through the
+// serialized port-1 front-end (bc_miss_req / p1_rom_done).
 reg        brom_busy /* verilator public_flat_rd */ = 0;
 reg        brom_hold = 0;
-reg  [2:0] bc_st = 0;
-reg [19:0] bc_q;
+reg        bc_st = 0;
 reg [15:0] brom_dout;
 reg [15:0] bc_addr;
 reg        bc_miss_req = 0;
 wire brom_acc = ~GEN_ROM_CE_N & ~GEN_OE_N;
 
-localparam BC_LOOKUP = 3'd1, BC_CHECK = 3'd2, BC_MISS = 3'd3, BC_FILL = 3'd4;
-
 always @(posedge clk_sys) begin
 	if (~brom_acc) brom_hold <= 0;
 	if (reset | bios_download) begin
 		brom_busy <= 0; brom_hold <= 0; bc_st <= 0; bc_miss_req <= 0;
-		bc_flushing <= 1; bc_flush_a <= 0;
-	end else if (bc_flushing) begin
-		bios_cache[bc_flush_a] <= 20'd0;
-		{bc_flushing, bc_flush_a} <= {1'b1, bc_flush_a} + 1'b1;
 	end else begin
 		case (bc_st)
-		3'd0: if (brom_acc & ~brom_hold) begin
-			// grant + lookup in one cycle: the RAM read is issued with the
-			// live bus address, hit/miss decided next cycle (2-cycle hits)
-			brom_busy <= 1;
-			bc_addr   <= GEN_VA[16:1];
-			bc_q      <= bios_cache[GEN_VA[13:1]];
-			bc_st     <= BC_CHECK;
+		1'd0: if (brom_acc & ~brom_hold) begin
+			brom_busy   <= 1;
+			bc_addr     <= GEN_VA[16:1];
+			bc_miss_req <= 1;
+			bc_st       <= 1'd1;
 		end
-		BC_CHECK: begin
-			if (bc_q[19] && bc_q[18:16] == bc_addr[15:13]) begin
-				brom_dout <= bc_q[15:0];
-				brom_busy <= 0;
-				brom_hold <= 1;
-				bc_st     <= 0;
-			end else begin
-				bc_miss_req <= 1;
-				bc_st       <= BC_MISS;
-			end
-		end
-		BC_MISS: if (p1_rom_done) begin
+		1'd1: if (p1_rom_done) begin
 			bc_miss_req <= 0;
 			brom_dout   <= p1_dout;
-			bios_cache[bc_addr[12:0]] <= {1'b1, bc_addr[15:13], p1_dout};
 			brom_busy   <= 0;
 			brom_hold   <= 1;
-			bc_st       <= 0;
+			bc_st       <= 1'd0;
 		end
-		default: bc_st <= 0;
 		endcase
 	end
 end
@@ -2433,12 +2407,20 @@ sdram sdram
 	.addr2(bios_download ? {6'b011110, ioctl_addr[18:1]} :
 	       dump_active    ? {6'b100000, dump_word} :
 	       dbg_prg_active ? {6'b100000, dbg_prg_addr} :
-	                        {7'b0110000, wr_owner, wr_addr}),
+	                        // Word RAM: its own SDRAM bank (3), and wr_owner
+	                        // placed inside the COLUMN, not the row. In 2M
+	                        // mode the ASIC interleaves the two word-RAM banks
+	                        // by EXT_VA(1) (ASIC.vhd WRA_IDLE), so a plain
+	                        // sequential stream alternates wr_owner on every
+	                        // access. With the owner bit in the row that made
+	                        // every access a PRECHARGE+ACTIVATE; here both
+	                        // halves of an interleaved pair share one open row.
+	                        {7'b1100000, wr_addr[15:8], wr_owner, wr_addr[7:0]}),
 	.din2(bios_download ? {ioctl_data[7:0], ioctl_data[15:8]} : wr_din),
 	.dout2(sdwr_do),
-	.rd2(~bios_download & (dump_active ? dump_rd : dbg_prg_active ? dbg_prg_req : wr_rd_r)),
-	.wrl2(bios_download ? ioctl_wait : wr_wr_r),
-	.wrh2(bios_download ? ioctl_wait : wr_wr_r),
+	.rd2(~bios_download & (dump_active ? dump_rd : dbg_prg_active ? dbg_prg_req : wr_rd_r & wr_probe_go)),
+	.wrl2(bios_download ? ioctl_wait : wr_wr_r & wr_probe_go),
+	.wrh2(bios_download ? ioctl_wait : wr_wr_r & wr_probe_go),
 	.busy2(sdld_busy),
 
 	.SDRAM_DQ(dram_dq),         // 16 bit bidirectional data bus
@@ -2480,23 +2462,31 @@ reg         wr_rd_r = 0, wr_wr_r = 0;
 reg  [15:0] wr_addr;
 reg  [15:0] wr_din;
 
-// ---- word-RAM read cache (16KB, direct-mapped) ---------------------------
+// ---- word-RAM read cache (32KB, direct-mapped) ---------------------------
 // After the RMW phase-skip, GFX op time is dominated by per-access overhead,
 // not SDRAM busy time (~133ns of a ~580ns access): the ASIC engine
 // requantizes every access to its 12.5MHz enable, so shaving the arbiter
 // round trip below one 12.5MHz period is what shortens an op. Hits complete
 // in 2 arbiter cycles. Coherence is exact: every word-RAM write (either
 // bank, any client) is granted through this same arbiter and updates the
-// cached entry in place. Key = {bank, word addr} = 17 bits; 8K entries so
-// tag is 4 bits; entry = {valid, tag[3:0], data[15:0]}.
-reg [20:0] wrc [0:8191];
-reg [20:0] wrc_q;
+// cached entry in place.
+// Doubled to 16K entries with the M10K reclaimed from the BIOS-window cache:
+// Sonic CD runs its whole main-CPU game loop from word RAM and the gameplay
+// hit rate at 8K entries was 16-29% — the latency this cache fails to hide
+// is the confirmed cause of the sprite-spike slowdown (hardware probe).
+// Key = {bank, word addr} = 17 bits. The bank bit lives in the INDEX, not
+// the tag: 2M mode interleaves the banks by VA(1), so consecutive CPU
+// fetches alternate banks and must not thrash one entry.
+// Index = {bank, addr[12:0]} (14 bits), tag = addr[15:13] (3 bits),
+// entry = {valid, tag[2:0], data[15:0]} = 20 bits.
+reg [19:0] wrc [0:16383];
+reg [19:0] wrc_q;
 reg        wrc_flushing = 1;
-reg [12:0] wrc_flush_a = 0;
+reg [13:0] wrc_flush_a = 0;
 reg        wrc_busy_d = 0;
 reg        wr_chk = 0;
-reg  [3:0] wr_tag;
-reg [12:0] wr_idx;
+reg  [2:0] wr_tag;
+reg [13:0] wr_idx;
 
 wire        wrc_sel0  = grant0_rd | grant0_wr;
 wire        wrc_gsel  = !wr_active && !wrc_flushing && !dbg_prg_active && !dump_active &&
@@ -2510,16 +2500,16 @@ always @(posedge clk_sys) begin
 	// grant cycle: look up the live key; afterwards hold the latched index
 	// (the live key can switch to the other bank's request mid-transaction,
 	// which must not reload wrc_q under the pending compare)
-	wrc_q <= wrc[wrc_gsel ? wrc_gkey[12:0] : wr_idx];
+	wrc_q <= wrc[wrc_gsel ? {wrc_gkey[16], wrc_gkey[12:0]} : wr_idx];
 	wrc_busy_d <= sdld_busy;
 	if ((reset & ~st2_active) | bios_download) begin
 		wrc_flushing <= 1;
 		wrc_flush_a  <= 0;
 	end else if (wrc_flushing) begin
-		wrc[wrc_flush_a] <= 21'd0;
+		wrc[wrc_flush_a] <= 20'd0;
 		{wrc_flushing, wrc_flush_a} <= {1'b1, wrc_flush_a} + 1'b1;
 	end else if (wrc_gsel && !wrc_gisrd) begin
-		wrc[wrc_gkey[12:0]] <= {1'b1, wrc_gkey[16:13], wrc_gdin};   // write-update
+		wrc[{wrc_gkey[16], wrc_gkey[12:0]}] <= {1'b1, wrc_gkey[15:13], wrc_gdin};   // write-update
 	end else if (wr_active && wr_rd_r && wrc_busy_d && ~sdld_busy) begin
 		wrc[wr_idx] <= {1'b1, wr_tag, sdwr_do};                     // miss fill
 	end
@@ -2543,6 +2533,45 @@ wire grant0_rd = WR0_RD & ~wr0_rd_hold;
 wire grant0_wr = WR0_WR & ~wr0_wr_hold;
 wire grant1_rd = WR1_RD & ~wr1_rd_hold;
 wire grant1_wr = WR1_WR & ~wr1_wr_hold;
+
+// WRAM_PROBE: latency-sensitivity probe build. Adds a fixed stall to EVERY
+// word-RAM arbiter transaction (read hit, read miss, write, prefetch step)
+// by holding the FSM between grant and service. Used with the user's
+// timer-vs-MiSTer fixed-course protocol: if the Pocket's lag deficit scales
+// with this stall, main-68K word-RAM latency is confirmed as the operative
+// variable on real hardware (and calibrates the co-sim model, which has the
+// matching +sdlat2 knob); if the deficit barely moves, the memory-latency
+// theory is dead on hardware. NEVER ship a build with this defined.
+//`define WRAM_PROBE
+`ifdef WRAM_PROBE
+localparam [4:0] WRAM_PROBE_STALL = 5'd16;   // clk_sys, ~2.1 68K clocks
+reg  [4:0] wr_stall = 0;
+// hold the SDRAM strobes off while stalled, or a write completes while the
+// FSM isn't looking and its busy edge is lost
+wire wr_probe_go = (wr_stall == 0);
+`else
+wire wr_probe_go = 1'b1;
+`endif
+
+// sequential word-RAM prefetch (see the completion branch below)
+localparam [2:0] PF_DEPTH = 3'd7;
+reg        wr_pf  = 0;      // the in-flight SDRAM access is speculative
+reg  [2:0] pf_cnt = 0;      // words still to pull in
+reg        pf_gap = 0;      // one-cycle strobe gap between prefetch reads
+// a real request is waiting: yield to it (checked in the pf_gap cycle, where
+// the just-served port's stale request line is already hold-masked)
+wire       wr_pf_stop = grant0_rd | grant0_wr | grant1_rd | grant1_wr;
+// next word in the CPU's 2M-mode access order (banks interleave by VA(1))
+wire [16:0] pf_next = {wr_addr, wr_owner} + 1'b1;
+
+`ifdef VERILATOR
+// word-RAM read-cache hit/miss counters (sim only: the fitter is at 95% ALM,
+// nothing measurement-only may reach hardware). Sonic CD executes its whole
+// main-CPU game loop out of word RAM, so this ratio is what sets the main
+// 68000's speed in gameplay.
+reg [31:0] dbg_wrc_hit  /* verilator public_flat_rd */ = 0;
+reg [31:0] dbg_wrc_miss /* verilator public_flat_rd */ = 0;
+`endif
 
 always @(posedge clk_sys) begin
 	reg old_busy;
@@ -2580,6 +2609,9 @@ always @(posedge clk_sys) begin
 		wr0_wr_hold <= 0;
 		wr1_rd_hold <= 0;
 		wr1_wr_hold <= 0;
+		wr_pf  <= 0;
+		pf_cnt <= 0;
+		pf_gap <= 0;
 	end else if (!wr_active && !wrc_flushing && !dbg_prg_active && !dump_active) begin
 		if (grant0_rd | grant0_wr) begin
 			wr_active <= 1;
@@ -2589,7 +2621,7 @@ always @(posedge clk_sys) begin
 			// reads take a cache-lookup cycle first (wr_chk); the RAM read
 			// for {bank,addr} was issued combinationally this same cycle
 			wr_chk    <= grant0_rd;
-			{wr_tag, wr_idx} <= {1'b0, WR0_A};
+			{wr_tag, wr_idx} <= {WR0_A[15:13], 1'b0, WR0_A[12:0]};
 			wr_rd_r   <= 0;
 			wr_wr_r   <= grant0_wr & ~grant0_rd;
 			WR0_RDY   <= 0;
@@ -2599,15 +2631,27 @@ always @(posedge clk_sys) begin
 			wr_addr   <= WR1_A;
 			wr_din    <= WR1_DO;
 			wr_chk    <= grant1_rd;
-			{wr_tag, wr_idx} <= {1'b1, WR1_A};
+			{wr_tag, wr_idx} <= {WR1_A[15:13], 1'b1, WR1_A[12:0]};
 			wr_rd_r   <= 0;
 			wr_wr_r   <= grant1_wr & ~grant1_rd;
 			WR1_RDY   <= 0;
 		end
+`ifdef WRAM_PROBE
+		if (grant0_rd | grant0_wr | grant1_rd | grant1_wr)
+			wr_stall <= WRAM_PROBE_STALL;
+`endif
+`ifdef WRAM_PROBE
+	end else if (wr_stall != 0) begin
+		// probe: hold the whole FSM here so every transaction pays the stall
+		wr_stall <= wr_stall - 1'b1;
+`endif
 	end else if (wr_chk) begin
 		wr_chk <= 0;
-		if (wrc_q[20] && wrc_q[19:16] == wr_tag) begin
+		if (wrc_q[19] && wrc_q[18:16] == wr_tag) begin
 			// hit: complete without touching SDRAM (2-cycle read)
+`ifdef VERILATOR
+			dbg_wrc_hit <= dbg_wrc_hit + 1'd1;
+`endif
 			if (!wr_owner) begin
 				WR0_DI  <= wrc_q[15:0];
 				WR0_RDY <= 1;
@@ -2620,8 +2664,43 @@ always @(posedge clk_sys) begin
 			wr_active <= 0;
 		end else begin
 			wr_rd_r <= 1;   // miss: start the SDRAM read (fill on completion)
+`ifdef VERILATOR
+			dbg_wrc_miss <= dbg_wrc_miss + 1'd1;
+`endif
 		end
+	end else if (wr_pf & pf_gap) begin
+		// The SDRAM controller starts on a RISING strobe edge, so each
+		// prefetch read launches from this one-cycle strobe gap. It is also
+		// the only safe place to check for a waiting requester: at the
+		// miss-completion edge the just-served port's request line is still
+		// up (it drops 1-2 clks after seeing RDY) and its re-grant hold was
+		// set on that same edge, so the grant wires only read true there. A
+		// cycle later the hold masks the stale line and any grant left
+		// pending is real work -- yield to it.
+		pf_gap <= 0;
+		if (wr_pf_stop) begin
+			wr_pf     <= 0;
+			wr_active <= 0;
+			wr_rd_r   <= 0;
+		end else
+			wr_rd_r <= 1;
 	end else if (old_busy & ~sdld_busy) begin
+		if (wr_pf) begin
+			// a prefetch completed: the fill happened in the wrc block above,
+			// there is no requester to answer. Keep pulling the stream in
+			// while nothing else wants the arbiter.
+			if (pf_cnt != 0) begin
+				pf_cnt <= pf_cnt - 1'b1;
+				{wr_addr, wr_owner} <= pf_next;
+				{wr_tag, wr_idx}   <= {pf_next[16:14], pf_next[0], pf_next[13:1]};
+				wr_rd_r <= 0;
+				pf_gap  <= 1;
+			end else begin
+				wr_pf     <= 0;
+				wr_active <= 0;
+				wr_rd_r   <= 0;
+			end
+		end else begin
 		if (!wr_owner) begin
 			WR0_DI  <= sdwr_do;
 			WR0_RDY <= 1;
@@ -2633,9 +2712,32 @@ always @(posedge clk_sys) begin
 			if (wr_rd_r) begin wr1_rd_hold <= 1; wr1_rd_tmo <= HOLD_TMO; end
 			else         begin wr1_wr_hold <= 1; wr1_wr_tmo <= HOLD_TMO; end
 		end
-		wr_active <= 0;
-		wr_rd_r   <= 0;
-		wr_wr_r   <= 0;
+		// SEQUENTIAL PREFETCH. The dominant word-RAM client is 68000
+		// instruction fetch -- Sonic CD runs its entire main-CPU game loop out
+		// of word RAM, ~19.4k fetches a frame -- and with one word per cache
+		// entry every new word is a compulsory miss (measured hit rate in
+		// gameplay: 31%). Behind a read miss, pull in the next PF_DEPTH words
+		// in the CPU's OWN access order: in 2M mode the ASIC interleaves the
+		// two banks by EXT_VA(1), so consecutive CPU fetches go (bank0,a),
+		// (bank1,a),(bank0,a+1)... = the 17-bit counter {addr,owner}+1, NOT
+		// addr+1 within one bank. The CPU can't re-request for >= 2 of its
+		// own clocks, so the stream turns into cache hits. The pf_gap cycle
+		// above aborts the moment a real requester appears: speculative work
+		// must never sit in front of real work.
+		if (wr_rd_r) begin
+			wr_pf     <= 1;
+			wr_active <= 1;
+			wr_rd_r   <= 0;
+			pf_gap    <= 1;
+			pf_cnt    <= PF_DEPTH - 1'b1;
+			{wr_addr, wr_owner} <= pf_next;
+			{wr_tag, wr_idx}   <= {pf_next[16:14], pf_next[0], pf_next[13:1]};
+		end else begin
+			wr_active <= 0;
+			wr_rd_r   <= 0;
+			wr_wr_r   <= 0;
+		end
+		end
 	end
 end
 
