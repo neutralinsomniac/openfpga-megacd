@@ -1336,7 +1336,18 @@ always @(posedge clk_74a) begin
         mnt_st <= M_IDLE;
     end
     M_FAIL: begin
-        // leave unmounted (drive keeps reporting NO_DISC)
+        // leave unmounted (drive keeps reporting NO_DISC).
+        // mount_loading MUST be dropped here: it is otherwise only cleared by
+        // toc_final_74, which needs mount_ready, which a failed mount never
+        // sets. Left up, the drive holds the tray open forever (the
+        // disc_loading branch in the CDD) and the BIOS sits on CLOSE THE CD
+        // DOOR with no way out. Clearing it lets the drive's "loading done
+        // with no media" path retire to NO_DISC and the BIOS return to its
+        // idle panel. The common trigger is a cue whose bin lives outside
+        // /Assets/megacd/ or /Saves/megacd/: APF refuses the openfile (0192
+        // only resolves paths under the platforms the core declares), so any
+        // cue/bin picked from elsewhere on the card lands here.
+        mount_loading <= 0;
         mnt_term <= 4'hC;
         mnt_st <= M_IDLE;
     end

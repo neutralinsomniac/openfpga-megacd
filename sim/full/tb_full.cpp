@@ -404,13 +404,24 @@ int main(int argc,char**argv){
                                dut->rootp->core_top__DOT__icb__DOT__fbuf_ram_b[1],
                                dut->rootp->core_top__DOT__icb__DOT__fbuf_ram_b[128],
                                dut->rootp->core_top__DOT__icb__DOT__fbuf_ram_b[129]);
+                        // OPENFILE_DENY=1: model APF's directory restriction.
+                        // 0192 only resolves paths under /Assets/<platform>/
+                        // or /Saves/<platform>/ for the platforms the core
+                        // declares; a cue picked from anywhere else on the
+                        // card gets its bin rejected with 4 (malformed path).
+                        // This is the out-of-Assets failure, distinct from a
+                        // genuinely missing bin (3), and the only way to
+                        // exercise the mount FSM's M_FAIL path in sim.
+                        static bool of_deny = getenv("OPENFILE_DENY")!=nullptr;
                         if(f2) fclose(f2);
-                        f2=fopen_fat(path);
+                        f2 = of_deny ? nullptr : fopen_fat(path);
                         snprintf(g_ckpt_f2path,sizeof g_ckpt_f2path,"%s",path);
                         uint32_t size2=0;
                         if(f2){ fseek(f2,0,SEEK_END); size2=(uint32_t)ftell(f2); }
                         printf("[%ld] CD openfile slot2: '%s' (%u bytes)%s\n",
-                               c,path,size2,f2?"":" -- OPEN FAILED");
+                               c,path,size2,
+                               f2?"":(of_deny?" -- DENIED (outside /Assets)"
+                                             :" -- OPEN FAILED"));
 
                         // NO_DTABLE=1: model a firmware whose datatable row
                         // order differs from our guess (the real-hardware
@@ -419,7 +430,8 @@ int main(int argc,char**argv){
                         // firmware refreshes the table after the openfile:
                         // the CD Data row (id 2) now carries this bin's size
                         if(f2 && !no_dtable) write_dtable(size1, size2);
-                        q.push_back({0xF8001000u,(uint32_t)(f2?0x6F6B0000u:0x6F6B0003u)});
+                        q.push_back({0xF8001000u,(uint32_t)(f2?0x6F6B0000u:
+                                     (of_deny?0x6F6B0004u:0x6F6B0003u))});
                         // user-reloadable slot: firmware follows the openfile
                         // with a 008A "slot updated" notification carrying the
                         // new size (this is the layout-independent size path
