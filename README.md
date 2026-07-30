@@ -62,11 +62,5 @@ several bugs and performance discrepencies.
 ## Hot-swapping BIOS
 - Currently the core doesn't like it if you switch the BIOS while it's running. If you need to hot-switch BIOS, quit the core first.
 
-## Sonic CD
-- Freqent slowdowns caused by heavy work RAM access - our work RAM access is not well optimized yet. Actively working on it
-
-## Lunar Eternal Blue
-- FMV audio isn't perfectly synced - this issue exists in the MiSTer [upstream](https://github.com/MiSTer-devel/MegaCD_MiSTer/issues/11) core as well. It's on the list to investigate/fix
-
 ## Popful Mail
 - Needs the SRAM to be formatted to avoid a crash - This is not a limitation of this core; it's just how the game works.
