@@ -140,7 +140,13 @@ architecture rtl of T80 is
 	signal Ap, Fp               : std_logic_vector(7 downto 0);
 	signal I                    : std_logic_vector(7 downto 0);
 	signal R                    : unsigned(7 downto 0);
-	signal SP, PC               : unsigned(15 downto 0);
+	-- SP powers up all-ones but must survive warm resets: a real Z80's
+	-- /RESET clears only PC/I/R/IM/IFF. Mega-CD sound drivers uploaded by
+	-- the 68K (Dark Wizard, Lords of Thunder) never load SP and inherit the
+	-- BIOS driver's stack; resetting SP here made their first RST push into
+	-- the banked 68K window and killed all FM sound effects.
+	signal SP                   : unsigned(15 downto 0) := (others => '1');
+	signal PC                   : unsigned(15 downto 0);
 
 	signal RegDIH               : std_logic_vector(7 downto 0);
 	signal RegDIL               : std_logic_vector(7 downto 0);
@@ -389,7 +395,6 @@ begin
 			Fp <= (others => '1');
 			I <= (others => '0');
 			R <= (others => '0');
-			SP <= (others => '1');
 			Alternate <= '0';
 
 			Read_To_Reg_r <= "00000";
