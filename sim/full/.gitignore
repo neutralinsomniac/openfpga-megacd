@@ -19,3 +19,7 @@ sdram_ctrl_gen.v
 
 # freeze-repro PC ring dumps (tb_full end-of-run)
 *_ring.txt
+
+# Verilator --savable build (build_savable.sh) + checkpoint scratch dir
+obj_savable/
+ckptrun/

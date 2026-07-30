@@ -40,12 +40,17 @@ SIM="$SDMOD pll_sim.v bram_prims.v ram_models.v dcfifo_sim.v"
 
 cp $R/rtl/FX68K/microrom.mem $R/rtl/FX68K/nanorom.mem . 2>/dev/null || true
 
-nix shell nixpkgs#verilator -c verilator --cc --exe --build -j 8 \
-  -O3 -CFLAGS "-O2 -march=native ${REALSD:+-DREALSD} ${SAVABLE:+-DTB_SAVABLE}" \
-  ${SAVABLE:+--savable} \
+nix shell nixpkgs#verilator -c verilator --cc --exe -j 8 \
+  -O3 -CFLAGS "-O2 -march=native ${REALSD:+-DREALSD} -DTB_SAVABLE" \
+  --savable \
   --inline-mult 1000000 \
   --top-module core_top --no-assert-case \
   -Wno-fatal --no-timing -Wno-BLKANDNBLK -Wno-WIDTH -Wno-CASEINCOMPLETE \
   -Wno-UNOPTFLAT -Wno-MULTIDRIVEN -Wno-LATCH -Wno-COMBDLY -Wno-CASEOVERLAP -Wno-PROCASSWIRE -Wno-IMPLICIT -Wno-BLKSEQ -Wno-SYMRSVDWORD \
   -I$R/rtl/FX68K -I$R/rtl/jt12 -I$R/rtl/jt89 \
-  $CONV $SIM $NATIVE $JT $APF tb_full.cpp -o tb_full "$@"
+  $CONV $SIM $NATIVE $JT $APF tb_full.cpp -o tb_full --Mdir obj_savable "$@"
+
+# inject the POD-serializer shim into the generated PCH so every unit sees it
+grep -q savable_shim obj_savable/Vcore_top__pch.h || \
+  sed -i '1a #include "../savable_shim.h"' obj_savable/Vcore_top__pch.h
+make -s -C obj_savable -f Vcore_top.mk -j 8

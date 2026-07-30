@@ -6,6 +6,7 @@
 #include "Vcore_top.h"
 #include "Vcore_top___024root.h"
 #include "verilated.h"
+#include "verilated_save.h"
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -34,6 +35,15 @@ static FILE* fopen_fat(const char* path){
     return f;
 }
 static vluint64_t t=0; double sc_time_stamp(){return t;}
+
+// --- checkpoint support ---------------------------------------------------
+// SAVE_AT=<cycle>:<file>  serialize the whole model at that cycle (run keeps
+//                         going). A "<file>.meta" sidecar carries the loop
+//                         counter + host-side state the model doesn't hold.
+// RESTORE=<file>          deserialize and continue from the saved cycle.
+// Requires the model to be verilated with --savable.
+static char g_ckpt_f2path[512] = "";     // slot-2 bin the core had open
+static int  g_ckpt_table_written = 0;    // CD mount already done pre-save
 
 // graceful stop: SIGTERM/SIGINT set the flag, the main loop breaks and the
 // normal end-of-run dumps (PRG RAM, work RAM, PC rings) still execute
@@ -88,8 +98,50 @@ int main(int argc,char**argv){
     dut->vblank=0; dut->port_ir_rx=0; dut->port_tran_si=0; dut->port_tran_so=0;
     dut->port_tran_sck=0; dut->port_tran_sd=0; dut->dbg_rx=0; dut->user2=0;
 
+    // --- checkpoint: parse env, maybe restore ---
+    long save_at=-1; char save_path[512]="";
+    { const char* e=getenv("SAVE_AT");
+      if(e){ const char* col=strchr(e,':');
+             if(col){ save_at=atol(e); snprintf(save_path,sizeof save_path,"%s",col+1); }
+             else fprintf(stderr,"SAVE_AT=<cycle>:<file>\n"); } }
+    long c_start=0;
     bool did_reset_exit=false;
-    for(long c=0;c<maxc && !g_stop;c++){
+#ifdef TB_SAVABLE
+    { const char* e=getenv("RESTORE");
+      if(e){
+          VerilatedRestore rs; rs.open(e);
+          if(!rs.isOpen()){ fprintf(stderr,"RESTORE: cannot open %s\n",e); return 1; }
+          rs >> *dut; rs.close();
+          char meta[600]; snprintf(meta,sizeof meta,"%s.meta",e);
+          FILE* mf=fopen(meta,"r");
+          if(mf){ if(fscanf(mf,"%ld %d %511s",&c_start,&g_ckpt_table_written,
+                            g_ckpt_f2path)<2)
+                      fprintf(stderr,"RESTORE: bad meta %s\n",meta);
+                  fclose(mf); }
+          else { fprintf(stderr,"RESTORE: missing %s\n",meta); return 1; }
+          if(!strcmp(g_ckpt_f2path,"-")) g_ckpt_f2path[0]=0;
+          did_reset_exit=true;
+          printf("[%ld] restored checkpoint %s (f2='%s' mounted=%d)\n",
+                 c_start,e,g_ckpt_f2path,g_ckpt_table_written);
+      } }
+#else
+    if(getenv("RESTORE")||save_at>=0)
+        fprintf(stderr,"checkpointing needs a SAVABLE=1 build; ignoring\n");
+#endif
+    for(long c=c_start;c<maxc && !g_stop;c++){
+#ifdef TB_SAVABLE
+        if(c==save_at && save_path[0]){
+            VerilatedSave ss; ss.open(save_path);
+            if(ss.isOpen()){ ss << *dut; ss.close();
+                char meta[600]; snprintf(meta,sizeof meta,"%s.meta",save_path);
+                FILE* mf=fopen(meta,"w");
+                if(mf){ fprintf(mf,"%ld %d %s\n",c,g_ckpt_table_written,
+                                g_ckpt_f2path[0]?g_ckpt_f2path:"-");
+                        fclose(mf); }
+                printf("[%ld] checkpoint saved to %s\n",c,save_path);
+            } else printf("[%ld] checkpoint save FAILED (%s)\n",c,save_path);
+        }
+#endif
         dut->clk_74a = !dut->clk_74a;
         // once PLL is locked + SDRAM preloaded, APF "Reset Exit" -> reset_n=1
         if(!did_reset_exit && c==4000){
@@ -141,6 +193,20 @@ int main(int argc,char**argv){
               if(sp0>=0 && c>=sp0 && c<sp1){
                   if((((c-sp0)/3580000)%300)<10) k |= 1u<<15;
               } }
+            // BTN_PULSES=<hexmask>,<from>,<until>[,<period>,<hold>]: press the
+            // masked buttons for <hold> frames every <period> frames inside
+            // the cycle window (defaults 300/10) -- START_PULSES generalized
+            // to any button, e.g. d-pad RIGHT to exercise a menu cursor.
+            { static long bp0[2]={-1,-1}, bp1[2]={0,0}, bpp[2]={300,300}, bph[2]={10,10};
+              static unsigned bpm[2]={0,0};
+              static bool bpi=false;
+              if(!bpi){ bpi=true;
+                const char* e[2] = { getenv("BTN_PULSES"), getenv("BTN_PULSES2") };
+                for(int i=0;i<2;i++) if(e[i])
+                    sscanf(e[i],"%x,%ld,%ld,%ld,%ld",&bpm[i],&bp0[i],&bp1[i],&bpp[i],&bph[i]); }
+              for(int i=0;i<2;i++) if(bp0[i]>=0 && c>=bp0[i] && c<bp1[i]){
+                  if((((c-bp0[i])/3580000)%bpp[i])<bph[i]) k |= bpm[i];
+              } }
             // HOLD=<hexmask>,<from>,<until> (and HOLD2= for a second window):
             // hold arbitrary buttons for a cycle range, e.g. HOLD=8,<c>,<c>
             // holds RIGHT -- what "hold right off the start of Palmtree
@@ -177,6 +243,13 @@ int main(int argc,char**argv){
                     printf("CD slot 1: %s (%u bytes)%s\n", f1path, size1,
                            f1?"":" -- OPEN FAILED");
                 }
+                // restored checkpoint: reopen the slot-2 bin and skip the mount
+                if(g_ckpt_f2path[0]){
+                    f2=fopen_fat(g_ckpt_f2path);
+                    printf("checkpoint: reopened slot2 '%s'%s\n",g_ckpt_f2path,
+                           f2?"":" -- OPEN FAILED");
+                }
+                if(g_ckpt_table_written) table_written=true;
             }
             // TOCPOST_AT=<cycle>: extra TOC snapshot once the mount is done
             static long tocpost_at = -1;
@@ -254,6 +327,7 @@ int main(int argc,char**argv){
                 const char* e=getenv("MOUNT_AT"); if(e) mount_at=atol(e); } }
             if(did_reset_exit && c>5000){
                 if(f1 && !table_written && c>mount_at){ table_written=true;
+                    g_ckpt_table_written=1;
                     printf("[%ld] mounting CD (008A)\n", c);
                     write_dtable(size1, 0);             // CD Image sized; no bin open yet
                     // deferload mount notification (host cmd 0x008A):
@@ -332,6 +406,7 @@ int main(int argc,char**argv){
                                dut->rootp->core_top__DOT__icb__DOT__fbuf_ram_b[129]);
                         if(f2) fclose(f2);
                         f2=fopen_fat(path);
+                        snprintf(g_ckpt_f2path,sizeof g_ckpt_f2path,"%s",path);
                         uint32_t size2=0;
                         if(f2){ fseek(f2,0,SEEK_END); size2=(uint32_t)ftell(f2); }
                         printf("[%ld] CD openfile slot2: '%s' (%u bytes)%s\n",
@@ -651,14 +726,14 @@ int main(int argc,char**argv){
                             static long tick_n=0; static long tick_c0=0;
                             if(tick_n==0) tick_c0=c;
                             tick_n++;
-                            if((tick_n & 255)==0)
+                            if(tick_n<=16 || (tick_n & 255)==0)
                                 printf("[%ld] YMTICK reg27<=%02X  #%ld  avg period %.0f cyc (%.1f Hz)\n",
                                        c,d,tick_n,(double)(c-tick_c0)/tick_n,
                                        214800000.0*tick_n/(double)(c-tick_c0));
                         } else if(bank==0 && reg==0x28){
                             keyon_n++;
                             printf("[%ld] YMKEY %02X (keyon #%ld)\n",c,d,keyon_n);
-                        } else if(reg<0x30 || (reg&0xF0)==0xB0 || (reg&0xF0)==0xA0){
+                        } else {
                             printf("[%ld] YMWR p%d reg%02X=%02X\n",c,bank,reg,d);
                         }
                     }
@@ -721,11 +796,57 @@ int main(int argc,char**argv){
                 static long ak_span=0, ak_span_max=0;
                 if(!ak){ ak_span++; if(ak_span>ak_span_max) ak_span_max=ak_span; }
                 else ak_span=0;
+                // Z80PCTRACE=<from>:<n> -- log the first n distinct Z80 read
+                // addresses (fetch+data, i.e. the executed path) from cycle
+                // <from> to z80pc.txt: "cycle addr". The full execution trace
+                // of the driver init, for diffing against the disassembly.
+                {
+                    static long ptr_from=-1, ptr_n=0; static FILE* ptr_f=nullptr;
+                    static bool ptr_i=false; static uint32_t ptr_prev=0xFFFFFFFF;
+                    if(!ptr_i){ ptr_i=true; const char* e=getenv("Z80PCTRACE");
+                        if(e){ const char* col=strchr(e,':');
+                               ptr_from=atol(e); ptr_n=col?atol(col+1):100000; } }
+                    if(ptr_from>=0 && c>=ptr_from && ptr_n>0){
+                        uint32_t a=r->core_top__DOT__gen__DOT__DBG_Z80_FETCH_A;
+                        if(a!=ptr_prev){
+                            if(!ptr_f) ptr_f=fopen("z80pc.txt","w");
+                            if(ptr_f){ fprintf(ptr_f,"%ld %04X\n",c,a);
+                                       if(--ptr_n==0){ fclose(ptr_f); ptr_f=nullptr;
+                                           printf("[%ld] Z80PCTRACE complete\n",c); } }
+                            ptr_prev=a;
+                        }
+                    }
+                }
+                // Z80 fetch-address histogram (256-byte pages) from the new
+                // gen.sv DBG_Z80_FETCH_A/CNT hooks -- shows where the Z80
+                // actually executes, or where it froze (CNT stops moving)
+                static uint32_t zf_prev=0; static long zf_hist[256];
+                {
+                    uint32_t zfc = r->core_top__DOT__gen__DOT__DBG_Z80_FETCH_CNT;
+                    if(zfc!=zf_prev){
+                        zf_hist[(r->core_top__DOT__gen__DOT__DBG_Z80_FETCH_A>>8)&0xFF]++;
+                        zf_prev=zfc;
+                    }
+                }
                 static long next_stat=0;
                 if(c>=next_stat){
-                    if(next_stat) printf("[%ld] SNDSTAT busak%%=%.2f busrq%%=%.2f fmreads=%ld dac=%ld z80@tick%%=%.1f beats=%ld vint=%ld vint_masked=%ld akspanmax=%ld\n",
+                    if(next_stat){
+                        printf("[%ld] SNDSTAT busak%%=%.2f busrq%%=%.2f fmreads=%ld dac=%ld z80@tick%%=%.1f beats=%ld vint=%ld vint_masked=%ld akspanmax=%ld\n",
                            c,100.0*akl/tot,100.0*rql/tot,rd_n,dacn,100.0*zloop/(zloop+zother+1),
                            beat_n,vint_n,vint_masked,ak_span_max);
+                        long zft=0; for(int i=0;i<256;i++) zft+=zf_hist[i];
+                        printf("[%ld] Z80EXEC fetches=%ld lastA=%04X state=%02X top:",
+                               c,zft,r->core_top__DOT__gen__DOT__DBG_Z80_FETCH_A,
+                               r->core_top__DOT__gen__DOT__DBG_Z80_STATE);
+                        for(int k=0;k<4;k++){
+                            int bi=-1; long bv=0;
+                            for(int i=0;i<256;i++) if(zf_hist[i]>bv){bv=zf_hist[i];bi=i;}
+                            if(bi<0||!bv) break;
+                            printf(" %02Xxx=%ld",bi,bv); zf_hist[bi]=0;
+                        }
+                        printf("\n");
+                        memset(zf_hist,0,sizeof zf_hist);
+                    }
                     akl=rql=tot=0; zloop=zother=0;
                     beat_n=0; vint_n=0; vint_masked=0; ak_span_max=0;
                     next_stat=c+214800000;
@@ -1271,6 +1392,13 @@ int main(int argc,char**argv){
                 fclose(fp); }
 #endif
         printf("wrote prgram_end.bin\n");
+    }
+    {   // Z80 RAM dump -- compare against a GPGX zram dump to catch upload
+        // corruption (Dark Wizard cursor-SFX investigation)
+        FILE*fp=fopen("zram_end.bin","wb");
+        if(fp){ for(int i=0;i<0x2000;i++)
+                    fputc(dut->rootp->core_top__DOT__gen__DOT__ramZ80__DOT__mem[i],fp);
+                fclose(fp); printf("wrote zram_end.bin\n"); }
     }
     {   // work RAM (64KB at $FF0000) + distinct-PC rings for the freeze
         FILE*fp;

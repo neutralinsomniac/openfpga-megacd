@@ -1157,6 +1157,18 @@ reg [31:0] DBG_ZRAM_WR_CNT /* verilator public_flat_rd */;
 reg [12:0] DBG_ZRAM_WR_A /* verilator public_flat_rd */;
 reg  [7:0] DBG_ZRAM_WR_D /* verilator public_flat_rd */;
 reg        DBG_ZRAM_WR_SRC /* verilator public_flat_rd */;  // 1 = 68K-side write
+reg [15:0] DBG_Z80_FETCH_A /* verilator public_flat_rd */;  // last Z80 read addr (fetches incl.)
+reg [31:0] DBG_Z80_FETCH_CNT /* verilator public_flat_rd */;
+reg  [7:0] DBG_Z80_STATE /* verilator public_flat_rd */;    // {RESET_N,BUSAK_N,MREQ_N,RD_N,WR_N,WAIT-ish,zbus_dtack_n,mbus_dtack_n}
+
+always @(posedge MCLK) begin
+	if (~Z80_MREQ_N & ~Z80_RD_N & Z80_RFSH_N & ~Z80_ZBUS_DTACK_N) begin
+		DBG_Z80_FETCH_A   <= Z80_A;
+		DBG_Z80_FETCH_CNT <= DBG_Z80_FETCH_CNT + 1'd1;
+	end
+	DBG_Z80_STATE <= {Z80_RESET_N, Z80_BUSAK_N, Z80_MREQ_N, Z80_RD_N, Z80_WR_N,
+	                  Z80_IO_PRE, Z80_ZBUS_DTACK_N, Z80_MBUS_DTACK_N};
+end
 
 always @(posedge MCLK) begin
 	reg z80_zbus_dtack_old;
