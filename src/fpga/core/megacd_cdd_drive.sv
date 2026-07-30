@@ -527,6 +527,16 @@ always @(posedge clk) begin
             buf_file  <= cur_file;
             buf_valid <= 0;
         end
+        // MEDIA CHANGE: the same tag collision, one level up. Every DISC also
+        // restarts at file LBA 0, so the four banked sectors of the disc being
+        // ejected read as hits for the disc being inserted -- and the guard
+        // above cannot catch it, because both discs' track 1 is file 0, so
+        // cur_file never changes. img_size drops to 0 for the whole of any
+        // (re)mount, which is the one signal that spans the swap, so drop the
+        // bank whenever there is no disc. Nothing else clears it: reset and
+        // mcd_rst_n do, but a swap pulses neither (verified in the co-sim --
+        // a swap at 600M cycles shows no MCD_RST_N edge after it).
+        if (!disc_present) buf_valid <= 0;
     end
 end
 

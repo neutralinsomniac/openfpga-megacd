@@ -686,6 +686,11 @@ localparam M_IDLE     = 5'd0,  M_SNIFF    = 5'd1,  M_SNIFF_W  = 5'd2,
            M_PROBE_EV = 5'd18;
 reg [4:0]  mnt_st = M_IDLE;
 reg [3:0]  mnt_term = 0;   // overlay: 1=started, B=READY reached, C=FAILED
+// latched swap request (see the pre-emption block at the end of the mount
+// always block): holds the 008A notification until the read channel is quiet
+// enough to restart the mount from whatever state the FSM was in.
+reg        mount_req = 0;
+reg [31:0] mount_req_size = 0;
 
 // cue parser state
 localparam CP_FETCH=3'd0, CP_FETCH_W=3'd1, CP_EVAL=3'd2, CP_DONE=3'd3;
@@ -815,32 +820,11 @@ always @(posedge clk_74a) begin
         // tds_id owned here: reads target the mounted data slot; the
         // mount sequence overrides it per-operation below
         tds_id <= mount_use_slot2 ? 16'd2 : 16'd1;
-        // mount on the firmware's explicit deferload notification (host
-        // command 0x008A carries slot id + size). Polling the datatable
-        // instead is a trap: its layout is firmware-defined and a stale
-        // nonzero word both false-mounts at boot and masks real mounts.
-        if (dataslot_update && dataslot_update_id == 16'd1
-            && dataslot_update_size != 32'd0) begin
-            mounted_size <= dataslot_update_size;
-            mount_ready <= 0;
-            mount_loading <= 1;      // tray opens now; closes when the TOC lands
-            mount_use_slot2 <= 0;
-            toc_track_count <= 0;
-            mnt_offset <= 0;
-            // round DOWN to a whole word: a read past EOF (even one byte,
-            // from rounding up an unaligned cue size) is a firmware error
-            mnt_len <= (dataslot_update_size < 32'd16384)
-                       ? {dataslot_update_size[31:2], 2'b00} : 32'd16384;
-            mnt_rd <= 1;
-            tds_id <= 16'd1;         // sniff reads the CD slot itself
-            mnt_term <= 4'h1;
-            mnt_reopen <= 0;
-            pb_active <= 0;          // cancel any prior background probe
-            pr_valid <= 0;           // and any partial probe bounds with it
-            lay_prelim <= 0;
-            fsecs_valid <= 0;        // all file sizes unknown until probed
-            mnt_st <= M_SNIFF;
-        end else if (reopen_req && mount_ready
+        // the mount itself is started by the swap pre-emption block at the
+        // bottom of this always block, not from here -- a new image can be
+        // picked while the FSM is anywhere, so sampling it in M_IDLE only
+        // dropped the ones that arrived mid-probe or mid-reopen.
+        if (reopen_req && mount_ready
                      && reopen_file != opened_file) begin
             // playback crossed into a track stored in another bin: build
             // that file's path and openfile it into slot 2. The
@@ -868,7 +852,14 @@ always @(posedge clk_74a) begin
     M_SNIFF: if (mnt_rd_done) begin
         mnt_rd <= 0;
         pbuf_addr <= 0;
-        mnt_st <= M_SNIFF_W;
+        // The sniff asks for mounted_size bytes -- the size the 008A just
+        // reported for the NEW image. If the firmware served that read from
+        // the PREVIOUS file and that file is shorter, APF fails the read
+        // (past EOF) and parse_buf still holds the old cue. Parsing it
+        // anyway mounts the previous disc's TOC under the new disc's name,
+        // which is invisible until the CD player lists the wrong tracks.
+        // Treat an errored sniff as a failed mount instead.
+        mnt_st <= mnt_rd_err ? M_FAIL : M_SNIFF_W;
     end
     M_SNIFF_W: mnt_st <= M_EVAL;   // one cycle for pbuf_q
     M_EVAL: begin
@@ -1036,6 +1027,23 @@ always @(posedge clk_74a) begin
                 mp_found <= 1;
                 mnt_file <= 0;
                 files_addr <= 0;
+                // mp_ph is 2 right now, and M_BPATH_TAB latches the name
+                // pointer on mp_ph == 2 -- so without this reset it fires on
+                // its FIRST cycle, one edge after files_addr changed, while
+                // files_nm_q still holds the entry for the PREVIOUS
+                // files_addr. Its whole reason to exist is to cover that
+                // read latency. Rewinding to 0 restores the 3-cycle wait.
+                //
+                // This was masked at power-up (files_addr is 0, so the stale
+                // entry happened to be the right one) and masked whenever the
+                // drive last touched file 0, but on a disc SWAP files_addr
+                // still points wherever the previous image left it -- the
+                // last background probe or reopen. Phase 1 then sized the
+                // wrong bin as file 0, so the new disc mounted with a TOC
+                // short (or long) by the difference between that bin and the
+                // real track 1: Sonic CD -> Dark Wizard mid-probe laid out
+                // 100911 sectors against a true 257858.
+                mp_ph <= 2'd0;
                 mnt_st <= M_BPATH_TAB;
             end else begin
                 if (b == 8'h2F || b == 8'h5C)            // '/' or '\'
@@ -1352,6 +1360,66 @@ always @(posedge clk_74a) begin
         mnt_st <= M_IDLE;
     end
     endcase
+
+    ///////////////////////////////////////////////
+    // swap pre-emption -- MUST stay after the case: its assignments
+    // deliberately override whatever state the FSM just scheduled.
+    //
+    // A new image can be picked at ANY moment. dataslot_update (host command
+    // 0x008A, the firmware's deferload notification carrying slot id + size)
+    // is a ~2-cycle pulse, and it used to be sampled only in the M_IDLE arm
+    // above. Every swap that landed while the FSM was elsewhere was dropped
+    // outright -- and the FSM is elsewhere for a LONG time: phase-2
+    // background probing walks files 1..N-1 at ~20 host round-trips each
+    // (seconds on a 50-file cue, exactly when a disc gets swapped), and
+    // every CD-audio track crossing into another bin runs a reopen. A
+    // dropped swap leaves the PREVIOUS image mounted, so the BIOS and the
+    // CD player go on showing the old disc's TOC until the slot is picked
+    // again. Latch it instead, and let it pre-empt: a user swap always wins.
+    //
+    // Aborting mid-flight is safe as long as the host read channel is left
+    // alone to drain. Dropping mnt_rd does not disturb a transaction already
+    // handed to the bridge (tds_* are latched), so the abort just releases
+    // the request and waits for the arbiter to retire it: cdf_st back to 0
+    // with mnt_rd_done low. Restarting before that would re-raise mnt_rd
+    // while the arbiter still sat in its state 3 -- it would never observe
+    // mnt_rd low, never clear mnt_rd_done, and the fresh M_SNIFF would
+    // accept that stale done and parse the PREVIOUS disc's cue text out of
+    // parse_buf. Whatever data the aborted read lands in parse_buf is
+    // harmless; the new sniff overwrites it. The getfile/openfile channel
+    // needs no such guard: core_bridge_cmd serialises those, so a new
+    // request cannot issue until the aborted one has completed.
+    ///////////////////////////////////////////////
+    if (dataslot_update && dataslot_update_id == 16'd1
+        && dataslot_update_size != 32'd0) begin
+        mount_req      <= 1;
+        mount_req_size <= dataslot_update_size;
+    end
+    if (mount_req) begin
+        mnt_rd <= 0;                 // release the channel so it can drain
+        if (cdf_st == 2'd0 && !mnt_rd_done) begin
+            mounted_size <= mount_req_size;
+            mount_ready <= 0;
+            mount_loading <= 1;  // tray opens now; closes when the TOC lands
+            mount_use_slot2 <= 0;
+            toc_track_count <= 0;
+            mnt_offset <= 0;
+            // round DOWN to a whole word: a read past EOF (even one byte,
+            // from rounding up an unaligned cue size) is a firmware error
+            mnt_len <= (mount_req_size < 32'd16384)
+                       ? {mount_req_size[31:2], 2'b00} : 32'd16384;
+            mnt_rd <= 1;
+            tds_id <= 16'd1;         // sniff reads the CD slot itself
+            mnt_term <= 4'h1;
+            mnt_reopen <= 0;
+            pb_active <= 0;          // cancel any prior background probe
+            pr_valid <= 0;           // and any partial probe bounds with it
+            lay_prelim <= 0;
+            fsecs_valid <= 0;        // all file sizes unknown until probed
+            mount_req <= 0;
+            mnt_st <= M_SNIFF;
+        end
+    end
 end
 wire [11:0] cd_buf_addr;    // clk_sys ({slot[1:0], word[9:0]})
 reg  [31:0] cd_buf_q;

@@ -336,6 +336,33 @@ int main(int argc,char**argv){
                     q.push_back({0xF8000024u, size1});   // size
                     q.push_back({0xF8000000u, 0x434D008Au});
                 }
+                // --cd2 <path> + SWAP_AT=<cycle>: model the user picking a
+                // NEW image for slot 1 mid-session. Slot 1 is user-reloadable
+                // (data.json parameters bit 0), so per the APF docs a runtime
+                // change sends ONLY 008A -- no 0082/008F sequence -- which is
+                // exactly what makes the timing of this notification the
+                // core's problem. Fire it at an arbitrary cycle to land the
+                // swap wherever the mount FSM happens to be (mid background
+                // probe, mid reopen); those are the ones that used to be
+                // dropped, leaving the previous disc mounted.
+                static long swap_at = -1; static const char* cd2=nullptr;
+                { static bool si=false; if(!si){ si=true;
+                    const char* e=getenv("SWAP_AT"); if(e) swap_at=atol(e);
+                    for(int i=1;i<argc;i++)
+                        if(!strcmp(argv[i],"--cd2")&&i+1<argc) cd2=argv[i+1]; } }
+                static bool swapped=false;
+                if(cd2 && swap_at>0 && !swapped && c>swap_at){ swapped=true;
+                    if(f1) fclose(f1);
+                    snprintf(f1path,sizeof f1path,"%s",cd2);
+                    f1=fopen(f1path,"rb");
+                    if(f1){ fseek(f1,0,SEEK_END); size1=(uint32_t)ftell(f1); }
+                    printf("[%ld] SWAP CD -> '%s' (%u bytes)%s\n",
+                           c,f1path,size1,f1?"":" -- OPEN FAILED");
+                    write_dtable(size1, 0);
+                    q.push_back({0xF8000020u, 1u});
+                    q.push_back({0xF8000024u, size1});
+                    q.push_back({0xF8000000u, 0x434D008Au});
+                }
                 if(q.empty() && (c&63)==0){
                     uint32_t t0 = dut->rootp->core_top__DOT__icb__DOT__target_0;
                     // HOST_LATENCY=<half-cycles>: hold every pending target
