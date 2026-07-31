@@ -76,6 +76,8 @@ reg  [4:0] base_rate_II;
 wire  [5:0] rate_out_II;
 reg  [5:1] rate_in_III;
 reg step_III, ssg_en_II, ssg_en_III;
+wire ssg_off_I, ssg_wb_I;
+reg  ssg_off_II, ssg_off_III, ssg_wb_II, ssg_wb_III;
 wire sum_out_II;
 reg sum_in_III;
 
@@ -107,6 +109,8 @@ jt12_eg_comb u_comb(
     .base_rate      ( base_rate_I   ),
     .state_next     ( state_next_I  ),
     .pg_rst         ( pg_rst_I      ),
+    .ssg_off        ( ssg_off_I     ),
+    .ssg_wb         ( ssg_wb_I      ),
     ///////////////////////////////////
     // II
     .step_attack    ( attack_II     ),
@@ -124,7 +128,9 @@ jt12_eg_comb u_comb(
     .pure_attack    ( attack_III        ),
     .pure_step      ( step_III          ),
     .pure_rate      ( rate_in_III[5:1]  ),
-    .pure_ssg_en    ( ssg_en_III        ), 
+    .pure_ssg_en    ( ssg_en_III        ),
+    .pure_ssg_off   ( ssg_off_III       ),
+    .pure_ssg_wb    ( ssg_wb_III        ),
     .pure_eg_in     ( eg_in_III         ),
     .pure_eg_out    ( pure_eg_out_III   ),
     .sum_up_in      ( sum_in_III        ),
@@ -145,6 +151,8 @@ always @(posedge clk) if(clk_en) begin
     base_rate_II<= base_rate_I;
     ssg_en_II   <= ssg_en_I;
     ssg_inv_II  <= ssg_inv_out_I;
+    ssg_off_II  <= ssg_off_I;
+    ssg_wb_II   <= ssg_wb_I;
     pg_rst_II   <= pg_rst_I;
 
     eg_in_III   <= eg_in_II;
@@ -152,6 +160,8 @@ always @(posedge clk) if(clk_en) begin
     rate_in_III <= rate_out_II[5:1];
     ssg_en_III  <= ssg_en_II;
     ssg_inv_III <= ssg_inv_II;
+    ssg_off_III <= ssg_off_II;
+    ssg_wb_III  <= ssg_wb_II;
     step_III    <= step_II;
     sum_in_III  <= sum_out_II;
 

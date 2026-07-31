@@ -40,6 +40,8 @@ module jt12_eg_comb(
     output  [4:0]   base_rate,
     output  [2:0]   state_next,
     output          pg_rst,
+    output          ssg_off,
+    output          ssg_wb,
     ///////////////////////////////////
     // II
     input           step_attack,
@@ -58,6 +60,8 @@ module jt12_eg_comb(
     input           pure_step,
     input [ 5:1]    pure_rate,
     input           pure_ssg_en,
+    input           pure_ssg_off,
+    input           pure_ssg_wb,
     input [ 9:0]    pure_eg_in,
     output   [9:0]  pure_eg_out,
     input           sum_up_in,
@@ -93,7 +97,9 @@ jt12_eg_ctrl u_ctrl(
 
     .base_rate      ( base_rate     ),
     .state_next     ( state_next    ),
-    .pg_rst         ( pg_rst        )
+    .pg_rst         ( pg_rst        ),
+    .ssg_off        ( ssg_off       ),
+    .ssg_wb         ( ssg_wb        )
 );
 
 // II
@@ -119,6 +125,8 @@ jt12_eg_pure u_pure(
     .step   ( pure_step     ),
     .rate   ( pure_rate     ),
     .ssg_en ( pure_ssg_en   ),
+    .ssg_off( pure_ssg_off  ),
+    .ssg_wb ( pure_ssg_wb   ),
     .eg_in  ( pure_eg_in    ),
     .eg_pure( pure_eg_out   ),
     .sum_up ( sum_up_in     )

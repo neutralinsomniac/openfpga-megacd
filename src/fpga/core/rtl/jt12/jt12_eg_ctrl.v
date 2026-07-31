@@ -39,7 +39,10 @@ module jt12_eg_ctrl(
 
 	output reg	[4:0]	base_rate,
 	output reg	[2:0]	state_next,
-	output reg			pg_rst
+	output reg			pg_rst,
+	// SSG envelope-off and key-off writeback (applied in jt12_eg_pure)
+	output reg			ssg_off,
+	output reg			ssg_wb
 );
 
 localparam 	ATTACK = 3'b001,
@@ -67,11 +70,22 @@ wire ssg_hold = ssg_eg[0] & ssg_en;
 
 reg ssg_over;
 
+// hold-up modes (ssg_eg 011/101) keep the envelope at the loud hold level
+// while keyed on; every other SSG slot whose envelope crosses 10'h200 is
+// snapped to max attenuation by real silicon ("Envelope off" in the
+// die-derived model). On key-off, an inverted slot writes back its audible
+// level (10'h200-eg) so the release starts from what was heard.
+wire ssg_holdup = ssg_hold & (ssg_att ^ ssg_alt);
 
 always @(*) begin
 	ssg_over = ssg_en && eg[9]; // eg >=10'h200
 	ssg_pg_rst = ssg_over && !( ssg_alt || ssg_hold );
 	pg_rst = keyon_now | ssg_pg_rst;
+
+	ssg_wb  = keyoff_now && ssg_en && ssg_inv_in;
+	ssg_off = ssg_over && !keyon_now && !ssg_wb &&
+		( state_in == RELEASE || keyoff_now ||
+		 (( state_in == HOLD || (state_in == DECAY && ssg_hold)) && !ssg_holdup) );
 end
 
 always @(*)

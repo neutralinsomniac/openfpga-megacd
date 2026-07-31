@@ -24,7 +24,9 @@ module jt12_eg_pure(
 	input			step,
 	input [ 5:1]	rate,
 	input [ 9:0]	eg_in,
-	input 			ssg_en,	
+	input 			ssg_en,
+	input 			ssg_off,	// snap to max attenuation (SSG envelope off)
+	input 			ssg_wb,		// key-off writeback of inverted SSG level
 	input 			sum_up,
 	output reg  [9:0] eg_pure
 );
@@ -75,7 +77,9 @@ always @(*) begin
 			eg_pre_fastar = dr_result[10] ? 10'h3FF : dr_result[9:0];
 	end
 	else eg_pre_fastar = eg_in;
-	eg_pure = (attack&rate[5:1]==5'h1F) ? 10'd0 : eg_pre_fastar;
+	eg_pure = ssg_wb  ? 10'h200 - eg_in :
+	          ssg_off ? 10'h3FF :
+	          (attack&rate[5:1]==5'h1F) ? 10'd0 : eg_pre_fastar;
 end
 
 endmodule // jt12_eg_pure

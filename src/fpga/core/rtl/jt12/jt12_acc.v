@@ -115,8 +115,13 @@ wire signed [15:0] acc_expand = {{7{acc_out[8]}}, acc_out};
 
 reg [1:0] rl_latch, rl_old;
 
-wire signed [4:0] ladder_left = ~ladder ? 5'd0 : (acc_expand >= 0 ? 5'd7 : (rl_old[1] ? 5'd0 : -5'd6));
-wire signed [4:0] ladder_right = ~ladder ? 5'd0 : (acc_expand >= 0 ? 5'd7 : (rl_old[0] ? 5'd0 : -5'd6));
+// Per-channel DAC discontinuity as measured on the die (Nuked OPN2
+// OPN2_ChOutput, YM2612 mode): over a sample the channel holds the 9-bit
+// bus for 4 cycles, contributing value+1 once and its sign the other 3 —
+// net +4 above zero / -3 below when panned in, and a +4/-4 sign leak even
+// when panned out.
+wire signed [4:0] ladder_left  = ~ladder ? 5'd0 : (acc_expand >= 0 ? 5'd4 : (rl_old[1] ? -5'd3 : -5'd4));
+wire signed [4:0] ladder_right = ~ladder ? 5'd0 : (acc_expand >= 0 ? 5'd4 : (rl_old[0] ? -5'd3 : -5'd4));
 
 always @(posedge clk) if(clk_en) begin
     if (channel_en)
