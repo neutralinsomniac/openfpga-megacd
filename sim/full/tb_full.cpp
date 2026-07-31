@@ -406,7 +406,38 @@ int main(int argc,char**argv){
                         } else if(nserved<20 || (nserved&255)==0)
                             printf("[%ld] CD read ERR: slot=%u off=%u len=%u fsz=%u\n",
                                    c,id,off,len,fsz);
-                        q.push_back({0xF8001000u,(uint32_t)(ok?0x6F6B0000u:0x6F6B0002u)});
+                        // DROP_RESP_AT=<cycle>: withhold the result word for the
+                        // first slot read completing after this cycle, modelling
+                        // a host response that never arrives. Before the
+                        // core_bridge_cmd watchdog this wedged tstate in
+                        // TARG_ST_WAITRESULT_DS permanently and killed all CD
+                        // access until the core was relaunched -- the hardware
+                        // symptom after a runtime BIOS reload.
+                        // DROP_RESP_AT=<cycle> [+ DROP_RESP_FOR=<cycles>]: the
+                        // host stops answering slot reads for a window,
+                        // modelling the lost response that wedges the target
+                        // channel. It must be a WINDOW, not a single skipped
+                        // reply: withholding one reply leaves target_0 still
+                        // holding 636D_0180, and this tb re-polls target_0 every
+                        // 64 cycles and would just serve the same read again.
+                        // Default window is 220M cycles -- longer than the
+                        // core_bridge_cmd watchdog (2^26 clk_74a ~= 193M here),
+                        // so the watchdog is what ends the stall, not the host
+                        // coming back.
+                        { static long drop_at=-1, drop_for=220000000; static bool dri=false;
+                          static bool announced=false;
+                          if(!dri){ dri=true;
+                              const char* e=getenv("DROP_RESP_AT"); if(e) drop_at=atol(e);
+                              const char* f=getenv("DROP_RESP_FOR"); if(f) drop_for=atol(f); }
+                          bool muted = drop_at>0 && c>drop_at && c<drop_at+drop_for;
+                          if(muted){
+                              if(!announced){ announced=true;
+                                  printf("[%ld] >>> HOST MUTE for %ld cycles "
+                                         "(slot=%u off=%u)\n",c,drop_for,id,off);
+                                  fflush(stdout); }
+                          } else
+                              q.push_back({0xF8001000u,(uint32_t)(ok?0x6F6B0000u:0x6F6B0002u)});
+                        }
                     } else if(t0==0x636D0190u){           // getfile: write slot path
                         uint32_t ptr=dut->rootp->core_top__DOT__icb__DOT__target_24;
                         printf("[%ld] CD getfile -> %08X ('%s')\n",c,ptr,f1path);
@@ -474,11 +505,76 @@ int main(int argc,char**argv){
                         }
                     }
                 }
+                // BIOS_RELOAD_AT=<cycle>: model the user picking a new BIOS in
+                // the Core Settings menu mid-run. Slot 0 is NOT deferload, so
+                // this is a full data-slot write, not a bare 008A: [0082
+                // request write] for slot 0, the image streamed as 32-bit
+                // big-endian bridge words into 0x1xxxxxxx (data_loader splits
+                // each into two 16-bit words, and megacd_top byte-swaps those
+                // into SDRAM at word 0x780000+), then [008F all complete].
+                // 0082 drives ioctl_download -> cart_download -> reset, so the
+                // whole system is held in reset across the transfer.
+                //
+                // Deliberately reloads the SAME image the run booted with
+                // (parsed back out of the +bios= hex), so a hang afterwards
+                // cannot be blamed on BIOS content -- only on the reload.
+                static std::vector<uint8_t> bios_bytes;
+                static long bios_reload_at=-1;
+                { static bool bri=false; if(!bri){ bri=true;
+                    const char* e=getenv("BIOS_RELOAD_AT");
+                    if(e) bios_reload_at=atol(e);
+                    if(bios_reload_at>0){
+                        const char* bp=nullptr;
+                        for(int i=1;i<argc;i++)
+                            if(!strncmp(argv[i],"+bios=",6)) bp=argv[i]+6;
+                        if(bp){ if(FILE* bf=fopen(bp,"r")){
+                            char ln[64];
+                            while(fgets(ln,sizeof ln,bf)){
+                                if(ln[0]=='@'||ln[0]=='\n') continue;
+                                unsigned w=0;
+                                if(sscanf(ln,"%x",&w)==1){
+                                    bios_bytes.push_back((uint8_t)(w>>8));
+                                    bios_bytes.push_back((uint8_t)w);
+                                }
+                            }
+                            fclose(bf);
+                            printf("BIOS reload source: %s (%zu bytes)\n",
+                                   bp, bios_bytes.size());
+                        } else printf("BIOS reload: cannot open %s\n", bp); }
+                        else printf("BIOS reload: no +bios= to reload from\n");
+                    } } }
+                static bool bios_reloaded=false;
+                if(bios_reload_at>0 && !bios_reloaded && !bios_bytes.empty()
+                   && c>bios_reload_at){ bios_reloaded=true;
+                    printf("[%ld] >>> BIOS RELOAD: 0082 slot 0, %zu bytes, 008F\n",
+                           c, bios_bytes.size()); fflush(stdout);
+                    q.push_back({0xF8000020u, 0u});           // slot id 0
+                    q.push_back({0xF8000000u, 0x434D0082u});  // request write
+                    for(size_t i=0;i+3<bios_bytes.size();i+=4)
+                        q.push_back({(uint32_t)(0x10000000u+i),
+                            (uint32_t)((bios_bytes[i]<<24)|(bios_bytes[i+1]<<16)|
+                                       (bios_bytes[i+2]<<8)|bios_bytes[i+3])});
+                    q.push_back({0xF8000000u, 0x434D008Fu});  // all complete
+                }
                 if(!q.empty()){
                     // 6 half-cycle write: asserted across >=2 rising edges, then idle
                     if(ph==0){ dut->bridge_addr=q.front().a;
                                dut->bridge_wr_data=q.front().d; dut->bridge_wr=1; }
                     if(ph==4){ dut->bridge_wr=0; }
+                    // BRIDGE_IDLE_ADDR=1: don't park bridge_addr on the last
+                    // write. The real bridge is shared -- APF drives it for its
+                    // own traffic between the words it sends us -- whereas this
+                    // tb held the last address indefinitely. That distinction is
+                    // invisible for data capture (data_loader latches on the
+                    // bridge_wr edge) but NOT for cart_download, which is a bare
+                    // function of the current bridge_addr with no bridge_wr
+                    // qualifier. During a runtime BIOS reload cart_download is
+                    // the ONLY thing holding the core in reset, so an address
+                    // excursion drops reset mid-transfer.
+                    { static int ia=-1;
+                      if(ia<0){ const char* e=getenv("BRIDGE_IDLE_ADDR");
+                                ia = e ? atoi(e) : 0; }
+                      if(ia && ph==5) dut->bridge_addr = 0xF8000000u; }
                     ph++;
                     if(ph==6){ ph=0; q.pop_front(); }
                 }
@@ -1284,6 +1380,22 @@ int main(int argc,char**argv){
                   }
               } else frz_since=-1;
               lhd=hd;
+            } }
+          // WDOGTRACE=1: watch the target-command FSM. tstate 14 =
+          // TARG_ST_WAITRESULT_DS, the unbounded wait the watchdog guards; if
+          // it never leaves 14 the channel is wedged, if it drops back to 0
+          // the watchdog fired. mount_loading stuck at 1 is CLOSE THE CD DOOR.
+          { static bool wt = getenv("WDOGTRACE")!=nullptr;
+            if(wt && (c%10000000)==0 && c){
+              auto& R = *r;
+              printf("WDOG [%ld] tstate=%u mnt_st=%u mount_loading=%u "
+                     "mount_ready=%u drv=%u\n", c,
+                     R.core_top__DOT__icb__DOT__tstate,
+                     R.core_top__DOT__mnt_st,
+                     R.core_top__DOT__mount_loading,
+                     R.core_top__DOT__mount_ready,
+                     R.core_top__DOT__cdd_drive__DOT__drv_status);
+              fflush(stdout);
             } }
           { static bool on = getenv("CDTRACE")!=nullptr;
             if(on && (c%2000000)==0 && c){

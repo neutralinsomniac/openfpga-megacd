@@ -684,7 +684,7 @@ localparam M_IDLE     = 5'd0,  M_SNIFF    = 5'd1,  M_SNIFF_W  = 5'd2,
            M_FDIV     = 5'd12, M_LAYOUT   = 5'd13, M_READY    = 5'd14,
            M_FAIL     = 5'd15, M_PROBE_GO = 5'd16, M_PROBE_WT = 5'd17,
            M_PROBE_EV = 5'd18;
-reg [4:0]  mnt_st = M_IDLE;
+reg [4:0]  mnt_st /* verilator public_flat_rd */ = M_IDLE;
 reg [3:0]  mnt_term = 0;   // overlay: 1=started, B=READY reached, C=FAILED
 // latched swap request (see the pre-emption block at the end of the mount
 // always block): holds the 008A notification until the read channel is quiet

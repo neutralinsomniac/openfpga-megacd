@@ -226,8 +226,36 @@ localparam  [31:0]  FBUF_OPENFILE_PTR = 32'hF8003200;
         fbuf_b_q <= fbuf_ram_b[fbuf_addr];
     end
     assign fbuf_q = fbuf_b_q;
-    reg     [3:0]   tstate;
-    
+    reg     [3:0]   tstate /* verilator public_flat_rd */;
+
+    // Watchdog for the two WAITRESULT states. Both are unbounded level waits
+    // on the host writing 6F6B into target_0, and this module has NO reset
+    // input -- tstate is set once in the initial block below and is never
+    // re-initialised afterwards. So a single lost host response wedges the
+    // target channel permanently: TARG_ST_IDLE becomes unreachable, no further
+    // target command can ever issue, and every CD sector fetch, getfile and
+    // openfile dies with it until the core is relaunched.
+    //
+    // Observed on hardware after a runtime BIOS reload (2026-07-30): the disc
+    // mount starts and never completes, so the BIOS sits on CLOSE THE CD DOOR;
+    // inserting a different image afterwards does nothing at all; and the
+    // in-core Reset Core does not recover it, because that only resets clk_sys
+    // logic while this FSM lives in clk_74a. Why the response goes missing is
+    // still unknown -- three models of the reload failed to reproduce it in the
+    // co-sim -- but a lost response should degrade to a reported error, not to
+    // a brick, whatever the cause.
+    //
+    // ~2^26 cycles ~= 900ms at 74.25MHz, deliberately enormous. This channel is
+    // the CD data path: one 0180 read per 2352-byte sector, continuously, the
+    // whole time a game runs. A timeout short enough to fire on a merely slow
+    // SD read would turn a recoverable stall into a CORRUPT SECTOR, because the
+    // fetch path acks on done regardless of err and marks the bank valid. So
+    // the bar is "no legitimate operation could ever take this long"; being
+    // slow to break a wedge costs nothing, since the alternative is quitting.
+    localparam      TGT_WDOG_BIT = 26;
+    reg     [TGT_WDOG_BIT:0] tgt_wdog = 0;
+    wire            tgt_wdog_fire = tgt_wdog[TGT_WDOG_BIT];
+
     reg             status_setup_done_1;
     reg             status_setup_done_queue;
     
@@ -510,6 +538,14 @@ always @(posedge clk) begin
     
     
     // target > host command executer
+    //
+    // Watchdog runs only while a result is outstanding; any other state clears
+    // it, so the count is always "time spent waiting on THIS response".
+    if(tstate == TARG_ST_WAITRESULT || tstate == TARG_ST_WAITRESULT_DS)
+        tgt_wdog <= tgt_wdog + 1'b1;
+    else
+        tgt_wdog <= 0;
+
     case(tstate)
     TARG_ST_IDLE: begin
         if(status_setup_done_queue) begin
@@ -559,12 +595,31 @@ always @(posedge clk) begin
         if(target_0[31:16] == 16'h6F6B) begin
             // done
             tstate <= TARG_ST_IDLE;
+        end else if(tgt_wdog_fire) begin
+            // nothing consumes 0140's completion; just free the channel
+            tstate <= TARG_ST_IDLE;
         end
 
     end
     TARG_ST_WAITRESULT_DS: begin
         if(target_0[31:16] == 16'h6F6B) begin
             target_dataslot_err <= target_0[2:0];
+            if (tgt_is_read) begin
+                target_dataslot_ack <= 0;
+                target_dataslot_done <= 1;
+            end else begin
+                target_dataslot_file_done <= 1;
+            end
+            tstate <= TARG_ST_IDLE;
+        end else if(tgt_wdog_fire) begin
+            // No response in ~900ms: complete it as a general error (5) rather
+            // than wait forever. The strobe matters as much as the code -- the
+            // mount FSM and the cdf arbiter both block on done/file_done, so
+            // without it they never advance and the swap pre-emption can never
+            // re-arm. With it, a timed-out sniff read reaches M_SNIFF's
+            // mnt_rd_err check and routes to M_FAIL -> NO_DISC, which the user
+            // can recover from by reinserting.
+            target_dataslot_err <= 3'd5;
             if (tgt_is_read) begin
                 target_dataslot_ack <= 0;
                 target_dataslot_done <= 1;
