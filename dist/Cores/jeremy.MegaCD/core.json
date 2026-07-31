@@ -7,8 +7,8 @@
             "description": "Sega CD / Mega CD core for Analogue Pocket",
             "author": "jeremy",
             "url": "https://github.com/jeremy/openFPGA-Genesis",
-            "version": "0.3.2",
-            "date_release": "2026-07-30"
+            "version": "0.3.3",
+            "date_release": "2026-07-31"
         },
         "framework": {
             "target_product": "Analogue Pocket",
