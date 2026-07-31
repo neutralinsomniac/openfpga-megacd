@@ -59,8 +59,5 @@ several bugs and performance discrepencies.
 
 # Known issues
 
-## Hot-swapping BIOS
-- Currently the core doesn't like it if you switch the BIOS while it's running. If you need to hot-switch BIOS, quit the core first.
-
 ## Popful Mail
 - Needs the SRAM to be formatted to avoid a crash - This is not a limitation of this core; it's just how the game works.
