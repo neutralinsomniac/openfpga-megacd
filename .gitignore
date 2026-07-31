@@ -33,6 +33,8 @@
 *.sw?
 # Verilator build output (any sim subdir)
 sim/*/obj_dir/
+sim/fm/obj_ref/
+sim/*/*.o
 sim/full/*.hex
 sim/full/bios_*.hex
 
