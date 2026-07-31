@@ -787,6 +787,24 @@ wire [7:0] cp_pgap8 = (cp_pend_pgap > 12'd255) ? 8'd255 : cp_pend_pgap[7:0];
 wire [19:0] cp_gap_raw = cp_raw[19:0] - cp_i00;
 wire [9:0]  cp_pre01 = (!cp_i00_v || cp_raw[19:0] < cp_i00) ? 10'd0 :
                        (cp_gap_raw > 20'd1023) ? 10'd1023 : cp_gap_raw[9:0];
+// EOF acts as one synthetic newline. The sniff read is rounded DOWN to a
+// whole word (a read past EOF is an APF firmware error), so a cue whose
+// size % 4 != 0 never gets its last 1-3 bytes into parse_buf -- for most
+// cues that is exactly the newline terminating the final INDEX line. LN_MSF
+// only commits its TOC entry when a terminator byte is PROCESSED, so a
+// parse ending mid-MSF silently dropped the last track into the lead-out
+// (Snatcher (USA).cue, 2271 bytes: track 21 vanished). Feeding a newline at
+// EOF lets the pending entry commit before the parser stops.
+//
+// Residual, accepted: when the dropped tail holds actual MSF DIGITS (a cue
+// with no trailing newline, or LF endings with size % 4 in {2,3}), the
+// missing low digits are simply gone and the last INDEX commits up to 74
+// frames (<1s) early -- the track starts with a breath of the gap's
+// silence. Unrecoverable without an unaligned/EOF-exact read, and APF only
+// demonstrably supports word reads that stop short of EOF.
+wire       cp_eof = (pbuf_byte == 8'h00) || (cp_p == 14'h3FFF) ||
+                    ({18'd0, cp_p} >= mnt_len);
+wire [7:0] cp_b   = cp_eof ? 8'h0A : pbuf_byte;
 
 always @(posedge clk_74a) begin
     target_dataslot_getfile <= 0;
@@ -882,86 +900,87 @@ always @(posedge clk_74a) begin
         CP_FETCH: begin pbuf_addr <= cp_p[13:2]; cp_st <= CP_FETCH_W; end
         CP_FETCH_W: cp_st <= CP_EVAL;
         CP_EVAL: begin
-            if (pbuf_byte==8'h00 || cp_p==14'h3FFF ||
-                {18'd0,cp_p} >= mnt_len) cp_st <= CP_DONE;
+            if (cp_eof && cp_ln != LN_MSF) cp_st <= CP_DONE;
             else begin
+                // at EOF mid-MSF: run the case once more on cp_b's synthetic
+                // newline (committing the pending INDEX), then terminate
                 cp_p <= cp_p + 1'b1;
-                cp_st <= CP_FETCH;
+                cp_st <= cp_eof ? CP_DONE : CP_FETCH;
                 case (cp_ln)
                 LN_START:
-                    if (pbuf_byte==8'h0A || pbuf_byte==8'h0D ||
-                        pbuf_byte==8'h20 || pbuf_byte==8'h09) ; // stay
-                    else begin cp_key0 <= pbuf_byte; cp_ln <= LN_KEY2; end
+                    if (cp_b==8'h0A || cp_b==8'h0D ||
+                        cp_b==8'h20 || cp_b==8'h09) ; // stay
+                    else begin cp_key0 <= cp_b; cp_ln <= LN_KEY2; end
                 LN_KEY2: begin
-                    if (cp_key0=="T" && pbuf_byte=="R") cp_ln <= LN_TNUM_WS;
-                    else if (cp_key0=="I" && pbuf_byte=="N") cp_ln <= LN_INUM_WS;
-                    else if (cp_key0=="P" && pbuf_byte=="R") cp_ln <= LN_PGAP_WS;
-                    else if (cp_key0=="F" && pbuf_byte=="I") cp_ln <= LN_FQUOTE;
+                    if (cp_key0=="T" && cp_b=="R") cp_ln <= LN_TNUM_WS;
+                    else if (cp_key0=="I" && cp_b=="N") cp_ln <= LN_INUM_WS;
+                    else if (cp_key0=="P" && cp_b=="R") cp_ln <= LN_PGAP_WS;
+                    else if (cp_key0=="F" && cp_b=="I") cp_ln <= LN_FQUOTE;
                     else cp_ln <= LN_SKIP;
                 end
                 // FILE "name.bin" BINARY — record a pointer into parse_buf
                 LN_FQUOTE:
-                    if (pbuf_byte==8'h22) begin
+                    if (cp_b==8'h22) begin
                         cp_fname_off <= cp_p + 1'b1;
                         cp_fname_len <= 0;
                         cp_ln <= LN_FNAME;
-                    end else if (pbuf_byte==8'h0A) cp_ln <= LN_START;
+                    end else if (cp_b==8'h0A) cp_ln <= LN_START;
                 LN_FNAME:
-                    if (pbuf_byte==8'h22) begin
+                    if (cp_b==8'h22) begin
                         if (cp_files < 8'd128) begin
                             files_nm[cp_files[6:0]] <= {cp_fname_off, cp_fname_len};
                             cp_files <= cp_files + 1'b1;
                         end
                         cp_ln <= LN_SKIP;
-                    end else if (pbuf_byte==8'h0A) cp_ln <= LN_START;
+                    end else if (cp_b==8'h0A) cp_ln <= LN_START;
                     else cp_fname_len <= cp_fname_len + 1'b1;
                 // PREGAP mm:ss:ff — skip to the first digit, then MSF
                 LN_PGAP_WS:
-                    if (pbuf_byte>=8'h30 && pbuf_byte<=8'h39) begin
-                        cp_mm <= pbuf_byte[6:0]-7'h30;
+                    if (cp_b>=8'h30 && cp_b<=8'h39) begin
+                        cp_mm <= cp_b[6:0]-7'h30;
                         cp_ss <= 0; cp_ff <= 0; cp_msf_pos <= 0;
                         cp_is_pgap <= 1;
                         cp_ln <= LN_MSF;
-                    end else if (pbuf_byte==8'h0A) cp_ln <= LN_START;
-                LN_SKIP: if (pbuf_byte==8'h0A) cp_ln <= LN_START;
+                    end else if (cp_b==8'h0A) cp_ln <= LN_START;
+                LN_SKIP: if (cp_b==8'h0A) cp_ln <= LN_START;
                 // TRACK nn TYPE
                 LN_TNUM_WS:
-                    if (pbuf_byte>=8'h30 && pbuf_byte<=8'h39) begin
-                        cp_num <= pbuf_byte[6:0]-7'h30; cp_ln <= LN_TNUM;
-                    end else if (pbuf_byte==8'h0A) cp_ln <= LN_START;
+                    if (cp_b>=8'h30 && cp_b<=8'h39) begin
+                        cp_num <= cp_b[6:0]-7'h30; cp_ln <= LN_TNUM;
+                    end else if (cp_b==8'h0A) cp_ln <= LN_START;
                 LN_TNUM:
-                    if (pbuf_byte>=8'h30 && pbuf_byte<=8'h39)
-                        cp_num <= cp_num*7'd10 + (pbuf_byte[6:0]-7'h30);
+                    if (cp_b>=8'h30 && cp_b<=8'h39)
+                        cp_num <= cp_num*7'd10 + (cp_b[6:0]-7'h30);
                     else begin
                         cp_track <= cp_num;
                         cp_i00_v <= 0;           // fresh track: no INDEX 00 yet
                         cp_ln <= LN_TTYPE_WS;
                     end
                 LN_TTYPE_WS:
-                    if (pbuf_byte=="A") begin cp_audio <= 1; cp_ln <= LN_SKIP; end
-                    else if (pbuf_byte=="M") begin cp_audio <= 0; cp_ln <= LN_SKIP; end
-                    else if (pbuf_byte==8'h0A) cp_ln <= LN_START;
+                    if (cp_b=="A") begin cp_audio <= 1; cp_ln <= LN_SKIP; end
+                    else if (cp_b=="M") begin cp_audio <= 0; cp_ln <= LN_SKIP; end
+                    else if (cp_b==8'h0A) cp_ln <= LN_START;
                 // INDEX nn mm:ss:ff
                 LN_INUM_WS:
-                    if (pbuf_byte>=8'h30 && pbuf_byte<=8'h39) begin
-                        cp_num <= pbuf_byte[6:0]-7'h30; cp_ln <= LN_INUM;
-                    end else if (pbuf_byte==8'h0A) cp_ln <= LN_START;
+                    if (cp_b>=8'h30 && cp_b<=8'h39) begin
+                        cp_num <= cp_b[6:0]-7'h30; cp_ln <= LN_INUM;
+                    end else if (cp_b==8'h0A) cp_ln <= LN_START;
                 LN_INUM:
-                    if (pbuf_byte>=8'h30 && pbuf_byte<=8'h39)
-                        cp_num <= cp_num*7'd10 + (pbuf_byte[6:0]-7'h30);
+                    if (cp_b>=8'h30 && cp_b<=8'h39)
+                        cp_num <= cp_num*7'd10 + (cp_b[6:0]-7'h30);
                     else begin
                         cp_idx <= cp_num;
                         cp_mm <= 0; cp_ss <= 0; cp_ff <= 0; cp_msf_pos <= 0;
                         cp_ln <= LN_MSF;
                     end
                 LN_MSF: begin
-                    if (pbuf_byte>=8'h30 && pbuf_byte<=8'h39) begin
+                    if (cp_b>=8'h30 && cp_b<=8'h39) begin
                         case (cp_msf_pos)
-                        2'd0: cp_mm <= cp_mm*7'd10 + (pbuf_byte[6:0]-7'h30);
-                        2'd1: cp_ss <= cp_ss*7'd10 + (pbuf_byte[6:0]-7'h30);
-                        default: cp_ff <= cp_ff*7'd10 + (pbuf_byte[6:0]-7'h30);
+                        2'd0: cp_mm <= cp_mm*7'd10 + (cp_b[6:0]-7'h30);
+                        2'd1: cp_ss <= cp_ss*7'd10 + (cp_b[6:0]-7'h30);
+                        default: cp_ff <= cp_ff*7'd10 + (cp_b[6:0]-7'h30);
                         endcase
-                    end else if (pbuf_byte==":") begin
+                    end else if (cp_b==":") begin
                         cp_msf_pos <= cp_msf_pos + 1'b1;
                     end else begin
                         // end of MSF
@@ -987,7 +1006,7 @@ always @(posedge clk_74a) begin
                             if (cp_track > cp_tmax) cp_tmax <= cp_track;
                         end
                         cp_is_pgap <= 0;
-                        cp_ln <= (pbuf_byte==8'h0A) ? LN_START : LN_SKIP;
+                        cp_ln <= (cp_b==8'h0A) ? LN_START : LN_SKIP;
                     end
                 end
                 default: cp_ln <= LN_SKIP;
