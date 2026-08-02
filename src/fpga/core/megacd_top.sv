@@ -2284,43 +2284,52 @@ wire dbg_prg_busy /* verilator public_flat_rd */ = sdr_busy;
 // itself is always written through, so the port-2 debug/dump readers stay
 // truthful.
 // ---------------------------------------------------------------------------
-reg [17:0] pfc_tag [0:1];
-reg [15:0] pfc_dat [0:1];
-reg  [1:0] pfc_val = 0;
+// entry: a 4-word line per stream. tag = word-addr[17:2]; per-word valids.
+reg [15:0] pfc_tag [0:1];
+reg [15:0] pfc_dat [0:1][0:3];
+reg  [3:0] pfc_val [0:1];
 reg        pfc_lru = 0;          // victim on miss
 localparam PFC_IDLE=0, PFC_REAL=1, PFC_PF=2, PFC_HIT=3;
 reg  [1:0] pfc_st = PFC_IDLE;
-reg [17:0] pfc_pfa;              // in-flight prefetch address
-reg        pfc_fill;             // entry the prefetch fills
 reg        pfc_poison = 0;
 reg        pfc_hbusy = 0;        // hit-path RDY pulse
-reg        pfc_hcnt = 0;         // stretches the pulse to 2 clk_ram so the
-                                 // clk_sys-sampled PRS FSM cannot miss it
+reg        pfc_hcnt = 0;         // stretched to 2 clk_ram for the clk_sys PRS
 reg [15:0] pfc_hdat;
-reg        pfc_next_pf = 0;      // queue a prefetch after this access
-reg [17:0] pfc_next_a;
-reg        pfc_next_e;
 reg        pfc_busy_d = 0;
+// line-fill queue: up to 4 single-word beats, one PFC_PF pass per beat with a
+// return to IDLE in between so a real access always preempts within a beat
+reg  [2:0] pfc_fleft = 0;        // beats remaining
+reg [15:0] pfc_fline;            // line being filled
+reg  [1:0] pfc_fw;               // next word index to fetch
+reg        pfc_fe;               // entry being filled
 
-wire prg_rd = ~MCD_PRG_OE_N;
-wire prg_wr = ~MCD_PRG_WRL_N | ~MCD_PRG_WRH_N;
-wire pfc_hit0 = pfc_val[0] && pfc_tag[0]==MCD_PRG_ADDR;
-wire pfc_hit1 = pfc_val[1] && pfc_tag[1]==MCD_PRG_ADDR;
+wire        prg_rd  = ~MCD_PRG_OE_N;
+wire        prg_wr  = ~MCD_PRG_WRL_N | ~MCD_PRG_WRH_N;
+wire [15:0] a_line  = MCD_PRG_ADDR[17:2];
+wire  [1:0] a_word  = MCD_PRG_ADDR[1:0];
+wire pfc_hit0 = pfc_tag[0]==a_line && pfc_val[0][a_word];
+wire pfc_hit1 = pfc_tag[1]==a_line && pfc_val[1][a_word];
+wire pfc_line0 = pfc_tag[0]==a_line;
+wire pfc_line1 = pfc_tag[1]==a_line;
 wire p1_quiet = ~p1_rd & ~p1_wrl & ~p1_wrh;
 
-reg        pfc_rd0 = 0;          // prefetch read strobe toward the controller
+reg        pfc_rd0 = 0;          // prefetch-beat read strobe
 reg [17:0] pfc_a0;
 always @(posedge clk_ram) begin
 	pfc_busy_d <= sdr_busy;
 	if (reset | ~pll_core_locked) begin
-		pfc_val <= 0; pfc_st <= PFC_IDLE; pfc_rd0 <= 0;
-		pfc_hbusy <= 0; pfc_poison <= 0; pfc_next_pf <= 0;
+		pfc_val[0] <= 0; pfc_val[1] <= 0;
+		pfc_st <= PFC_IDLE; pfc_rd0 <= 0;
+		pfc_hbusy <= 0; pfc_poison <= 0; pfc_fleft <= 0;
 	end else begin
-		// writes invalidate matching state, whatever the FSM is doing
+		// writes invalidate the whole matching line and stop a matching fill
 		if (prg_wr) begin
-			if (pfc_val[0] && pfc_tag[0]==MCD_PRG_ADDR) pfc_val[0] <= 0;
-			if (pfc_val[1] && pfc_tag[1]==MCD_PRG_ADDR) pfc_val[1] <= 0;
-			if (pfc_st==PFC_PF && pfc_pfa==MCD_PRG_ADDR) pfc_poison <= 1;
+			if (pfc_line0) pfc_val[0] <= 0;
+			if (pfc_line1) pfc_val[1] <= 0;
+			if (pfc_fleft != 0 && pfc_fline==a_line) begin
+				pfc_fleft <= 0;
+				if (pfc_st==PFC_PF) pfc_poison <= 1;
+			end
 		end
 		case (pfc_st)
 		PFC_IDLE: begin
@@ -2329,69 +2338,80 @@ always @(posedge clk_ram) begin
 				pfc_st <= PFC_REAL;          // writes: plain pass-through
 			end else if (prg_rd) begin
 				if (pfc_hit0 | pfc_hit1) begin
-					pfc_hdat  <= pfc_hit0 ? pfc_dat[0] : pfc_dat[1];
-					pfc_hbusy <= 1;          // RDY low-pulse for the PRS FSM
+					pfc_hdat  <= pfc_hit0 ? pfc_dat[0][a_word] : pfc_dat[1][a_word];
+					pfc_hbusy <= 1;
 					pfc_hcnt  <= 1;
 					pfc_lru   <= pfc_hit0;   // protect the entry that hit
-					// stream advance: this entry now wants the next word
-					pfc_next_pf <= 1;
-					pfc_next_a  <= MCD_PRG_ADDR + 18'd1;
-					pfc_next_e  <= pfc_hit1;
+					// consumed the last word of the line: this stream now wants
+					// the NEXT line -- retag the entry and queue a 4-beat fill
+					if (a_word==2'd3) begin
+						if (pfc_hit0) begin pfc_tag[0] <= a_line+16'd1; pfc_val[0] <= 0; end
+						else          begin pfc_tag[1] <= a_line+16'd1; pfc_val[1] <= 0; end
+						pfc_fline <= a_line+16'd1;
+						pfc_fw    <= 0;
+						pfc_fleft <= 3'd4;
+						pfc_fe    <= pfc_hit1;
+					end
 					pfc_st <= PFC_HIT;
 				end else begin
 					pfc_st <= PFC_REAL;      // miss: original protocol
 				end
-			end else if (pfc_next_pf && p1_quiet && !sdr_busy) begin
-				pfc_pfa  <= pfc_next_a;
-				pfc_fill <= pfc_next_e;
+			end else if (pfc_fleft != 0 && p1_quiet && !sdr_busy) begin
 				pfc_poison <= 0;
-				pfc_rd0 <= 1; pfc_a0 <= pfc_next_a;
-				pfc_next_pf <= 0;
+				pfc_rd0 <= 1; pfc_a0 <= {pfc_fline, pfc_fw};
 				pfc_st <= PFC_PF;
 			end
 		end
 		PFC_REAL: begin
-			// pass-through access; on a completed READ, capture the word and
-			// queue the stream's next one into the victim entry
+			// pass-through; on a completed READ, land the word in a line-
+			// matching entry (else retag the victim) and queue the rest of
+			// the line
 			if (pfc_busy_d & ~sdr_busy) begin
 				if (prg_rd) begin
-					pfc_tag[pfc_lru] <= MCD_PRG_ADDR;
-					pfc_dat[pfc_lru] <= sdr_do;
-					pfc_val[pfc_lru] <= 1;
-					pfc_next_pf <= 1;
-					pfc_next_a  <= MCD_PRG_ADDR + 18'd1;
-					pfc_next_e  <= pfc_lru;
-					pfc_lru <= ~pfc_lru;
+					if (pfc_line0) begin
+						pfc_dat[0][a_word] <= sdr_do; pfc_val[0][a_word] <= 1;
+					end else if (pfc_line1) begin
+						pfc_dat[1][a_word] <= sdr_do; pfc_val[1][a_word] <= 1;
+					end else begin
+						pfc_tag[pfc_lru] <= a_line;
+						pfc_val[pfc_lru] <= 0;
+						pfc_dat[pfc_lru][a_word] <= sdr_do;
+						pfc_val[pfc_lru][a_word] <= 1;
+						pfc_lru <= ~pfc_lru;
+					end
+					// fill the remainder of this line (words after the miss)
+					if (a_word != 2'd3) begin
+						pfc_fline <= a_line;
+						pfc_fw    <= a_word + 2'd1;
+						pfc_fleft <= 3'd3 - {1'b0, a_word};
+						pfc_fe    <= pfc_line0 ? 1'b0 : pfc_line1 ? 1'b1 : pfc_lru;
+					end
 				end
 				pfc_st <= PFC_IDLE;
 			end
-			// strobes withdrawn with the engine idle (sub held/reset)
 			if (~prg_rd & ~prg_wr & ~sdr_busy & ~pfc_busy_d) pfc_st <= PFC_IDLE;
 		end
 		PFC_PF: begin
 			if (pfc_busy_d & ~sdr_busy) begin
 				pfc_rd0 <= 0;
-				if (!pfc_poison) begin
-					pfc_tag[pfc_fill] <= pfc_pfa;
-					pfc_dat[pfc_fill] <= sdr_do;
-					pfc_val[pfc_fill] <= 1;
+				if (!pfc_poison && pfc_fleft != 0) begin
+					pfc_dat[pfc_fe][pfc_fw] <= sdr_do;
+					if (pfc_tag[pfc_fe]==pfc_fline) pfc_val[pfc_fe][pfc_fw] <= 1;
+					pfc_fw    <= pfc_fw + 2'd1;
+					pfc_fleft <= pfc_fleft - 3'd1;
 				end
-				pfc_st <= PFC_IDLE;
+				pfc_st <= PFC_IDLE;          // yield between beats
 			end
 		end
 		PFC_HIT: begin
-			if (pfc_hcnt) pfc_hcnt <= 0;     // hold busy a second clk_ram
+			if (pfc_hcnt) pfc_hcnt <= 0;
 			else          pfc_hbusy <= 0;
-			if (~prg_rd) pfc_st <= PFC_IDLE; // PRS latched and moved on
+			if (~prg_rd) pfc_st <= PFC_IDLE;
 		end
 		endcase
 	end
 end
 
-// hit data must hold while the PRS FSM latches; misses/writes see the wires.
-// A real access arriving while a prefetch owns the port simply waits (RDY
-// stays idle; the PRS FSM's RDY-low wait tolerates any delay) until the
-// prefetch drains and PFC_IDLE dispatches it.
 wire pfc_serving_hit = (pfc_st==PFC_HIT) | pfc_hbusy;
 wire p0_pf_owns = (pfc_st==PFC_PF);
 assign MCD_PRG_DI   = pfc_serving_hit ? pfc_hdat : sdr_do;
