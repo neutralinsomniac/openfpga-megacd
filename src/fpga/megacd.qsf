@@ -813,4 +813,4 @@ set_global_assignment -name VHDL_FILE core/rtl/mcd/MCD.vhd
 # an internal counter (gen|ZCLKCNT / jt12 integ_data) comes and goes with
 # placement churn; the seed is chosen to land a fit with zero timing
 # violations. Bump if a future change reintroduces a marginal path.
-set_global_assignment -name SEED 19
+set_global_assignment -name SEED 18

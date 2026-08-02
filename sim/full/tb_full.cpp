@@ -114,13 +114,30 @@ int main(int argc,char**argv){
           rs >> *dut; rs.close();
           char meta[600]; snprintf(meta,sizeof meta,"%s.meta",e);
           FILE* mf=fopen(meta,"r");
-          if(mf){ if(fscanf(mf,"%ld %d %511s",&c_start,&g_ckpt_table_written,
-                            g_ckpt_f2path)<2)
+          // f2 path may contain spaces ("Sonic CD (USA).bin"): read the two
+          // leading numbers, then take the rest of the line verbatim.
+          if(mf){ if(fscanf(mf,"%ld %d ",&c_start,&g_ckpt_table_written)<2 ||
+                     !fgets(g_ckpt_f2path,sizeof g_ckpt_f2path,mf))
                       fprintf(stderr,"RESTORE: bad meta %s\n",meta);
+                  else { size_t n=strlen(g_ckpt_f2path);
+                         while(n && (g_ckpt_f2path[n-1]=='\n'||g_ckpt_f2path[n-1]=='\r'))
+                             g_ckpt_f2path[--n]=0; }
                   fclose(mf); }
           else { fprintf(stderr,"RESTORE: missing %s\n",meta); return 1; }
           if(!strcmp(g_ckpt_f2path,"-")) g_ckpt_f2path[0]=0;
           did_reset_exit=true;
+          // +sdlat* live in model state, so the restore just overwrote the
+          // values the initial block read from the plusargs — every restored
+          // "+sdlat0=N" sweep silently ran at the checkpoint's latency.
+          // Re-apply them from the environment after restore.
+          { const char* l;
+            if((l=getenv("SDLAT0"))) dut->rootp->core_top__DOT__sdram__DOT__LAT0=atol(l);
+            if((l=getenv("SDLAT1"))) dut->rootp->core_top__DOT__sdram__DOT__LAT1=atol(l);
+            if((l=getenv("SDLAT2"))) dut->rootp->core_top__DOT__sdram__DOT__LAT2=atol(l);
+            printf("[%ld] post-restore sdlat = %d/%d/%d\n", c_start,
+                   (int)dut->rootp->core_top__DOT__sdram__DOT__LAT0,
+                   (int)dut->rootp->core_top__DOT__sdram__DOT__LAT1,
+                   (int)dut->rootp->core_top__DOT__sdram__DOT__LAT2); }
           printf("[%ld] restored checkpoint %s (f2='%s' mounted=%d)\n",
                  c_start,e,g_ckpt_f2path,g_ckpt_table_written);
       } }
@@ -219,6 +236,19 @@ int main(int argc,char**argv){
                 for(int i=0;i<2;i++) if(e[i])
                     sscanf(e[i],"%x,%ld,%ld",&hm[i],&h0[i],&h1[i]); }
               for(int i=0;i<2;i++) if(h0[i]>=0 && c>=h0[i] && c<h1[i]) k |= hm[i]; }
+            // INPUT_SCRIPT=<c0>-<c1>:<hexmask>;... : arbitrary sequence of
+            // press windows (cycle units, same button bits as HOLD). Built for
+            // multi-press cheat codes (Sonic CD sound test = 6 ordered
+            // presses) that outgrow the two HOLD/BTN_PULSES windows.
+            { static struct { long c0,c1; unsigned m; } sw[64]; static int nsw=-1;
+              if(nsw<0){ nsw=0; const char* e=getenv("INPUT_SCRIPT");
+                if(e){ char buf[4096]; snprintf(buf,sizeof buf,"%s",e);
+                  for(char* tok=strtok(buf,";"); tok && nsw<64; tok=strtok(NULL,";")){
+                      long a,b; unsigned m;
+                      if(sscanf(tok,"%ld-%ld:%x",&a,&b,&m)==3){
+                          sw[nsw].c0=a; sw[nsw].c1=b; sw[nsw].m=m; nsw++;
+                      } else fprintf(stderr,"INPUT_SCRIPT: bad entry '%s'\n",tok); } } }
+              for(int i=0;i<nsw;i++) if(c>=sw[i].c0 && c<sw[i].c1) k |= sw[i].m; }
             dut->cont1_key = k;
         }
 
@@ -822,6 +852,58 @@ int main(int argc,char**argv){
         uint32_t mpc = dut->rootp->core_top__DOT__dbg_m68k_a & 0xFFFFFF;
         uint32_t spc = dut->rootp->core_top__DOT__dbg_s68k_a & 0xFFFFFF;
 
+        // ---- S08TRACE=1: PCM-stream service pacing, one line per 75Hz-ish
+        // window. Counts sub-CPU accesses to $FF8008 (CDC host data: the
+        // BIOS blind copy loop, GPGX shows 1026/tick during Sonic CD past
+        // music), $FF8004 (DSR polls: 1/transfer when healthy, a storm when
+        // the BIOS hits its timeout path), and the PCM wave-RAM window
+        // $FF2000-$FF3FFF (driver ring writes, GPGX W-profile equivalent).
+        // int() stats are c-unit gaps between consecutive $FF8008 reads
+        // inside a burst (<3000 units apart): the blind loop paces at 16
+        // sub-CPU cycles = ~275 units when executing at real speed, so the
+        // average interval IS the measured copy-loop speed.
+        {
+            static bool i8=false, t8=false;
+            if(!i8){ i8=true; const char* e=getenv("S08TRACE"); t8 = e && *e=='1'; }
+            if(t8){
+                static uint32_t prev_a=0;
+                static long n08=0, n04=0, npcmw=0, last08=-1;
+                static long imin=1000000000, imax=0, isum=0, in_=0, islow=0;
+                static long win0=0;
+                if(spc==0xFF8008 && prev_a!=0xFF8008){
+                    if(last08>=0){ long d=c-last08;
+                        if(d<3000){ if(d<imin)imin=d; if(d>imax)imax=d;
+                                    isum+=d; in_++; if(d>600) islow++; } }
+                    last08=c; n08++;
+                }
+                if(spc==0xFF8004 && prev_a!=0xFF8004) n04++;
+                if(spc>=0xFF2000 && spc<0xFF4000 && prev_a!=spc) npcmw++;
+                static long nregw=0;                    // PCM register window
+                if(spc>=0xFF0000 && spc<0xFF2000 && prev_a!=spc) nregw++;
+                static int16_t amin=0, amax=0;          // PCM+CDDA premix swing
+                { int16_t a=(int16_t)dut->rootp->core_top__DOT__mcd_l;
+                  if(a<amin)amin=a; if(a>amax)amax=a; }
+                static int16_t xmin=0, xmax=0;          // gen mixer output
+                { int16_t a=(int16_t)dut->rootp->core_top__DOT__gen__DOT__mix_l;
+                  if(a<xmin)xmin=a; if(a>xmax)xmax=a; }
+                static int16_t gmin=0, gmax=0;          // post-LPF DAC output
+                { int16_t a=(int16_t)dut->rootp->core_top__DOT__GEN_AUDL;
+                  if(a<gmin)gmin=a; if(a>gmax)gmax=a; }
+                prev_a=spc;
+                if(c-win0 >= 2864000){
+                    if(n08 || npcmw || nregw)
+                        printf("[%ld] S08 n08=%ld n04=%ld pcmw=%ld regw=%ld mcdl=%d..%d mixl=%d..%d audl=%d..%d int=%ld/%ld/%ld slow=%ld\n",
+                               c, n08, n04, npcmw, nregw, amin, amax,
+                               xmin, xmax, gmin, gmax,
+                               imin==1000000000?0:imin,
+                               in_? isum/in_:0, imax, islow);
+                    win0=c; n08=n04=npcmw=nregw=0; last08=-1;
+                    imin=1000000000; imax=isum=in_=islow=0; amin=amax=0;
+                    xmin=xmax=gmin=gmax=0;
+                }
+            }
+        }
+
         // ---- last-64K distinct-address rings (both CPUs), dumped at exit.
         // Sized to hold several rounds of the Lunar RPC livelock (~120 Hz)
         // so the frozen loop can be read straight out of the dump.
@@ -831,6 +913,61 @@ int main(int argc,char**argv){
           if(mpc!=lm){ g_mring[g_mri++ & 65535]=mpc; lm=mpc; }
           if(spc!=ls){ g_sring[g_sri++ & 65535]=spc; ls=spc; } }
         auto* r = dut->rootp;
+
+        // ---- AUDIO_DUMP=<path>[:<div>]: final-mix audio capture ----
+        // Samples GEN_AUDL/GEN_AUDR (the s16 stereo pair feeding sound_i2s)
+        // every <div> loop iterations. Default 4871: 3.58M units/frame at
+        // 60 fps = 214.8M units/s -> 44.1 kHz. Raw s16le stereo; convert:
+        //   ffmpeg -f s16le -ar 44100 -ac 2 -i dump.pcm dump.wav
+        {
+            static FILE* af=nullptr; static long adiv=4871; static bool ai=false;
+            if(!ai){ ai=true; const char* e=getenv("AUDIO_DUMP");
+                if(e){ char p[512]; long d;
+                    if(sscanf(e,"%511[^:]:%ld",p,&d)==2) adiv=d;
+                    else snprintf(p,sizeof p,"%s",e);
+                    af=fopen(p,"wb");
+                    if(!af) fprintf(stderr,"AUDIO_DUMP: cannot open %s\n",p); } }
+            if(af && c%adiv==0){
+                int16_t s[2] = { (int16_t)r->core_top__DOT__GEN_AUDL,
+                                 (int16_t)r->core_top__DOT__GEN_AUDR };
+                fwrite(s,2,2,af);
+            }
+        }
+
+        // ---- PRGTIME=1: sub-CPU PRG-RAM (SDRAM port 0) transaction timing ----
+        // Histograms MCD_PRG_OE_N-low pulse widths and dbg_prg_busy-high
+        // widths in c-units. Built to answer why +sdlat0 did not move the
+        // BIOS blind-copy loop at all: if OE widths do not shift with
+        // +sdlat0, the PRS/front-end handshake is not actually waiting on
+        // the SDRAM (port-0 sibling of the EWJ p1 false-accept).
+        {
+            static bool pi=false, pt=false;
+            if(!pi){ pi=true; const char* e=getenv("PRGTIME"); pt = e && *e=='1'; }
+            if(pt){
+                static long oe0=-1, bs0=-1, nacc=0;
+                static long oh[65], bh[65];   // width histograms, capped
+                static long win0=0;
+                bool oe = !(r->core_top__DOT__MCD_PRG_OE_N);
+                bool bs = r->core_top__DOT__dbg_prg_busy;
+                static bool oe_p=false, bs_p=false;
+                if(oe && !oe_p) oe0=c;
+                if(!oe && oe_p && oe0>=0){ long w=c-oe0; if(w>64)w=64; oh[w]++; nacc++; }
+                if(bs && !bs_p) bs0=c;
+                if(!bs && bs_p && bs0>=0){ long w=c-bs0; if(w>64)w=64; bh[w]++; }
+                oe_p=oe; bs_p=bs;
+                if(c-win0 >= 100000000){
+                    if(nacc){
+                        printf("[%ld] PRGTIME n=%ld oe:",c,nacc);
+                        for(int i=0;i<=64;i++) if(oh[i]) printf(" %d:%ld",i,oh[i]);
+                        printf(" busy:");
+                        for(int i=0;i<=64;i++) if(bh[i]) printf(" %d:%ld",i,bh[i]);
+                        printf("\n");
+                    }
+                    memset(oh,0,sizeof oh); memset(bh,0,sizeof bh);
+                    nacc=0; win0=c;
+                }
+            }
+        }
 
         // ---- SNDTRACE=1: Genesis-side sound-driver activity trace ----
         // Logs YM2612 register writes (address-latch reconstructed per bank),
@@ -1543,6 +1680,13 @@ int main(int argc,char**argv){
                 fclose(fp); }
 #endif
         printf("wrote prgram_end.bin\n");
+    }
+    {   // PCM wave RAM dump (64KB) -- compare against GPGX pcm.ram to find
+        // where streamed past-music data diverges (Sonic CD investigation)
+        FILE*fp=fopen("pcmram_end.bin","wb");
+        if(fp){ for(uint32_t i=0;i<65536;i++)
+                    fputc(dut->rootp->core_top__DOT__MCD__DOT__pcm_ram__DOT__mem[i],fp);
+                fclose(fp); printf("wrote pcmram_end.bin\n"); }
     }
     {   // Z80 RAM dump -- compare against a GPGX zram dump to catch upload
         // corruption (Dark Wizard cursor-SFX investigation)
