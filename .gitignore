@@ -40,3 +40,6 @@ sim/full/bios_*.hex
 
 # Claude Code per-user local settings
 .claude/settings.local.json
+
+# Quartus build transcripts from build.sh runs at the repo root
+build_*.log

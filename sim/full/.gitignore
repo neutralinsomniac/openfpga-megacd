@@ -23,3 +23,10 @@ sdram_ctrl_gen.v
 # Verilator --savable build (build_savable.sh) + checkpoint scratch dir
 obj_savable/
 ckptrun/
+
+# co-sim run/build logs, audio captures, and Verilator checkpoints
+# (all reproducible from the scripts; checkpoints are model-locked anyway)
+*.log
+*.pcm
+*.sav
+*.sav.meta
