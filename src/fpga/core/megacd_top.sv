@@ -2322,15 +2322,6 @@ always @(posedge clk_ram) begin
 		pfc_st <= PFC_IDLE; pfc_rd0 <= 0;
 		pfc_hbusy <= 0; pfc_poison <= 0; pfc_fleft <= 0;
 	end else begin
-		// writes invalidate the whole matching line and stop a matching fill
-		if (prg_wr) begin
-			if (pfc_line0) pfc_val[0] <= 0;
-			if (pfc_line1) pfc_val[1] <= 0;
-			if (pfc_fleft != 0 && pfc_fline==a_line) begin
-				pfc_fleft <= 0;
-				if (pfc_st==PFC_PF) pfc_poison <= 1;
-			end
-		end
 		case (pfc_st)
 		PFC_IDLE: begin
 			pfc_hbusy <= 0;
@@ -2342,16 +2333,10 @@ always @(posedge clk_ram) begin
 					pfc_hbusy <= 1;
 					pfc_hcnt  <= 1;
 					pfc_lru   <= pfc_hit0;   // protect the entry that hit
-					// consumed the last word of the line: this stream now wants
-					// the NEXT line -- retag the entry and queue a 4-beat fill
-					if (a_word==2'd3) begin
-						if (pfc_hit0) begin pfc_tag[0] <= a_line+16'd1; pfc_val[0] <= 0; end
-						else          begin pfc_tag[1] <= a_line+16'd1; pfc_val[1] <= 0; end
-						pfc_fline <= a_line+16'd1;
-						pfc_fw    <= 0;
-						pfc_fleft <= 3'd4;
-						pfc_fe    <= pfc_hit1;
-					end
+					// v2.1: no speculative next-line retag -- entries only ever
+					// hold lines the CPU actually read (the v2 retag variant
+					// corrupted an early-boot read; per-line first-word misses
+					// are the price of the smaller correctness surface)
 					pfc_st <= PFC_HIT;
 				end else begin
 					pfc_st <= PFC_REAL;      // miss: original protocol
@@ -2409,6 +2394,17 @@ always @(posedge clk_ram) begin
 			if (~prg_rd) pfc_st <= PFC_IDLE;
 		end
 		endcase
+		// writes invalidate the whole matching line and stop a matching
+		// fill. AFTER the case so a same-cycle fill completion can never
+		// override the invalidation.
+		if (prg_wr) begin
+			if (pfc_line0) pfc_val[0] <= 0;
+			if (pfc_line1) pfc_val[1] <= 0;
+			if (pfc_fleft != 0 && pfc_fline==a_line) begin
+				pfc_fleft <= 0;
+				if (pfc_st==PFC_PF) pfc_poison <= 1;
+			end
+		end
 	end
 end
 
