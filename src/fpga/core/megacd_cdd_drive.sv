@@ -772,12 +772,17 @@ always @(posedge clk) begin
             dlv_hold_req <= 0;
 
             if (latency != 0) begin
-                // drive latency: count down, decoder keeps running
-                // ("fixes MCD-verificator CDC Init")
+                // drive latency: count down. The decoder keeps running but
+                // gets the NULL tick (via !tick_streamed below) — GPGX runs
+                // cdc_decoder_update(0) here, zero header and no data, and
+                // that is what passes MCD-verificator CDC Init. Re-delivering
+                // the REAL parked sector (which since the seek-applies-
+                // immediately model is the TARGET sector, valid header and
+                // all) hands the BIOS sector loader header-matching data
+                // before PLAY has started — the Sonic CD sound-test bank
+                // loads (play 08/09 then 07) came back scratchy on hardware
+                // with re-delivery here.
                 lat_after = latency - 1'b1;
-                if (tick_data_ok) begin
-                    dlv_hold_req <= 1; tick_streamed = 1;
-                end
             end else if (drv_status == STAT_PLAY) begin
                 if (!head[31] && head >= leadout_lba) begin
                     // end of disc detection
