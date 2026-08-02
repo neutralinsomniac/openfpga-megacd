@@ -2264,9 +2264,142 @@ cofi coffee (
 //   port 2: BIOS load (download-time only)
 wire        sdr_busy;
 wire [15:0] sdr_do;
-assign MCD_PRG_BUSY = sdr_busy;
 wire dbg_prg_busy /* verilator public_flat_rd */ = sdr_busy;
-assign MCD_PRG_DI   = sdr_do;
+
+// ---------------------------------------------------------------------------
+// Sub-CPU PRG-RAM read-line cache + next-word prefetch (registers only, no
+// M10K). The Sonic CD past-music sequencer is sub-CPU-bound at its densest
+// bars (tempo sag at the song's three demand peaks on the Pocket; MiSTer
+// clean), and its hot loops are word-sequential in two interleaved streams
+// (instruction fetch + data pointer). Two entries — one lands per stream —
+// each holding the stream's next expected word, refilled by a speculative
+// read issued only when the engine has no real port-0 work and the main CPU
+// (port 1) has nothing pending, so gameplay's work-RAM service cannot be
+// starved by speculation.
+//
+// Correctness surface kept deliberately small: MISSES and WRITES pass
+// through with the original wire protocol untouched; only HITS take the new
+// path. Every PRG write (S68K and ASIC DMA both arrive on these strobes)
+// invalidates matching tags and poisons a matching in-flight prefetch; RAM
+// itself is always written through, so the port-2 debug/dump readers stay
+// truthful.
+// ---------------------------------------------------------------------------
+reg [17:0] pfc_tag [0:1];
+reg [15:0] pfc_dat [0:1];
+reg  [1:0] pfc_val = 0;
+reg        pfc_lru = 0;          // victim on miss
+localparam PFC_IDLE=0, PFC_REAL=1, PFC_PF=2, PFC_HIT=3;
+reg  [1:0] pfc_st = PFC_IDLE;
+reg [17:0] pfc_pfa;              // in-flight prefetch address
+reg        pfc_fill;             // entry the prefetch fills
+reg        pfc_poison = 0;
+reg        pfc_hbusy = 0;        // hit-path RDY pulse
+reg        pfc_hcnt = 0;         // stretches the pulse to 2 clk_ram so the
+                                 // clk_sys-sampled PRS FSM cannot miss it
+reg [15:0] pfc_hdat;
+reg        pfc_next_pf = 0;      // queue a prefetch after this access
+reg [17:0] pfc_next_a;
+reg        pfc_next_e;
+reg        pfc_busy_d = 0;
+
+wire prg_rd = ~MCD_PRG_OE_N;
+wire prg_wr = ~MCD_PRG_WRL_N | ~MCD_PRG_WRH_N;
+wire pfc_hit0 = pfc_val[0] && pfc_tag[0]==MCD_PRG_ADDR;
+wire pfc_hit1 = pfc_val[1] && pfc_tag[1]==MCD_PRG_ADDR;
+wire p1_quiet = ~p1_rd & ~p1_wrl & ~p1_wrh;
+
+reg        pfc_rd0 = 0;          // prefetch read strobe toward the controller
+reg [17:0] pfc_a0;
+always @(posedge clk_ram) begin
+	pfc_busy_d <= sdr_busy;
+	if (reset | ~pll_core_locked) begin
+		pfc_val <= 0; pfc_st <= PFC_IDLE; pfc_rd0 <= 0;
+		pfc_hbusy <= 0; pfc_poison <= 0; pfc_next_pf <= 0;
+	end else begin
+		// writes invalidate matching state, whatever the FSM is doing
+		if (prg_wr) begin
+			if (pfc_val[0] && pfc_tag[0]==MCD_PRG_ADDR) pfc_val[0] <= 0;
+			if (pfc_val[1] && pfc_tag[1]==MCD_PRG_ADDR) pfc_val[1] <= 0;
+			if (pfc_st==PFC_PF && pfc_pfa==MCD_PRG_ADDR) pfc_poison <= 1;
+		end
+		case (pfc_st)
+		PFC_IDLE: begin
+			pfc_hbusy <= 0;
+			if (prg_wr) begin
+				pfc_st <= PFC_REAL;          // writes: plain pass-through
+			end else if (prg_rd) begin
+				if (pfc_hit0 | pfc_hit1) begin
+					pfc_hdat  <= pfc_hit0 ? pfc_dat[0] : pfc_dat[1];
+					pfc_hbusy <= 1;          // RDY low-pulse for the PRS FSM
+					pfc_hcnt  <= 1;
+					pfc_lru   <= pfc_hit0;   // protect the entry that hit
+					// stream advance: this entry now wants the next word
+					pfc_next_pf <= 1;
+					pfc_next_a  <= MCD_PRG_ADDR + 18'd1;
+					pfc_next_e  <= pfc_hit1;
+					pfc_st <= PFC_HIT;
+				end else begin
+					pfc_st <= PFC_REAL;      // miss: original protocol
+				end
+			end else if (pfc_next_pf && p1_quiet && !sdr_busy) begin
+				pfc_pfa  <= pfc_next_a;
+				pfc_fill <= pfc_next_e;
+				pfc_poison <= 0;
+				pfc_rd0 <= 1; pfc_a0 <= pfc_next_a;
+				pfc_next_pf <= 0;
+				pfc_st <= PFC_PF;
+			end
+		end
+		PFC_REAL: begin
+			// pass-through access; on a completed READ, capture the word and
+			// queue the stream's next one into the victim entry
+			if (pfc_busy_d & ~sdr_busy) begin
+				if (prg_rd) begin
+					pfc_tag[pfc_lru] <= MCD_PRG_ADDR;
+					pfc_dat[pfc_lru] <= sdr_do;
+					pfc_val[pfc_lru] <= 1;
+					pfc_next_pf <= 1;
+					pfc_next_a  <= MCD_PRG_ADDR + 18'd1;
+					pfc_next_e  <= pfc_lru;
+					pfc_lru <= ~pfc_lru;
+				end
+				pfc_st <= PFC_IDLE;
+			end
+			// strobes withdrawn with the engine idle (sub held/reset)
+			if (~prg_rd & ~prg_wr & ~sdr_busy & ~pfc_busy_d) pfc_st <= PFC_IDLE;
+		end
+		PFC_PF: begin
+			if (pfc_busy_d & ~sdr_busy) begin
+				pfc_rd0 <= 0;
+				if (!pfc_poison) begin
+					pfc_tag[pfc_fill] <= pfc_pfa;
+					pfc_dat[pfc_fill] <= sdr_do;
+					pfc_val[pfc_fill] <= 1;
+				end
+				pfc_st <= PFC_IDLE;
+			end
+		end
+		PFC_HIT: begin
+			if (pfc_hcnt) pfc_hcnt <= 0;     // hold busy a second clk_ram
+			else          pfc_hbusy <= 0;
+			if (~prg_rd) pfc_st <= PFC_IDLE; // PRS latched and moved on
+		end
+		endcase
+	end
+end
+
+// hit data must hold while the PRS FSM latches; misses/writes see the wires.
+// A real access arriving while a prefetch owns the port simply waits (RDY
+// stays idle; the PRS FSM's RDY-low wait tolerates any delay) until the
+// prefetch drains and PFC_IDLE dispatches it.
+wire pfc_serving_hit = (pfc_st==PFC_HIT) | pfc_hbusy;
+wire p0_pf_owns = (pfc_st==PFC_PF);
+assign MCD_PRG_DI   = pfc_serving_hit ? pfc_hdat : sdr_do;
+assign MCD_PRG_BUSY = pfc_serving_hit ? pfc_hbusy : (sdr_busy & ~p0_pf_owns);
+wire        p0_rd_out   = p0_pf_owns ? pfc_rd0 : (prg_rd & (pfc_st==PFC_REAL));
+wire        p0_wrl_out  = ~MCD_PRG_WRL_N & (pfc_st==PFC_REAL);
+wire        p0_wrh_out  = ~MCD_PRG_WRH_N & (pfc_st==PFC_REAL);
+wire [17:0] p0_addr_out = p0_pf_owns ? pfc_a0 : MCD_PRG_ADDR;
 
 wire [15:0] GEN_MEM_DO;
 wire        GEN_MEM_BUSY /* verilator public_flat_rd */;
@@ -2483,13 +2616,13 @@ sdram sdram
 	.init(~pll_core_locked),
 	.clk(clk_ram),
 
-	// MCD Sub-CPU PRG-RAM
-	.addr0({6'b100000, MCD_PRG_ADDR}),
+	// MCD Sub-CPU PRG-RAM (behind the pfc read-line cache above)
+	.addr0({6'b100000, p0_addr_out}),
 	.din0(MCD_PRG_DO),
 	.dout0(sdr_do),
-	.rd0(~MCD_PRG_OE_N),
-	.wrl0(~MCD_PRG_WRL_N),
-	.wrh0(~MCD_PRG_WRH_N),
+	.rd0(p0_rd_out),
+	.wrl0(p0_wrl_out),
+	.wrh0(p0_wrh_out),
 	.busy0(sdr_busy),
 
 	// Genesis work RAM + CD BIOS window (serialized by the port-1 front-end)
