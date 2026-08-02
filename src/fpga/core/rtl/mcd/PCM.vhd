@@ -235,8 +235,15 @@ begin
 					end if;
 				else
 					CH <= CH + 1;
-					
-					if CHOFF(to_integer(CH)) = '0' and ONOFF = '1' then
+
+					-- 0xFF is the loop marker, not sample data: the real chip
+					-- never plays it (GPGX: "infinite loop should not output
+					-- any data"). Without this gate its sign+magnitude decode
+					-- is full-scale positive, so a channel whose loop start
+					-- also lands in 0xFF-filled RAM (what erased banks hold)
+					-- pins the mix at +max — the Sonic CD sound-test
+					-- track-switch static.
+					if CHOFF(to_integer(CH)) = '0' and ONOFF = '1' and RAM_DI /= x"FF" then
 						WD := unsigned(RAM_DI);
 					else
 						WD := (others => '0');
