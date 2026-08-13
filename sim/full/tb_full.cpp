@@ -395,6 +395,28 @@ int main(int argc,char**argv){
                 }
                 if(q.empty() && (c&63)==0){
                     uint32_t t0 = dut->rootp->core_top__DOT__icb__DOT__target_0;
+                    // STALL_AT=<cycle> [+ STALL_FOR=<half-cycles>]: the host
+                    // firmware goes completely silent -- NO target command of
+                    // any kind is served inside the window -- modelling the
+                    // observed USB-power-plug stall (firmware busy with a
+                    // power event, bridge polling loop parked). Distinct from
+                    // DROP_RESP_*, which serves the data but loses the result
+                    // word: here nothing happens at all until the window ends,
+                    // then service resumes normally, exactly like the firmware
+                    // coming back. Default window ~300ms emulated (45M half-
+                    // cycles); set >193M to also cross the core_bridge_cmd
+                    // watchdog and exercise the cdf retry path.
+                    { static long stall_at = getenv("STALL_AT")?atol(getenv("STALL_AT")):-1;
+                      static long stall_for = getenv("STALL_FOR")?atol(getenv("STALL_FOR")):45000000;
+                      static int ann=0;
+                      if(stall_at>0 && c>stall_at && c<stall_at+stall_for){
+                          if(!ann){ ann=1;
+                              printf("[%ld] >>> HOST STALL for %ld cycles\n",c,stall_for);
+                              fflush(stdout); }
+                          t0=0;
+                      } else if(ann==1){ ann=2;
+                          printf("[%ld] >>> HOST STALL over\n",c); fflush(stdout); }
+                    }
                     // HOST_LATENCY=<half-cycles>: hold every pending target
                     // command for this long before serving it, modeling the
                     // real Pocket host's SD-card latency (instant by default).
@@ -1218,6 +1240,24 @@ int main(int argc,char**argv){
               printf("MNT [%ld] mount_ready=%d drv_status=%d door=%d main=%06X\n",
                      c, mr, ds, dr, mpc);
               mr_prev=mr; ds_prev=ds; dr_prev=dr;
+          } }
+        // pause-on-stall trace: stall_pause edges and any delivered sector
+        // whose MODE1 sync was broken (stale-bank delivery -- the failure the
+        // watchdog-retry path exists to prevent)
+        { static int sp_prev=-1; static long sp_since=0;
+          int sp = r->core_top__DOT__cdd_stall_pause;
+          if(sp!=sp_prev){
+              if(sp) printf("STALLPAUSE [%ld] ON\n", c);
+              else   printf("STALLPAUSE [%ld] off (held %ld cyc)\n", c,
+                            sp_prev==1 ? c-sp_since : 0L);
+              sp_prev=sp; sp_since=c; fflush(stdout);
+          } }
+        { static unsigned bs_prev=0;
+          unsigned bs = r->core_top__DOT__cdd_drive__DOT__dbg_badsync_cnt;
+          if(bs!=bs_prev){
+              printf("BADSYNC [%ld] count=%u first_lba=%u\n", c, bs,
+                     (unsigned)r->core_top__DOT__cdd_drive__DOT__dbg_badsync_lba);
+              bs_prev=bs; fflush(stdout);
           } }
         // CDDATRACE=1: during CDDA playback, log every CDD command the game
         // issues (skipping the frequent DRIVE STATUS poll c0=0) and flag any

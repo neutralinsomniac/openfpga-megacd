@@ -435,6 +435,7 @@ core_bridge_cmd icb (
     .target_dataslot_ack        ( target_dataslot_ack ),
     .target_dataslot_done       ( target_dataslot_done ),
     .target_dataslot_err        ( target_dataslot_err ),
+    .target_dataslot_wdog       ( target_dataslot_wdog ),
     .target_dataslot_id         ( tds_id ),
     .target_dataslot_slotoffset ( tds_offset ),
     .target_dataslot_bridgeaddr ( tds_bridgeaddr ),
@@ -456,6 +457,7 @@ core_bridge_cmd icb (
     wire    [31:0]  dbg_target_0;
     wire    [3:0]   dbg_tstate;
     wire    [2:0]   target_dataslot_err;
+    wire            target_dataslot_wdog;
     reg     [15:0]  tds_id;
     reg     [31:0]  tds_offset, tds_bridgeaddr, tds_length;
     reg             target_dataslot_getfile = 0, target_dataslot_openfile = 0;
@@ -544,8 +546,25 @@ always @(posedge clk_74a) begin
         if (cdf_src) begin
             mnt_rd_done <= 1;
             mnt_rd_err  <= (target_dataslot_err != 0);
-        end else cd_ack <= 1;
-        cdf_st <= 2'd3;
+            cdf_st <= 2'd3;
+        end else if (target_dataslot_err != 0 && target_dataslot_wdog) begin
+            // WATCHDOG-MANUFACTURED completion of a drive fetch: the host
+            // never answered, so the sector RAM holds whatever it held
+            // before. Acking would mark the bank slot valid and hand the
+            // drive a stale sector (delivered as data, wrong LBA, broken
+            // sync). The drive is still holding cd_req, so simply not
+            // acking retries the read from state 0 -- forever, if need be:
+            // the stall-pause in the drive keeps the emulated system frozen
+            // meanwhile, and when the host comes back the first clean read
+            // unfreezes it. Gated on _wdog, NOT on err alone: a genuine
+            // host-reported error (fast, will repeat identically) keeps
+            // the old ack-anyway behavior instead of retry-spinning with
+            // the system frozen.
+            cdf_st <= 2'd0;
+        end else begin
+            cd_ack <= 1;
+            cdf_st <= 2'd3;
+        end
     end
     2'd3: begin
         if (cdf_src ? !mnt_rd : !cdreq_s[1]) begin
@@ -2026,7 +2045,10 @@ wire [31:0] dbg_hexrow = (dbg_y < 10'd42) ? dbg_hexval :
                          //   LLLLL = LBA of the FIRST one; compare against the
                          //        track layout to see where the disc stops
                          //        being what we think it is
-                         //   F  = {cur_audio, in_pregap, 0, 0}
+                         //   F  = {cur_audio, in_pregap, stall-pause LIVE,
+                         //        stall-pause SEEN since reset} -- the low two
+                         //        bits confirm the pause-on-host-stall path
+                         //        fired (plug in USB power to provoke it)
                          // Replaces the last APF datatable dump from the mount
                          // bring-up, which is long solved.
                          (dbg_y < 10'd114) ? cdd_dbg_integ :
@@ -3279,6 +3301,18 @@ wire reset = ~reset_n_sync | cart_download | region_set;
 
 wire bios_download = cart_download;
 
+// pause-on-stall: the drive raises stall_pause when PLAY delivery has been
+// starved of the head sector for ~78ms (a Pocket firmware event -- observed:
+// plugging in USB power -- stops bridge servicing for hundreds of ms, and
+// streaming games like Silpheed turn that gap into a read error). sys_pause
+// freezes the whole emulated machine (gen CEs, MCD + CART ENABLE, the
+// drive's own 75Hz tick) while the fetch path and bridge keep running;
+// releasing is the drive's call the moment the fetch lands. The VDP
+// free-runs so the display holds the last frame. If a menu pause is ever
+// wired (cs_menu_pause_enable is currently a dead register), OR it in here.
+wire cdd_stall_pause /* verilator public_flat_rd */;
+wire sys_pause = cdd_stall_pause;
+
 ///////////////////////////////////////////////
 // Genesis (gen) — expansion bus exported
 ///////////////////////////////////////////////
@@ -3298,6 +3332,7 @@ gen gen
 (
 	.RESET_N(~reset && reset_delay_done),
 	.MCLK(clk_sys),
+	.PAUSE_EN(sys_pause),
 
 	.VA(GEN_VA),
 	.VDI(GEN_VDI),
@@ -3436,7 +3471,7 @@ MCD MCD
 	// keep gen/MCD/CART reset release aligned: reset_delay applied to all
 	.RST_N(~(reset | bios_download) && reset_delay_done),
 	.CLK(clk_sys),
-	.ENABLE(1'b1),
+	.ENABLE(~sys_pause),
 	.MCD_RST_N(MCD_RST_N),
 	.PALSW(1'b0),
 
@@ -3868,6 +3903,9 @@ megacd_cdd_drive cdd_drive
 	.cdc_cdda_wr(CD_CDC_CDDA_WR),
 	.cdda_wr_ready(MCD_CDDA_WR_READY),
 
+	.sys_pause(sys_pause),
+	.stall_pause(cdd_stall_pause),
+
 	.track_count(toc_count_sys),
 	.disc_loading(loading_sys),
 	.cd_fast_seek(cd_fast_sys),
@@ -3965,7 +4003,7 @@ CART CART
 (
 	.RST_N(~(reset | bios_download) && reset_delay_done),
 	.CLK(clk_sys),
-	.ENABLE(1'b1),
+	.ENABLE(~sys_pause),
 
 	.ROM_MODE(1'b0),   // no cartridge inserted: BIOS boots from expansion
 	.RAM_ID(8'd255),   // no RAM cart in M1

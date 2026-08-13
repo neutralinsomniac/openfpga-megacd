@@ -86,6 +86,20 @@ module megacd_cdd_drive
     output reg        cdc_cdda_wr,
     input             cdda_wr_ready,
 
+    // pause-on-stall. The Pocket host stops servicing bridge reads for the
+    // duration of firmware events (observed: plugging in USB power), and a
+    // streaming game's own driver turns a long enough sector gap into a
+    // read error (Silpheed's 3D cutscenes abort). When PLAY delivery has
+    // been starved of the sector under the head for STALL_PAUSE_AT clks,
+    // stall_pause asserts and the top freezes the emulated system (gen CEs,
+    // MCD/CART ENABLE, and this module's tick block via sys_pause) until
+    // the fetch lands: the game never sees the gap, only wall-clock stops.
+    // sys_pause is the top's combined pause fed back; today it is just
+    // stall_pause synchronized... (same clk domain: identical), kept as an
+    // input so a future menu pause freezes the drive through the same gate.
+    input             sys_pause,
+    output reg        stall_pause,
+
     // track table from the cue parser (0 = no cue: single data track).
     // toc_q = {audio, pregap[7:0], pre01_gap[9:0], file[6:0],
     //          delta[19:0], disc_lba[19:0]}; pre01_gap = in-file INDEX 00
@@ -128,6 +142,7 @@ module megacd_cdd_drive
     //   [31:24] data sectors delivered whose 12-byte MODE1 sync was WRONG
     //   [23:4]  LBA of the first such sector
     //   [3]     cur_audio      [2] in_pregap
+    //   [1]     stall-pause live   [0] stall-pause seen since reset (sticky)
     output wire [31:0] dbg_integ
 );
 
@@ -229,7 +244,10 @@ wire in_pregap = !head[31] && (head[19:0] >= pgap_lo) && (head[19:0] < pgap_hi)
 wire aud_gap = cur_audio && !head[31] && (head[31:20] == 12'd0) &&
                (head[19:0] < cur_start);
 assign dbg_pos = {n1, cur_audio, in_pregap, cur_track[5:0], dbg_seek_lba};
-assign dbg_integ = {dbg_badsync_cnt, dbg_badsync_lba, cur_audio, in_pregap, 2'b00};
+// [1] = stall-pause LIVE, [0] = stall-pause has fired since reset (sticky):
+// the hardware confirmation bits for the USB-power-plug host stall
+assign dbg_integ = {dbg_badsync_cnt, dbg_badsync_lba, cur_audio, in_pregap,
+                    stall_pause, dbg_stall_seen};
 // disc LBA -> file LBA for fetch/delivery
 wire [31:0] head_file = head - {12'd0, cur_delta};
 
@@ -541,6 +559,47 @@ always @(posedge clk) begin
 end
 
 ///////////////////////////////////////////////
+// pause-on-stall detector. Counts how long PLAY delivery has been blocked on
+// a missing head sector (want_head high with the drive actively delivering).
+// The threshold sits between the two worlds it separates: the 4-sector bank
+// covers ~53ms of 1x streaming, so any healthy SD-latency spike clears in
+// well under 78ms, while the host stalls this exists for (firmware servicing
+// a USB power event) run hundreds of ms. A false trigger costs a ~ms freeze,
+// not an error, so the threshold errs toward firing.
+//
+// Deassert is immediate on the condition clearing (the fetch landed, a seek
+// was commanded, the disc vanished). The detector must stay OUTSIDE the
+// sys_pause-frozen tick block or it could never release its own pause; the
+// inputs it samples from the frozen block (drv_status/latency/pending) hold
+// their values, want_head is live from the free-running fetch engine.
+//
+// No deadlock: the fetch engine keeps cd_req held while paused, the clk_74a
+// bridge FSM keeps serving it, and the core_bridge_cmd watchdog turns a
+// dead host into a retried read (see the cdf arbiter) rather than a stale
+// ack -- so the pause releases on the first read the host actually answers.
+///////////////////////////////////////////////
+localparam [22:0] STALL_PAUSE_AT = 23'h400000;   // 2^22 clk ~= 78ms
+reg [22:0] stall_cnt = 0;
+reg        dbg_stall_seen /*verilator public_flat_rd*/ = 0;  // sticky
+wire stall_cond = disc_present && (drv_status == STAT_PLAY) &&
+                  (latency == 8'd0) && (pending == 4'd0) && want_head;
+always @(posedge clk) begin
+    if (reset | ~mcd_rst_n) begin
+        stall_cnt   <= 0;
+        stall_pause <= 0;
+        dbg_stall_seen <= 0;
+    end else if (!stall_cond) begin
+        stall_cnt   <= 0;
+        stall_pause <= 0;
+    end else if (stall_cnt != STALL_PAUSE_AT) begin
+        stall_cnt <= stall_cnt + 1'b1;
+    end else begin
+        stall_pause <= 1;
+        dbg_stall_seen <= 1;
+    end
+end
+
+///////////////////////////////////////////////
 // sector delivery: stream 1176 words to the CDC (16 clks per word: 8 high,
 // 8 low = ~350us per sector) or to the CDDA DAC (FIFO-paced, ~13ms).
 // dlv_hold marks a re-delivery of the sector under a parked head (latency /
@@ -596,7 +655,12 @@ always @(posedge clk) begin
         dbg_badsync_cnt <= 0;
         dbg_badsync_seen <= 0;
     end else case (dlv_st)
-    2'd0: if (dlv_owed != 0 && (head[31] || !want_head)) begin
+    // !sys_pause: no delivery may START while the system is frozen (the CDC
+    // and DAC are not consuming). A delivery can never be in flight when the
+    // pause asserts: the pause requires want_head high for ~78ms, which holds
+    // this very gate closed for far longer than the longest delivery (~27ms,
+    // an audio sector against a full CDDA FIFO).
+    2'd0: if (dlv_owed != 0 && (head[31] || !want_head) && !sys_pause) begin
         dlv_w  <= 0;
         dlv_slot <= head_file[1:0];
         dlv_neg  <= head[31];
@@ -726,7 +790,14 @@ always @(posedge clk) begin
         rpt_toc_use <= 0;
         msf_start <= 0;
         dlv_owed <= 0;
-    end else begin : main
+    // !sys_pause freezes the drive's entire 75Hz world -- wdog (so no ticks,
+    // no owed accumulation, no head movement), the CDD command/status
+    // exchange, the null-tick stretcher -- while the fetch engine and the
+    // stall detector above keep running. The ASIC/CDC/CDDA consumers of this
+    // block's outputs are frozen by the same signal in the same clk domain,
+    // so held levels (cdc_dec_tick, cdd_rec mid-pulse) resume coherently.
+    // reset keeps priority over the freeze.
+    end else if (!sys_pause) begin : main
         // effective latency after this tick's decrement, GPGX sequential
         // semantics (the pending block sees the already-decremented value)
         reg [7:0] lat_after;

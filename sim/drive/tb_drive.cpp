@@ -68,7 +68,14 @@ static void toc_set(int idx, bool audio, int pregap, int pre01, int file,
 static bool fail = false;
 static void err(const char* m){ printf("FAIL: %s (t=%llu)\n", m, (unsigned long long)tk); fail=true; }
 
+// stallpause_test only: loop stall_pause back into sys_pause the way
+// megacd_top wires it. Everywhere else sys_pause stays 0, which makes the
+// detector's output a no-op -- identical drive behavior to before the port
+// existed, so the legacy tests' expectations are untouched.
+static bool loopback_pause = false;
+
 static void tick(){
+    dut->sys_pause = loopback_pause ? dut->stall_pause : 0;
     dut->clk = 0; dut->eval();
     // ----- drive the mock host (combinational off current outputs) -----
     bool req = dut->cd_req;
@@ -897,10 +904,130 @@ static int reseek_test(){
     return fail?1:0;
 }
 
+// Pause-on-stall test: a host outage during PLAY delivery must raise
+// stall_pause after ~78ms (2^22 clk) of head starvation, hold the drive's
+// 75Hz world frozen while asserted (head parked, zero deliveries, zero
+// stale sectors), and release within a handful of clk of the fetch landing.
+// The outage is modelled as one fetch whose ack never comes for spike_len
+// clk -- from the drive's side that IS a dead host, since the fetch FSM is
+// serial and parks on the un-acked request.
+static int stallpause_test(){
+    mock_valid_sync = true;
+    loopback_pause = true;
+    dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
+    dut->img_size = 30000u*2352u; dut->track_count=0; dut->cdda_wr_ready=1;
+    dut->cd_fast_seek=0; dut->disc_loading=0;
+    dut->toc_q[0]=0; dut->toc_q[1]=0; dut->toc_q[2]=0; dut->cd_ack_74a=0;
+    for(int i=0;i<20;i++) tick();
+    dut->reset=0; dut->mcd_rst_n=1;
+    for(int i=0;i<20;i++) tick();
+
+    pulse_cmd(mk_seek(10));
+    const long BEAT = 715909;
+    const long THRESH = 4194304;             // STALL_PAUSE_AT in the drive
+
+    // 1) establish streaming. deliver_words is NOT the signal here: the
+    //    drive re-delivers the parked head sector every beat in TOC/latency
+    //    states (decoder-keeps-running behavior), which pumps the word count
+    //    long before PLAY delivery begins. Head ADVANCE is what only PLAY
+    //    deliveries do, so wait for a few of those.
+    long b=0;
+    while((long)(dut->dbg_state & 0xFFFFF) < 13 && b < 60){ pulse_cmd(0x0ULL);
+        for(long c=0;c<BEAT;c++) tick(); b++; }
+    if((long)(dut->dbg_state & 0xFFFFF) < 13){ err("streaming never established"); return 1; }
+
+    // 2) host outage: the next fetch's ack is withheld for ~223ms
+    const long OUTAGE = 12000000;
+    spike_at_fetch = fetch_idx;
+    spike_len = OUTAGE;
+    vluint64_t t_out0 = tk;
+    long words_at_out0 = deliver_words;
+
+    // 3) run through the outage watching for the pause. No IDLE polls in
+    //    here: the real sub-CPU is frozen by the pause and sends nothing.
+    vluint64_t t_on=0, t_off=0, t_spike_req=0;
+    long head_at_on=-1, words_at_on=-1;
+    bool frozen_moved=false, frozen_delivered=false;
+    { long head_d = dut->dbg_state & 0xFFFFF; bool req_dd = dut->cd_req;
+      int ev=0;
+      while(tk < t_out0 + OUTAGE + 9000000){
+        tick();
+        long hd = dut->dbg_state & 0xFFFFF; bool rq = dut->cd_req;
+        if(ev<40 && hd!=head_d){ printf("  [ev] t=+%lld head %ld->%ld\n",
+            (long long)(tk-t_out0), head_d, hd); ev++; }
+        if(rq && !req_dd){
+            // this loop sees the rise one tick before the mock assigns
+            // lat_ctr, so identify the spiked fetch by its index instead
+            bool spiked = (fetch_idx == spike_at_fetch);
+            if(ev<40) printf("  [ev] t=+%lld req off=%u lat=%ld%s\n",
+                (long long)(tk-t_out0), (unsigned)dut->cd_req_offset, lat_ctr,
+                spiked ? " <SPIKE>" : ""); ev++;
+            if(spiked && !t_spike_req) t_spike_req = tk;
+        }
+        head_d=hd; req_dd=rq;
+        bool sp = dut->stall_pause;
+        if(sp && !t_on){ t_on = tk;
+            printf("  [ev] t=+%lld PAUSE ON\n",(long long)(tk-t_out0));
+            head_at_on = dut->dbg_state & 0xFFFFF;
+            words_at_on = deliver_words; }
+        if(sp){
+            if((long)(dut->dbg_state & 0xFFFFF) != head_at_on) frozen_moved=true;
+            if(deliver_words != words_at_on) frozen_delivered=true;
+        }
+        if(t_on && !sp){ t_off = tk;
+            printf("  [ev] t=+%lld PAUSE OFF\n",(long long)(tk-t_out0)); break; }
+      }
+    }
+    printf("--- pause-on-stall results ---\n");
+    printf("outage at t=%llu, pause ON +%lld clk, OFF +%lld clk (outage %ld)\n",
+           (unsigned long long)t_out0,
+           t_on ? (long long)(t_on-t_out0) : -1,
+           t_off ? (long long)(t_off-t_out0) : -1, OUTAGE);
+    printf("head@ON=%ld  frozen_moved=%d frozen_delivered=%d  badsync=%u\n",
+           head_at_on, frozen_moved, frozen_delivered,
+           (unsigned)((dut->dbg_integ>>24)&0xFF));
+
+    if(!t_on)  err("stall_pause never asserted during a >200ms host outage");
+    if(!t_spike_req) err("spiked fetch never issued (test setup broken)");
+    // All timing is relative to the SPIKED REQUEST's start: its ack lands at
+    // t_spike_req+OUTAGE, and starvation begins once the bank (<=5 sectors
+    // incl. in-flight) drains after it.
+    if(t_on && t_spike_req && (long long)(t_on-t_spike_req) < THRESH)
+               err("stall_pause asserted before the 78ms threshold");
+    if(t_on && t_spike_req && (long long)(t_on-t_spike_req) > THRESH + 6*BEAT)
+               err("stall_pause asserted late (starvation start + 78ms expected)");
+    if(!t_off) err("stall_pause never released after the host came back");
+    if(t_off && t_spike_req && (long long)(t_off-t_spike_req) > OUTAGE+1000)
+               err("stall_pause released late (release must track the ack)");
+    if(frozen_moved)     err("head advanced while paused");
+    if(frozen_delivered) err("sectors delivered while paused");
+    if(((dut->dbg_integ>>24)&0xFF)!=0) err("stale sector delivered (badsync)");
+    if(((dut->dbg_state>>28)&0xF)!=1) err("drive fell out of PLAY across the outage");
+    if(!(dut->dbg_integ & 1)) err("sticky stall-seen debug bit not set");
+
+    // 4) recovery: streaming resumes at full rate with the head continuous
+    long words_at_rec = deliver_words;
+    long head_at_rec = dut->dbg_state & 0xFFFFF;
+    for(long bb=0;bb<8;bb++){ pulse_cmd(0x0ULL);
+        for(long c=0;c<BEAT;c++) tick(); }
+    long secs_rec = (deliver_words - words_at_rec)/1176;
+    long head_now = dut->dbg_state & 0xFFFFF;
+    printf("recovery: +%ld sectors in 8 beats, head %ld -> %ld\n",
+           secs_rec, head_at_rec, head_now);
+    if(secs_rec < 6) err("delivery did not resume at rate after the pause");
+    if(head_now - head_at_rec != (long)(deliver_words-words_at_rec)/1176)
+        err("head skipped sectors across the pause/recovery");
+    if(((dut->dbg_integ>>24)&0xFF)!=0) err("badsync after recovery");
+
+    printf(fail ? "\n==== STALL-PAUSE TEST FAILED ====\n"
+                : "\n==== STALL-PAUSE TEST PASSED ====\n");
+    return fail?1:0;
+}
+
 int main(int argc, char** argv){
     Verilated::commandArgs(argc,argv);
     dut = new Vmegacd_cdd_drive;
-    bool cdda_mode=false, swap_mode=false, reseek_mode=false, pause_mode=false, scan_mode=false, binswap_mode=false, integ_mode=false, gap_mode=false, jingle_mode=false;
+    bool cdda_mode=false, swap_mode=false, reseek_mode=false, pause_mode=false, scan_mode=false, binswap_mode=false, integ_mode=false, gap_mode=false, jingle_mode=false, stallpause_mode=false;
     const char* content_bin=nullptr;
     for(int i=1;i<argc;i++){
         // --lat N: SUSTAINED per-fetch host latency in clk, modelling real SD
@@ -921,6 +1048,7 @@ int main(int argc, char** argv){
         if(!strcmp(argv[i],"--integ")) integ_mode=true;
         if(!strcmp(argv[i],"--gap")) gap_mode=true;
         if(!strcmp(argv[i],"--jingle")) jingle_mode=true;
+        if(!strcmp(argv[i],"--stallpause")) stallpause_mode=true;
         if(!strcmp(argv[i],"--content")&&i+1<argc) content_bin=argv[++i];
     }
     if(cdda_mode){ int r=cdda_test(); delete dut; return r; }
@@ -932,6 +1060,7 @@ int main(int argc, char** argv){
     if(integ_mode){ int r=integ_test(); delete dut; return r; }
     if(gap_mode){ int r=gap_test(); delete dut; return r; }
     if(jingle_mode){ int r=jingle_test(); delete dut; return r; }
+    if(stallpause_mode){ int r=stallpause_test(); delete dut; return r; }
     if(content_bin){ int r=content_test(content_bin); delete dut; return r; }
 
     // reset

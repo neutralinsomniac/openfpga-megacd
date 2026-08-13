@@ -37,7 +37,12 @@ module gen
 (
 	input         RESET_N,
 	input         MCLK,
-	
+	// freeze the emulated machine: suppresses the 68K/Z80 clock enables (and
+	// with them everything they pace -- PSG, FM, IO, bus FSMs) exactly like
+	// system.sv's PAUSE_EN in the Genesis core. The VDP free-runs so the
+	// display keeps showing. State-preserving: CEs resume mid-bus-cycle.
+	input         PAUSE_EN,
+
 	output [23:1] VA,
 	input  [15:0] VDI,
 	output [15:0] VDO,
@@ -166,24 +171,24 @@ always @(negedge MCLK) begin
 		VCLKCNT <= VCLKCNT + 1'b1;
 		if (VCLKCNT == 4'd6) begin
 			VCLKCNT <= 0;
-			M68K_CLKENp <= 1;
+			M68K_CLKENp <= ~PAUSE_EN;
 		end
 
 		M68K_CLKENn <= 0;
 		if (VCLKCNT == 4'd3) begin
-			M68K_CLKENn <= 1;
+			M68K_CLKENn <= ~PAUSE_EN;
 		end
-		
+
 		Z80_CLKENn <= 0;
 		ZCLKCNT <= ZCLKCNT + 1'b1;
 		if (ZCLKCNT == 14) begin
 			ZCLKCNT <= 0;
-			Z80_CLKENn <= 1;
+			Z80_CLKENn <= ~PAUSE_EN;
 		end
-		
+
 		Z80_CLKENp <= 0;
 		if (ZCLKCNT == 7) begin
-			Z80_CLKENp <= 1;
+			Z80_CLKENp <= ~PAUSE_EN;
 		end
 
 	end

@@ -57,6 +57,11 @@ input   wire            target_dataslot_read,
 output  reg             target_dataslot_ack,
 output  reg             target_dataslot_done,
 output  reg     [2:0]   target_dataslot_err,
+// 1 = the done it accompanies was manufactured by the watchdog below, not
+// answered by the host. Consumers that can retry (the CD drive fetch) key on
+// this rather than on err=5, so a genuine host-reported error keeps its
+// current handling and only a vanished host is retried.
+output  reg             target_dataslot_wdog,
 input   wire    [15:0]  target_dataslot_id,
 input   wire    [31:0]  target_dataslot_slotoffset,
 input   wire    [31:0]  target_dataslot_bridgeaddr,
@@ -275,6 +280,7 @@ initial begin
     target_dataslot_ack <= 0;
     target_dataslot_done <= 0;
     target_dataslot_err <= 0;
+    target_dataslot_wdog <= 0;
 end
     
 always @(posedge clk) begin
@@ -604,6 +610,7 @@ always @(posedge clk) begin
     TARG_ST_WAITRESULT_DS: begin
         if(target_0[31:16] == 16'h6F6B) begin
             target_dataslot_err <= target_0[2:0];
+            target_dataslot_wdog <= 0;
             if (tgt_is_read) begin
                 target_dataslot_ack <= 0;
                 target_dataslot_done <= 1;
@@ -620,6 +627,7 @@ always @(posedge clk) begin
             // mnt_rd_err check and routes to M_FAIL -> NO_DISC, which the user
             // can recover from by reinserting.
             target_dataslot_err <= 3'd5;
+            target_dataslot_wdog <= 1;
             if (tgt_is_read) begin
                 target_dataslot_ack <= 0;
                 target_dataslot_done <= 1;
