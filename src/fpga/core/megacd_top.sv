@@ -543,24 +543,29 @@ always @(posedge clk_74a) begin
         cdf_st <= 2'd2;
     end
     2'd2: if (target_dataslot_done) begin
-        if (cdf_src) begin
+        if (target_dataslot_err != 0 && target_dataslot_wdog) begin
+            // WATCHDOG-MANUFACTURED completion: the host never answered, so
+            // the destination RAM holds whatever it held before. Completing
+            // would hand the consumer garbage dressed as data:
+            //   - a drive fetch acked here marks the bank slot valid and
+            //     delivers a stale sector (wrong LBA, broken sync);
+            //   - a mount read completed-with-err here feeds the size
+            //     probe's binary search a fake "does not fit" answer (the
+            //     probe treats err as DATA), silently corrupting the TOC.
+            // Both requests are level-held (cd_req / mnt_rd), so simply not
+            // completing retries from state 0 -- forever, if need be: for
+            // fetches the stall-pause keeps the emulated system frozen
+            // meanwhile, and a disc re-pick still recovers a truly dead
+            // host, because the swap pre-emption drops mnt_rd and fires on
+            // (cdf_st==0 && !mnt_rd_done), which every retry round passes
+            // through. Gated on _wdog, NOT on err alone: a genuine
+            // host-reported error (fast, will repeat identically) keeps
+            // the old complete-with-err behavior instead of retry-spinning.
+            cdf_st <= 2'd0;
+        end else if (cdf_src) begin
             mnt_rd_done <= 1;
             mnt_rd_err  <= (target_dataslot_err != 0);
             cdf_st <= 2'd3;
-        end else if (target_dataslot_err != 0 && target_dataslot_wdog) begin
-            // WATCHDOG-MANUFACTURED completion of a drive fetch: the host
-            // never answered, so the sector RAM holds whatever it held
-            // before. Acking would mark the bank slot valid and hand the
-            // drive a stale sector (delivered as data, wrong LBA, broken
-            // sync). The drive is still holding cd_req, so simply not
-            // acking retries the read from state 0 -- forever, if need be:
-            // the stall-pause in the drive keeps the emulated system frozen
-            // meanwhile, and when the host comes back the first clean read
-            // unfreezes it. Gated on _wdog, NOT on err alone: a genuine
-            // host-reported error (fast, will repeat identically) keeps
-            // the old ack-anyway behavior instead of retry-spinning with
-            // the system frozen.
-            cdf_st <= 2'd0;
         end else begin
             cd_ack <= 1;
             cdf_st <= 2'd3;
@@ -710,6 +715,17 @@ reg [3:0]  mnt_term = 0;   // overlay: 1=started, B=READY reached, C=FAILED
 // enough to restart the mount from whatever state the FSM was in.
 reg        mount_req = 0;
 reg [31:0] mount_req_size = 0;
+// slot-1 008A notifications seen (accepted or suppressed) -- overlay
+// diagnostic for the firmware re-announcing slots on power events
+reg  [2:0] dbg_008a_cnt = 0;
+// "the menu was open recently": osnotify_inmenu held, then ~3.6s of
+// grace after it drops (2^28 @74.25MHz), qualifying a user-caused 008A
+reg [27:0] menu_seen_cnt = 0;
+wire       menu_recent = |menu_seen_cnt;
+always @(posedge clk_74a) begin
+    if (osnotify_inmenu)          menu_seen_cnt <= {28{1'b1}};
+    else if (menu_seen_cnt != 0)  menu_seen_cnt <= menu_seen_cnt - 1'b1;
+end
 
 // cue parser state
 localparam CP_FETCH=3'd0, CP_FETCH_W=3'd1, CP_EVAL=3'd2, CP_DONE=3'd3;
@@ -1045,10 +1061,19 @@ always @(posedge clk_74a) begin
         endcase
     end
     M_GETFILE: if (target_dataslot_file_done) begin
-        // scan the returned path: find the NUL and the last '/' — the
-        // directory prefix is reused for every bin the cue references
-        mp_w <= 0; mp_ph <= 0; mp_found <= 0; mp_dirlen <= 0;
-        mnt_st <= M_DIRSCAN;
+        if (target_dataslot_err != 0 && target_dataslot_wdog) begin
+            // watchdog-completed getfile: the path buffer was never
+            // written (it holds the previous mount's path, or zeros).
+            // Scanning it would open the WRONG file; failing retires to
+            // NO_DISC for a merely-stalled host. Re-strobe instead --
+            // same recovery story as the openfile retry above.
+            target_dataslot_getfile <= 1;
+        end else begin
+            // scan the returned path: find the NUL and the last '/' — the
+            // directory prefix is reused for every bin the cue references
+            mp_w <= 0; mp_ph <= 0; mp_found <= 0; mp_dirlen <= 0;
+            mnt_st <= M_DIRSCAN;
+        end
     end
     M_DIRSCAN: begin
         case (mp_ph)
@@ -1184,6 +1209,18 @@ always @(posedge clk_74a) begin
                 mnt_tmo <= 25'd1;
                 mnt_st <= M_FSIZE;
             end
+        end else if (target_dataslot_wdog) begin
+            // the "error" is our own bridge watchdog timing out a host that
+            // went silent (firmware busy with a power event). Failing the
+            // mount here retired the disc to NO_DISC mid-game whenever the
+            // stall landed on a cross-bin reopen -- the game's loader then
+            // hung on a dead drive (black screen, PCM ring looping). The
+            // openfile is idempotent and its path buffer is intact, so just
+            // strobe it again; each round costs one ~900ms watchdog period
+            // and a disc re-pick still pre-empts (mount_req is
+            // state-independent). Genuine firmware answers (3 = missing
+            // bin, 4 = outside /Assets) keep the fail path below.
+            target_dataslot_openfile <= 1;
         end else begin
             mnt_reopen <= 0;
             mnt_st <= M_FAIL;
@@ -1428,10 +1465,27 @@ always @(posedge clk_74a) begin
     // needs no such guard: core_bridge_cmd serialises those, so a new
     // request cannot issue until the aborted one has completed.
     ///////////////////////////////////////////////
+    // SPURIOUS-RENOTIFY GUARD. A slot-1 008A used to start a teardown
+    // remount unconditionally: mount_ready drops, img_size reads 0, the
+    // drive retires to NO_DISC and the disc is gone for the seconds the
+    // re-probe takes -- fatal to any game mid-load. Every notification a
+    // USER causes goes through the Pocket menu (the size also differs on a
+    // real image change), but the firmware also emits notifications on its
+    // own (it already re-sends 008A after every core-initiated openfile),
+    // and a power event that re-announces the slot would rip a mounted disc
+    // out from under a running game at random. So: accept a remount only if
+    // nothing is mounted yet, the size actually changed, or the menu was
+    // open within the last ~3.6s (every genuine pick satisfies one of
+    // these). A same-size re-notify with the menu closed is echoed state,
+    // not a user action -- counted for the overlay, otherwise ignored.
     if (dataslot_update && dataslot_update_id == 16'd1
         && dataslot_update_size != 32'd0) begin
-        mount_req      <= 1;
-        mount_req_size <= dataslot_update_size;
+        dbg_008a_cnt <= dbg_008a_cnt + 1'b1;
+        if (!mount_ready || dataslot_update_size != mounted_size
+            || menu_recent) begin
+            mount_req      <= 1;
+            mount_req_size <= dataslot_update_size;
+        end
     end
     if (mount_req) begin
         mnt_rd <= 0;                 // release the channel so it can drain
@@ -3962,7 +4016,11 @@ always @(posedge clk_74a) begin
         if (target_dataslot_err != 0) dbg_err_cnt <= dbg_err_cnt + 1'b1;
     end
 end
-wire [31:0] dbg_cdpath = {2'b0, cdf_st, 3'b0, reopen_req,
+// second nibble = {008A-notification count[2:0], reopen_req}: the count
+// bumping when USB power is plugged (without a menu visit) is the direct
+// hardware confirmation that the firmware re-announces the CD slot on
+// power events (the remount such a notify used to cause is now suppressed)
+wire [31:0] dbg_cdpath = {2'b0, cdf_st, dbg_008a_cnt, reopen_req,
                           mnt_st[3:0], dbg_tstate,
                           3'b0, opened_file, 1'b0, crf_stable};
 wire [31:0] dbg_cdcnt  = {dbg_of_cnt, dbg_err_cnt, dbg_rd_cnt};

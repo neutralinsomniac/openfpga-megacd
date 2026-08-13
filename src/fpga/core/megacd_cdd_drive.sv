@@ -581,8 +581,21 @@ end
 localparam [22:0] STALL_PAUSE_AT = 23'h400000;   // 2^22 clk ~= 78ms
 reg [22:0] stall_cnt = 0;
 reg        dbg_stall_seen /*verilator public_flat_rd*/ = 0;  // sticky
-wire stall_cond = disc_present && (drv_status == STAT_PLAY) &&
-                  (latency == 8'd0) && (pending == 4'd0) && want_head;
+// Two starvation shapes are covered, matching the two GPGX delivery paths:
+//   PLAY: the streaming path proper.
+//   PAUSE on a data track: GPGX re-delivers the PARKED sector every tick
+//     (tick_data_ok) and games read it via the CDC; a missing bank there is
+//     the same observable gap. Only right after a seek can the parked sector
+//     be un-banked (once fetched it stays banked), so this term cannot
+//     trigger during ordinary long menu PAUSEs. cur_audio excluded: a parked
+//     audio sector is never re-delivered, so starving it observes nothing.
+// toc_settled: the fetch engine will not fill while the track search walks
+// (fetch_wanted gates on it), so counting during that window could only
+// produce a pause no fetch can release.
+wire stall_cond = disc_present && toc_settled &&
+                  (latency == 8'd0) && (pending == 4'd0) && want_head &&
+                  ((drv_status == STAT_PLAY) ||
+                   (drv_status == STAT_PAUSE && !cur_audio));
 always @(posedge clk) begin
     if (reset | ~mcd_rst_n) begin
         stall_cnt   <= 0;

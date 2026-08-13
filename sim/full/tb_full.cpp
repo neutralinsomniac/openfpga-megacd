@@ -380,6 +380,21 @@ int main(int argc,char**argv){
                     const char* e=getenv("SWAP_AT"); if(e) swap_at=atol(e);
                     for(int i=1;i<argc;i++)
                         if(!strcmp(argv[i],"--cd2")&&i+1<argc) cd2=argv[i+1]; } }
+                // RENOTIFY_AT=<cycle>: firmware re-announces slot 1 with the
+                // SAME image and size, menu closed -- the suspected Pocket
+                // power-event behavior. The core must NOT remount (no
+                // DISCSIZE drop to 0, no MNT churn); before the spurious-
+                // renotify guard this tore the disc out mid-game.
+                { static long renotify_at=-1; static bool ren_done=false;
+                  { static bool ri=false; if(!ri){ ri=true;
+                      const char* e=getenv("RENOTIFY_AT"); if(e) renotify_at=atol(e); } }
+                  if(renotify_at>0 && !ren_done && c>renotify_at){ ren_done=true;
+                      printf("[%ld] >>> RENOTIFY 008A slot=1 size=%u (same image)\n",c,size1);
+                      fflush(stdout);
+                      q.push_back({0xF8000020u, 1u});
+                      q.push_back({0xF8000024u, size1});
+                      q.push_back({0xF8000000u, 0x434D008Au});
+                  } }
                 static bool swapped=false;
                 if(cd2 && swap_at>0 && !swapped && c>swap_at){ swapped=true;
                     if(f1) fclose(f1);

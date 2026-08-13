@@ -73,6 +73,7 @@ static void err(const char* m){ printf("FAIL: %s (t=%llu)\n", m, (unsigned long 
 // detector's output a no-op -- identical drive behavior to before the port
 // existed, so the legacy tests' expectations are untouched.
 static bool loopback_pause = false;
+static bool g_sp_parked = false;   // --stallpause-parked variant
 
 static void tick(){
     dut->sys_pause = loopback_pause ? dut->stall_pause : 0;
@@ -922,6 +923,45 @@ static int stallpause_test(){
     dut->reset=0; dut->mcd_rst_n=1;
     for(int i=0;i<20;i++) tick();
 
+    // --stallpause-parked: SEEK+PAUSE variant. The drive parks on the target
+    // and re-delivers it every tick (GPGX tick_data_ok); with the host dead
+    // the parked sector never banks, and the STAT_PAUSE term of stall_cond
+    // must engage exactly like the PLAY term. The outage starts BEFORE the
+    // seek so the target fetch itself is the one that hangs.
+    if(g_sp_parked){
+        // outage must outlast seek latency (12 beats ~= 8.6M) PLUS the 78ms
+        // threshold (4.2M) -- the latency window deliberately does not count
+        spike_at_fetch = fetch_idx; spike_len = 20000000;
+        uint64_t comm = mk_seek(500) & ~0xFULL; comm |= 0x4;   // c0=4 SEEK+PAUSE
+        pulse_cmd(comm);
+        vluint64_t t0=tk, t_on=0, t_off=0;
+        while(tk < t0 + 26000000){
+            tick();
+            if(((tk-t0) % 4000000)==0)
+                printf("  [parked] t=+%lld head=%ld drv=%d req=%d bufv=%d\n",
+                       (long long)(tk-t0), (long)(dut->dbg_state & 0xFFFFF),
+                       (int)((dut->dbg_state>>28)&0xF),
+                       (int)((dut->dbg_state>>23)&1),
+                       (int)((dut->dbg_state>>21)&3));
+            bool sp = dut->stall_pause;
+            if(sp && !t_on) t_on=tk;
+            if(t_on && !sp){ t_off=tk; break; }
+        }
+        int drv=(dut->dbg_state>>28)&0xF;
+        printf("--- parked (SEEK+PAUSE) stall results ---\n");
+        printf("pause ON %s+%lld, OFF %s+%lld, drv_status=%d badsync=%u\n",
+               t_on?"":"never ", t_on?(long long)(t_on-t0):-1,
+               t_off?"":"never ", t_off?(long long)(t_off-t0):-1,
+               drv, (unsigned)((dut->dbg_integ>>24)&0xFF));
+        if(!t_on)  err("stall_pause never asserted for a starved parked sector");
+        if(!t_off) err("stall_pause never released after the fetch landed");
+        if(drv!=4) err("drive fell out of PAUSE");
+        if(((dut->dbg_integ>>24)&0xFF)!=0) err("badsync in parked stall");
+        printf(fail ? "\n==== PARKED STALL TEST FAILED ====\n"
+                    : "\n==== PARKED STALL TEST PASSED ====\n");
+        return fail?1:0;
+    }
+
     pulse_cmd(mk_seek(10));
     const long BEAT = 715909;
     const long THRESH = 4194304;             // STALL_PAUSE_AT in the drive
@@ -1049,6 +1089,7 @@ int main(int argc, char** argv){
         if(!strcmp(argv[i],"--gap")) gap_mode=true;
         if(!strcmp(argv[i],"--jingle")) jingle_mode=true;
         if(!strcmp(argv[i],"--stallpause")) stallpause_mode=true;
+        if(!strcmp(argv[i],"--stallpause-parked")){ stallpause_mode=true; g_sp_parked=true; }
         if(!strcmp(argv[i],"--content")&&i+1<argc) content_bin=argv[++i];
     }
     if(cdda_mode){ int r=cdda_test(); delete dut; return r; }
