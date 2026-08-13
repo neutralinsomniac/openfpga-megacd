@@ -924,13 +924,12 @@ static int stallpause_test(){
     for(int i=0;i<20;i++) tick();
 
     // --stallpause-parked: SEEK+PAUSE variant. The drive parks on the target
-    // and re-delivers it every tick (GPGX tick_data_ok); with the host dead
-    // the parked sector never banks, and the STAT_PAUSE term of stall_cond
-    // must engage exactly like the PLAY term. The outage starts BEFORE the
+    // and prefetches it during the latency countdown; with the host dead the
+    // fetch hangs, and the latency-window term of stall_cond must engage
+    // MID-SEEK (well before the 12-beat latency elapses), then keep holding
+    // through the parked re-delivery phase. The outage starts BEFORE the
     // seek so the target fetch itself is the one that hangs.
     if(g_sp_parked){
-        // outage must outlast seek latency (12 beats ~= 8.6M) PLUS the 78ms
-        // threshold (4.2M) -- the latency window deliberately does not count
         spike_at_fetch = fetch_idx; spike_len = 20000000;
         uint64_t comm = mk_seek(500) & ~0xFULL; comm |= 0x4;   // c0=4 SEEK+PAUSE
         pulse_cmd(comm);
@@ -954,6 +953,10 @@ static int stallpause_test(){
                t_off?"":"never ", t_off?(long long)(t_off-t0):-1,
                drv, (unsigned)((dut->dbg_integ>>24)&0xFF));
         if(!t_on)  err("stall_pause never asserted for a starved parked sector");
+        // 12-beat latency ~= 8.6M: the pause must fire INSIDE the latency
+        // window (~ threshold after the seek applies), not after it elapses
+        if(t_on && (long long)(t_on-t0) > 8000000)
+                   err("pause did not engage during the seek-latency window");
         if(!t_off) err("stall_pause never released after the fetch landed");
         if(drv!=4) err("drive fell out of PAUSE");
         if(((dut->dbg_integ>>24)&0xFF)!=0) err("badsync in parked stall");
@@ -964,7 +967,7 @@ static int stallpause_test(){
 
     pulse_cmd(mk_seek(10));
     const long BEAT = 715909;
-    const long THRESH = 4194304;             // STALL_PAUSE_AT in the drive
+    const long THRESH = 1048576;             // STALL_PAUSE_AT in the drive
 
     // 1) establish streaming. deliver_words is NOT the signal here: the
     //    drive re-delivers the parked head sector every beat in TOC/latency

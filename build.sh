@@ -108,7 +108,12 @@ for t in "${targets[@]}"; do
 
   echo
   echo "=== Timing ($rev), worst first ==="
-  sta_slacks "$sta" | head -12
+  # NOT `| head -12`: under pipefail, head exiting after 12 lines can EPIPE
+  # sort mid-write and set -e then kills the script here -- AFTER a passing
+  # compile, BEFORE the install. Raced rarely (first seen seed-44 pf3 build:
+  # timing met, nothing installed, exit 1 with no error text). sed reads its
+  # whole input, so the pipeline always retires cleanly.
+  sta_slacks "$sta" | sed -n '1,12p'
   echo
 
   violations="$(grep -cE '^Slack[[:space:]]*:[[:space:]]*-' "$sta" || true)"

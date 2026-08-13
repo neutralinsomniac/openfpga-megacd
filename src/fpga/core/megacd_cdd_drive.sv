@@ -578,24 +578,40 @@ end
 // dead host into a retried read (see the cdf arbiter) rather than a stale
 // ack -- so the pause releases on the first read the host actually answers.
 ///////////////////////////////////////////////
-localparam [22:0] STALL_PAUSE_AT = 23'h400000;   // 2^22 clk ~= 78ms
-reg [22:0] stall_cnt = 0;
+// ~19.5ms (2^20 clk). Far above any single fetch's normal round-trip, and
+// want_head persisting AT ALL means every layer of buffering (4-sector
+// bank, deep prefetch, CDDA FIFO lead) is already exhausted -- the gap has
+// begun. Was 2^22 (~78ms): Silpheed on hardware still occasionally hit its
+// own read timeout through the wider pre-pause window; a false trigger
+// costs a sub-frame freeze, so the threshold errs aggressive.
+localparam [20:0] STALL_PAUSE_AT = 21'h100000;
+reg [20:0] stall_cnt = 0;
 reg        dbg_stall_seen /*verilator public_flat_rd*/ = 0;  // sticky
-// Two starvation shapes are covered, matching the two GPGX delivery paths:
-//   PLAY: the streaming path proper.
-//   PAUSE on a data track: GPGX re-delivers the PARKED sector every tick
-//     (tick_data_ok) and games read it via the CDC; a missing bank there is
-//     the same observable gap. Only right after a seek can the parked sector
-//     be un-banked (once fetched it stays banked), so this term cannot
-//     trigger during ordinary long menu PAUSEs. cur_audio excluded: a parked
-//     audio sector is never re-delivered, so starving it observes nothing.
+// Starvation shapes covered, matching the GPGX delivery paths:
+//   PLAY delivering (latency 0): the streaming path proper.
+//   SEEK LATENCY (either end status, any latency value): the head parks on
+//     the target the moment the seek applies and the target prefetch runs
+//     during the countdown. A host outage here used to be INVISIBLE to the
+//     detector (it waited for latency 0), so the game watched its full
+//     seek time pass and then 19.5ms more before time stopped -- and a
+//     driver that re-seeks on lateness reset the detector each try,
+//     compounding until the game's own timeout fired (Silpheed's residual
+//     hardware read error). Counting the latency window freezes time
+//     MID-SEEK; the latency countdown resumes when the fetch lands, so the
+//     game observes a nominal-length seek no matter how long the outage.
+//   PAUSE parked on a data track (latency 0): GPGX re-delivers the parked
+//     sector every tick and games read it via the CDC. Only reachable
+//     right after a seek (a parked sector stays banked once fetched), so
+//     ordinary long menu PAUSEs cannot trigger it. cur_audio excluded
+//     there: a parked audio sector is never re-delivered.
 // toc_settled: the fetch engine will not fill while the track search walks
 // (fetch_wanted gates on it), so counting during that window could only
 // produce a pause no fetch can release.
-wire stall_cond = disc_present && toc_settled &&
-                  (latency == 8'd0) && (pending == 4'd0) && want_head &&
+wire stall_cond = disc_present && toc_settled && (pending == 4'd0) &&
+                  want_head &&
                   ((drv_status == STAT_PLAY) ||
-                   (drv_status == STAT_PAUSE && !cur_audio));
+                   (drv_status == STAT_PAUSE &&
+                    ((latency != 8'd0) || !cur_audio)));
 always @(posedge clk) begin
     if (reset | ~mcd_rst_n) begin
         stall_cnt   <= 0;
