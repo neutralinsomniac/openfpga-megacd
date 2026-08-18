@@ -395,6 +395,24 @@ int main(int argc,char**argv){
                       q.push_back({0xF8000024u, size1});
                       q.push_back({0xF8000000u, 0x434D008Au});
                   } }
+                // RENOTIFY_WRONGSIZE_AT=<cycle>: firmware re-announces slot 1
+                // with the same image but a WRONG size (stale/racy host_24 --
+                // e.g. echoing the last slot-2 openfile's size), menu closed.
+                // Today's guard accepts any size change as a real image pick,
+                // so this tears the mounted disc out mid-game: the failure
+                // this models is one bad firmware echo during the constant
+                // cross-bin reopens of a multi-bin game.
+                { static long renws_at=-1; static bool renws_done=false;
+                  { static bool ri=false; if(!ri){ ri=true;
+                      const char* e=getenv("RENOTIFY_WRONGSIZE_AT"); if(e) renws_at=atol(e); } }
+                  if(renws_at>0 && !renws_done && c>renws_at){ renws_done=true;
+                      uint32_t wsz = size1 + 2352u;
+                      printf("[%ld] >>> RENOTIFY 008A slot=1 size=%u (WRONG, real=%u)\n",c,wsz,size1);
+                      fflush(stdout);
+                      q.push_back({0xF8000020u, 1u});
+                      q.push_back({0xF8000024u, wsz});
+                      q.push_back({0xF8000000u, 0x434D008Au});
+                  } }
                 static bool swapped=false;
                 if(cd2 && swap_at>0 && !swapped && c>swap_at){ swapped=true;
                     if(f1) fclose(f1);
@@ -404,9 +422,17 @@ int main(int argc,char**argv){
                     printf("[%ld] SWAP CD -> '%s' (%u bytes)%s\n",
                            c,f1path,size1,f1?"":" -- OPEN FAILED");
                     write_dtable(size1, 0);
+                    // a real pick goes through the Pocket menu: notify menu
+                    // open (00B0 state=1) before the 008A and closed after --
+                    // the spurious-renotify guard requires menu_recent for
+                    // any remount of an already-mounted disc
+                    q.push_back({0xF8000020u, 1u});
+                    q.push_back({0xF8000000u, 0x434D00B0u});
                     q.push_back({0xF8000020u, 1u});
                     q.push_back({0xF8000024u, size1});
                     q.push_back({0xF8000000u, 0x434D008Au});
+                    q.push_back({0xF8000020u, 0u});
+                    q.push_back({0xF8000000u, 0x434D00B0u});
                 }
                 if(q.empty() && (c&63)==0){
                     uint32_t t0 = dut->rootp->core_top__DOT__icb__DOT__target_0;
@@ -517,6 +543,52 @@ int main(int argc,char**argv){
                         }
                         q.push_back({0xF8001000u,0x6F6B0000u});
                     } else if(t0==0x636D0192u){           // openfile: read param path
+                        // OPENFILE_ERR_AT=<cycle>: the FIRST openfile served
+                        // after this cycle answers 3 ("missing bin") without
+                        // touching slot 2 -- a one-shot transient firmware
+                        // failure, distinct from OPENFILE_DENY (every open
+                        // fails). Models an SD/FS hiccup on a mid-game
+                        // cross-bin reopen to test whether one bad answer
+                        // retires the whole disc (M_FAIL -> NO_DISC).
+                        { static long of_err_at = getenv("OPENFILE_ERR_AT")?atol(getenv("OPENFILE_ERR_AT")):-1;
+                          static bool of_err_done=false;
+                          if(of_err_at>0 && c>of_err_at && !of_err_done){
+                              of_err_done=true;
+                              printf("[%ld] >>> OPENFILE transient ERR=3 injected\n",c);
+                              fflush(stdout);
+                              q.push_back({0xF8001000u,0x6F6B0003u});
+                              goto openfile_done;
+                          } }
+                        // OPENFILE_LAT=<half-cycles>: extra service latency for
+                        // openfile commands only (reads stay instant), modeling
+                        // the host's slow file-open path. Implemented by
+                        // deferring service: the command sits unanswered until
+                        // the window passes, then is served normally.
+                        // OPENFILE_SLOW_AT=<cycle> + OPENFILE_SLOW_LAT=<hc>:
+                        // one-shot: the FIRST openfile after that cycle takes
+                        // SLOW_LAT instead (mount/probe openfiles stay fast) --
+                        // models a single SD/FAT stall on a mid-game reopen,
+                        // e.g. one long enough to cross the ~900ms bridge
+                        // watchdog and exercise the wdog-retry path under the
+                        // stall-pause freeze.
+                        { static long of_lat = getenv("OPENFILE_LAT")?atol(getenv("OPENFILE_LAT")):0;
+                          static long of_slow_at = getenv("OPENFILE_SLOW_AT")?atol(getenv("OPENFILE_SLOW_AT")):-1;
+                          static long of_slow_lat = getenv("OPENFILE_SLOW_LAT")?atol(getenv("OPENFILE_SLOW_LAT")):160000000;
+                          static long of_seen = -1;
+                          static bool of_slow_used=false, of_slow_this=false;
+                          long lat = of_lat;
+                          if(of_slow_at>0 && !of_slow_used && c>of_slow_at){
+                              of_slow_this=true; lat = of_slow_lat; }
+                          if(lat>0){
+                              if(of_seen<0){ of_seen=c;
+                                  if(of_slow_this)
+                                      printf("[%ld] >>> OPENFILE SLOW: %ldms one-shot\n",
+                                             c, lat/150000); }
+                              if(c-of_seen<lat) goto openfile_skip;
+                              of_seen=-1;
+                              if(of_slow_this){ of_slow_this=false; of_slow_used=true; }
+                          } }
+                        {
                         char path[257];
                         for(int i=0;i<64;i++){
                             uint32_t w=dut->rootp->core_top__DOT__icb__DOT__fbuf_ram_b[128+i];
@@ -570,6 +642,9 @@ int main(int argc,char**argv){
                             q.push_back({0xF8000024u, size2});
                             q.push_back({0xF8000000u, 0x434D008Au});
                         }
+                        }
+                        openfile_done: ;
+                        openfile_skip: ;
                     }
                 }
                 // BIOS_RELOAD_AT=<cycle>: model the user picking a new BIOS in
@@ -1316,6 +1391,135 @@ int main(int argc,char**argv){
         if(vbl && !vbl_prev) vbl_cnt++;
         vint_prev=vint; cepix_prev=cepix; vbl_prev=vbl;
         if(mpc==last) stuck++; else { stuck=0; last=mpc; }
+        // FORCE_PAUSE=<from>,<until>: randomized whole-machine freeze/
+        // resume cycles via megacd_top.dbg_force_pause -- period 20-300ms,
+        // hold 7-200ms, FORCE_PAUSE_SEED varies the schedule. Hits the
+        // freeze/resume x machine-state interleavings (mid VDP-DMA, mid
+        // sub-68K bus cycle) that the 0.3.5 stall detector produces
+        // hundreds of times per session at CD-load screens -- the
+        // suspected freeze-resume lockup (SF CD, diag square ORANGE).
+        static bool fp_paused_seen=false;
+        { static long fp0=-1, fp1=0; static uint32_t fprng=0x1234;
+          static bool fpi=false; static long fp_next=-1, fp_off=-1, fp_count=0;
+          if(!fpi){ fpi=true; const char* e=getenv("FORCE_PAUSE");
+              if(e) sscanf(e,"%ld,%ld",&fp0,&fp1);
+              const char* s=getenv("FORCE_PAUSE_SEED");
+              if(s) fprng=(uint32_t)strtoul(s,0,0); }
+          if(fp0>=0 && c>=fp0 && c<fp1){
+              uint32_t rv;
+              #define FP_RND() (fprng^=fprng<<13,fprng^=fprng>>17,fprng^=fprng<<5,fprng)
+              if(fp_next<0){ rv=FP_RND(); fp_next = c + 3000000 + rv%42000000; }
+              if(fp_off<0 && c>=fp_next){
+                  r->core_top__DOT__dbg_force_pause = 1;
+                  rv=FP_RND(); fp_off = c + 1000000 + rv%29000000; fp_count++;
+                  static bool fpv = getenv("FORCE_PAUSE_VERBOSE")!=nullptr;
+                  if(fpv || (fp_count%100)==1)
+                      printf("[%ld] FORCE_PAUSE #%ld until %ld (main=%06X)\n",
+                             c,fp_count,fp_off,mpc);
+              }
+              if(fp_off>=0 && c>=fp_off){
+                  r->core_top__DOT__dbg_force_pause = 0;
+                  fp_off=-1; fp_next=-1;
+              }
+          } else if(fp0>=0 && r->core_top__DOT__dbg_force_pause)
+              r->core_top__DOT__dbg_force_pause = 0;
+        }
+        // DRVWATCH=<from_cycle>: dense drive/CDD progression dump for
+        // diagnosing stopped-CD hangs (game alive, both CPUs polling,
+        // no CD progress). One line per 1M half-cycles.
+        { static long dw=-1, dwcad=1000000; static bool dwi=false; static long dw_last=0;
+          if(!dwi){ dwi=true; const char* e=getenv("DRVWATCH");
+                    if(e){ dw=atol(e); const char* comma=strchr(e,',');
+                           if(comma) dwcad=atol(comma+1); } }
+          if(dw>=0 && c>=dw && c-dw_last>=dwcad){
+              dw_last=c;
+              printf("DRV [%ld] w=%d dth=%d head=%d st=%d lat=%d pend=%d dlv=%d owed=%d "
+                     "hb=%d bufv=%X lastc0=%X stallcnt=%ld sp=%d fp=%d "
+                     "main=%06X sub=%06X\n", c,
+                     (int)(r->core_top__DOT__cdd_drive__DOT__dlv_w),
+                     (int)(r->core_top__DOT__cdd_drive__DOT__dec_tick_hold),
+                     (int)(r->core_top__DOT__cdd_drive__DOT__head),
+                     (int)(r->core_top__DOT__cdd_drive__DOT__drv_status),
+                     (int)(r->core_top__DOT__cdd_drive__DOT__latency),
+                     (int)(r->core_top__DOT__cdd_drive__DOT__pending),
+                     (int)(r->core_top__DOT__cdd_drive__DOT__dlv_st),
+                     (int)(r->core_top__DOT__cdd_drive__DOT__dlv_owed),
+                     (int)(r->core_top__DOT__cdd_drive__DOT__head_banked),
+                     (int)(r->core_top__DOT__cdd_drive__DOT__buf_valid),
+                     (int)(r->core_top__DOT__cdd_drive__DOT__dbg_last_c0),
+                     (long)(r->core_top__DOT__cdd_drive__DOT__stall_cnt),
+                     (int)(r->core_top__DOT__cdd_stall_pause),
+                     (int)(r->core_top__DOT__dbg_force_pause),
+                     mpc, (unsigned)(dut->rootp->core_top__DOT__dbg_s68k_a & 0xFFFFFF));
+              // CDC host-transfer / DMA engine (ASIC side): dsr = data set
+              // ready (what the BIOS CDCREAD loop polls), edt = end of
+              // transfer, dd = device destination, dten/wait = CDC handshake
+              printf("XFER [%ld] dsr=%d edt=%d dd=%d dma=%05X dten_n=%d "
+                     "wait_n=%d subrd=%d\n", c,
+                     (int)(r->core_top__DOT__MCD__DOT__asic__DOT__dsr),
+                     (int)(r->core_top__DOT__MCD__DOT__asic__DOT__edt),
+                     (int)(r->core_top__DOT__MCD__DOT__asic__DOT__dd),
+                     (unsigned)(r->core_top__DOT__MCD__DOT__asic__DOT__dma_addr),
+                     (int)(r->core_top__DOT__MCD__DOT__cdc_dten_n),
+                     (int)(r->core_top__DOT__MCD__DOT__cdc_wait_n),
+                     (int)(r->core_top__DOT__MCD__DOT__asic__DOT__sub_cpu_cdc_read));
+              // CDC decode path: {DECEN,WRRQ,DECI,DTEI,DOUTEN,DTEN,DTBSY,0,
+              // HEAD0, HEAD1, TRG_CNT, DEC_CNT} -- HEAD0/1 are the decoded
+              // sector header MSF bytes the BIOS matches its target against
+              { unsigned dv = (unsigned)r->core_top__DOT__dbg_dec;
+                printf("DEC [%ld] f=%02X head=%02X:%02X trg=%X cnt=%X "
+                       "commlba=%d rpt=%d\n",
+                       c, dv>>24, (dv>>16)&0xFF, (dv>>8)&0xFF,
+                       (dv>>4)&0xF, dv&0xF,
+                       (int)(r->core_top__DOT__cdd_drive__DOT__comm_lba),
+                       (int)(r->core_top__DOT__cdd_drive__DOT__rpt_kind)); }
+              // the raw CDD exchange as the SUB sees it: cddc = the 40-bit
+              // command register the sub wrote, cdds = the latched status
+              // packet it reads back. Nibble-hex, c0 first.
+              { unsigned long long cc =
+                    (unsigned long long)r->core_top__DOT__MCD__DOT__asic__DOT__cddc;
+                unsigned long long cs =
+                    (unsigned long long)r->core_top__DOT__MCD__DOT__asic__DOT__cdds;
+                printf("CDD [%ld] c=%010llX s=%010llX\n", c, cc & 0xFFFFFFFFFFULL,
+                       cs & 0xFFFFFFFFFFULL); }
+              // memory-handshake watch: which transition-coded path is
+              // stuck mid-transaction (strobes are active-LOW; busy high)
+              printf("MEMW [%ld] prg_oe=%d pbusy=%d bromb=%d "
+                     "romce=%d genb=%d spe=%d\n", c,
+                     (int)(r->core_top__DOT__MCD_PRG_OE_N),
+                     (int)(r->core_top__DOT__MCD_PRG_BUSY),
+                     (int)(r->core_top__DOT__brom_busy),
+                     (int)(r->core_top__DOT__GEN_ROM_CE_N),
+                     (int)(r->core_top__DOT__GEN_MEM_BUSY),
+                     (int)(r->core_top__DOT__sys_pause_eff));
+          } }
+        // wedge detector (armed by FORCE_PAUSE or WEDGEWATCH): >2s of
+        // emulated time with zero VINT edges while never paused in the
+        // window = the machine died; dump and exit(2) so sweeps notice.
+        { static bool ww=false, wwi=false;
+          static long unp=0, vint_at_chk=0; static int quiet=0;
+          if(!wwi){ wwi=true;
+              ww = getenv("FORCE_PAUSE")||getenv("WEDGEWATCH"); }
+          bool paused_now = r->core_top__DOT__cdd_stall_pause ||
+                            r->core_top__DOT__dbg_force_pause;
+          (void)fp_paused_seen;
+          // measure in UNPAUSED cycles: a dense pause schedule used to put
+          // a pause in every wall-clock check window, blinding the
+          // detector (it missed the H1 seed-0xACE1 wedge at 4.166e9)
+          if(!paused_now && ww){
+              if(++unp >= 30000000){
+                  if(vint_cnt==vint_at_chk) quiet++; else quiet=0;
+                  unp=0; vint_at_chk=vint_cnt;
+                  if(quiet>=10){
+                      printf("[%ld] ==== WEDGE DETECTED: no VINT for ~2s of "
+                             "unpaused time, main=%06X vint=%ld ====\n",
+                             c, mpc, vint_cnt);
+                      fflush(stdout);
+                      exit(2);
+                  }
+              }
+          }
+        }
         { static bool gw_on = getenv("GATEWATCH")!=nullptr;
           static uint32_t gw_prev=0;
           if(gw_on && mpc!=gw_prev && c>1140000000 && c<1160000000){

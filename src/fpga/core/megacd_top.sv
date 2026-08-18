@@ -707,7 +707,7 @@ localparam M_IDLE     = 5'd0,  M_SNIFF    = 5'd1,  M_SNIFF_W  = 5'd2,
            M_BTAIL    = 5'd9,  M_OPENFILE = 5'd10, M_FSIZE    = 5'd11,
            M_FDIV     = 5'd12, M_LAYOUT   = 5'd13, M_READY    = 5'd14,
            M_FAIL     = 5'd15, M_PROBE_GO = 5'd16, M_PROBE_WT = 5'd17,
-           M_PROBE_EV = 5'd18;
+           M_PROBE_EV = 5'd18, M_REOPEN_BK= 5'd19;
 reg [4:0]  mnt_st /* verilator public_flat_rd */ = M_IDLE;
 reg [3:0]  mnt_term = 0;   // overlay: 1=started, B=READY reached, C=FAILED
 // latched swap request (see the pre-emption block at the end of the mount
@@ -766,6 +766,7 @@ reg [2:0]  bp_ph;
 reg [7:0]  bp_src;
 reg [6:0]  mnt_file;      // file being opened (phase B / reopen)
 reg        mnt_reopen = 0;
+reg [2:0]  reopen_tries = 0;  // transient-error retries this reopen (see M_REOPEN_BK)
 reg [6:0]  opened_file = 0;
 reg [13:0] bp_nm_off;
 reg [7:0]  bp_nm_len;
@@ -887,6 +888,7 @@ always @(posedge clk_74a) begin
             // probing so a real drive fetch is never starved.
             mnt_file <= reopen_file;
             mnt_reopen <= 1;
+            reopen_tries <= 0;
             files_addr <= reopen_file;
             mnt_st <= M_BPATH_TAB;
         end else if (pb_active && !reopen_req && pb_ready) begin
@@ -1221,9 +1223,34 @@ always @(posedge clk_74a) begin
             // state-independent). Genuine firmware answers (3 = missing
             // bin, 4 = outside /Assets) keep the fail path below.
             target_dataslot_openfile <= 1;
+        end else if (mnt_reopen && reopen_tries != 3'd7) begin
+            // Genuine error on a MID-GAME cross-bin reopen. This file was
+            // opened successfully at mount/probe time, so "missing" now is
+            // a transient host/SD condition, not a bad rip -- and failing
+            // here retires the whole mounted disc to NO_DISC under a
+            // running game (a multi-bin game reopens on every CD-audio
+            // track change: Shining Force CD does one per battle attack
+            // transition, hundreds per session -- one bad answer = a
+            // permanent silent black screen). Back off ~113ms and reissue,
+            // up to 7 tries (~1s total); only a persistent failure -- a
+            // genuinely vanished filesystem -- still lands in M_FAIL.
+            reopen_tries <= reopen_tries + 1'b1;
+            mnt_tmo <= 25'd1;
+            mnt_st <= M_REOPEN_BK;
         end else begin
             mnt_reopen <= 0;
             mnt_st <= M_FAIL;
+        end
+    end
+    M_REOPEN_BK: begin
+        // path buffer still holds this file's path (nothing else ran: the
+        // openfile channel is serialized and the mount FSM owns it), so a
+        // bare re-strobe is enough. A disc re-pick still pre-empts from
+        // here -- mount_req handling is state-independent.
+        mnt_tmo <= mnt_tmo + 1'b1;
+        if (mnt_tmo[23]) begin
+            target_dataslot_openfile <= 1;
+            mnt_st <= M_OPENFILE;
         end
     end
     M_FSIZE: if (pb_yield) mnt_st <= M_IDLE;
@@ -1474,15 +1501,20 @@ always @(posedge clk_74a) begin
     // own (it already re-sends 008A after every core-initiated openfile),
     // and a power event that re-announces the slot would rip a mounted disc
     // out from under a running game at random. So: accept a remount only if
-    // nothing is mounted yet, the size actually changed, or the menu was
-    // open within the last ~3.6s (every genuine pick satisfies one of
-    // these). A same-size re-notify with the menu closed is echoed state,
-    // not a user action -- counted for the overlay, otherwise ignored.
+    // nothing is mounted yet or the menu was open within the last ~3.6s
+    // (every genuine pick goes through the menu, so real image changes
+    // always qualify). A re-notify with the menu closed is echoed firmware
+    // state, not a user action -- counted for the overlay, otherwise
+    // ignored REGARDLESS of the size it carries: the firmware re-sends
+    // 008As after every core-initiated openfile, a multi-bin game reopens
+    // on every CD-audio track change, and an echo carrying a stale/racy
+    // size used to pass the old "size changed = real pick" test and tear
+    // the mounted disc out mid-game (seconds of NO_DISC = a permanent
+    // silent black screen for any game caught mid-load).
     if (dataslot_update && dataslot_update_id == 16'd1
         && dataslot_update_size != 32'd0) begin
         dbg_008a_cnt <= dbg_008a_cnt + 1'b1;
-        if (!mount_ready || dataslot_update_size != mounted_size
-            || menu_recent) begin
+        if (!mount_ready || menu_recent) begin
             mount_req      <= 1;
             mount_req_size <= dataslot_update_size;
         end
@@ -2032,6 +2064,18 @@ reg vs_prev;
 reg [9:0] dbg_x, dbg_y;
 reg       dbg_de_line;
 
+// clk_74a -> clk_sys sync for the hardware diagnostic squares. The 008A
+// counter crosses as a raw multi-bit value: worst case is one frame of a
+// transitional color on a diagnostic tile, not worth a gray code.
+reg [1:0] diag_mount_s = 0, diag_reopen_s = 0;
+reg [2:0] diag_008a_s = 0, diag_008a_m = 0;
+always @(posedge clk_sys) begin
+    diag_mount_s  <= {diag_mount_s[0],  mount_ready};
+    diag_reopen_s <= {diag_reopen_s[0], reopen_req};
+    diag_008a_m   <= dbg_008a_cnt;
+    diag_008a_s   <= diag_008a_m;
+end
+
 // hex readout row 1: GG LL MM SS
 //   GG = GFX-engine ops completed/s (3C = one op per frame, 00 = unused)
 //   LL = longest GFX op this second, clk_sys cycles >>13 (153.5us units;
@@ -2214,6 +2258,38 @@ always @(posedge current_pix_clk) begin
         video_rgb_reg[15:8]  <= (lg_target && lightgun_enabled && show_crosshair) ? {8{lg_target[1]}} : green;
         video_rgb_reg[7:0]   <= (lg_target && lightgun_enabled && show_crosshair) ? {8{lg_target[2]}} : blue;
 
+        // Minimal hardware diagnostic squares (the full overlay below is
+        // sim-only — it was cut from synthesis for the work-RAM cache
+        // LABs, which left hardware with NO way to read the CD-path state
+        // during a live hang). Four 12x12 squares, top-left, gated on the
+        // same 0x110 "Debug Overlay" setting; ~30 ALMs, no M10K.
+        //   SQ0 stall-pause:  RED = machine frozen by pause-on-stall NOW,
+        //                     ORANGE = a freeze has occurred since reset,
+        //                     dim green = never
+        //   SQ1 mount:        RED = mounted disc torn down (mount_ready
+        //                     dropped), dim green = mounted
+        //   SQ2 reopen:       ORANGE while a cross-bin reopen is in flight
+        //                     (solid during a hang = reopen wedged),
+        //                     dim green = idle
+        //   SQ3 008A counter: low 3 bits of the slot-1 008A count as RGB —
+        //                     the color CHANGES on every firmware
+        //                     re-notify, so an echo landing at a hang is
+        //                     visible without any readout
+        if (cs_debug_overlay && dbg_y < 10'd12 && dbg_x < 10'd64) begin
+            case (dbg_x[5:4])
+                2'd0: video_rgb_reg <= cdd_dbg_integ[1] ? 24'hFF0000 :
+                                       cdd_dbg_integ[0] ? 24'hFF8000 :
+                                                          24'h004000;
+                2'd1: video_rgb_reg <= diag_mount_s[1]  ? 24'h004000 :
+                                                          24'hFF0000;
+                2'd2: video_rgb_reg <= diag_reopen_s[1] ? 24'hFF8000 :
+                                                          24'h004000;
+                2'd3: video_rgb_reg <= {{8{diag_008a_s[0]}},
+                                        {8{diag_008a_s[1]}},
+                                        {8{diag_008a_s[2]}}};
+            endcase
+        end
+
         // bring-up debug overlay, gated behind the "Debug Overlay" core
         // setting (0x110); quasi-static config bit, safe to sample here.
         // Excluded from synthesis (EWJ-SE fix): the work-RAM read cache
@@ -2370,6 +2446,7 @@ reg  [1:0] pfc_st = PFC_IDLE;
 reg        pfc_poison = 0;
 reg        pfc_hbusy = 0;        // hit-path RDY pulse
 reg        pfc_hcnt = 0;         // stretched to 2 clk_ram for the clk_sys PRS
+reg  [2:0] pfc_rep = 0;          // re-pulse pacing while the strobe is held
 reg [15:0] pfc_hdat;
 reg        pfc_busy_d = 0;
 // line-fill queue: up to 4 single-word beats, one PFC_PF pass per beat with a
@@ -2408,6 +2485,7 @@ always @(posedge clk_ram) begin
 					pfc_hdat  <= pfc_hit0 ? pfc_dat[0][a_word] : pfc_dat[1][a_word];
 					pfc_hbusy <= 1;
 					pfc_hcnt  <= 1;
+					pfc_rep   <= 0;
 					pfc_lru   <= pfc_hit0;   // protect the entry that hit
 					// v2.1: no speculative next-line retag -- entries only ever
 					// hold lines the CPU actually read (the v2 retag variant
@@ -2466,7 +2544,20 @@ always @(posedge clk_ram) begin
 		end
 		PFC_HIT: begin
 			if (pfc_hcnt) pfc_hcnt <= 0;
-			else          pfc_hbusy <= 0;
+			else if (pfc_hbusy) pfc_hbusy <= 0;
+			else begin
+				// The consumer (ASIC PRMS, EN-gated and freezable by
+				// sys_pause) must OBSERVE the RDY dip; a one-shot 2-clk_ram
+				// pulse into a frozen or slow-sampling observer is lost, and
+				// serve-once + wait-for-strobe-drop then deadlocks the PRG
+				// engine that issued the read (sub-side DMA/flag machinery
+				// wedges while both CPUs stay alive -- the 0.3.5 Shining
+				// Force CD lockup, repro'd via the force-pause hammer). While
+				// the strobe stays held, re-pulse every 8 clk_ram: the data
+				// is held on MCD_PRG_DI, so extra dips just re-present it.
+				pfc_rep <= pfc_rep + 1'b1;
+				if (&pfc_rep) begin pfc_hbusy <= 1; pfc_hcnt <= 1; end
+			end
 			if (~prg_rd) pfc_st <= PFC_IDLE;
 		end
 		endcase
@@ -3365,7 +3456,59 @@ wire bios_download = cart_download;
 // free-runs so the display holds the last frame. If a menu pause is ever
 // wired (cs_menu_pause_enable is currently a dead register), OR it in here.
 wire cdd_stall_pause /* verilator public_flat_rd */;
+`ifdef VERILATOR
+// co-sim force-pause hook: the testbench pokes this to yank the whole
+// machine through freeze/resume cycles at arbitrary phases (mid VDP-DMA,
+// mid sub-CPU bus cycle) without needing a starved CD fetch -- the
+// interleaving space the real 0.3.5 detector hits hundreds of times per
+// session at CD-load screens. Never synthesized.
+reg dbg_force_pause /* verilator public_flat_rw */ = 0;
+wire sys_pause = cdd_stall_pause | dbg_force_pause;
+`else
 wire sys_pause = cdd_stall_pause;
+`endif
+
+// ---- pause-entry gate ------------------------------------------------
+// sys_pause must not freeze the EN-gated ASIC/CART mid RAM-handshake:
+// their RDY protocols are transition-coded (the FSM must OBSERVE RDY go
+// 0 then 1), while the SDRAM side is free-running and serves a request
+// ONCE per assertion (sdram.sv: ~old_rd & rd). A freeze landing between
+// "request raised" and "busy observed" lets the transaction complete
+// invisibly; on resume the FSM waits for a busy dip that already
+// happened and the controller waits for a request drop that never
+// comes: sub-68K wedged mid bus-cycle, main 68K spinning on the GA comm
+// flags -- the 0.3.5 Shining Force CD random black-screen lockup
+// (reproduced by the tb_full FORCE_PAUSE hammer, seed 0xACE1: sub
+// parked at PRG 00285C, VINT edges dead, VBL alive). Entry therefore
+// waits for the PRG / BIOS-window / cart / work-RAM paths to go idle --
+// gaps recur every few microseconds even during loads -- and the WHOLE
+// machine (gen CEs, MCD, CART, drive tick block) freezes on the same
+// edge. Release stays immediate. The word-RAM arbiter needs no gate:
+// its HOLD_TMO re-grant loop replays the transaction while the request
+// line is held, so a resumed FSM always sees a fresh busy dip.
+wire pause_mem_idle = MCD_PRG_OE_N & MCD_PRG_WRL_N & MCD_PRG_WRH_N &
+                      ~MCD_PRG_BUSY & ~brom_busy & GEN_ROM_CE_N &
+                      CART_ROM_CE_N & CART_RAM_CE_N & ~GEN_MEM_BUSY;
+// Two-stage entry closes the same-edge race: with a single-stage latch, the
+// ASIC (still enabled on the latch edge) could ISSUE a request in the very
+// cycle eff asserts -- frozen with a fresh request the free-running memory
+// side then serves invisibly. Stage 1 (arm) freezes the CEs for one cycle;
+// stage 2 commits only if nothing was in flight, else releases and retries.
+// While retrying, the machine advances on alternate cycles, so an in-flight
+// transaction still drains within microseconds.
+reg sys_pause_arm = 0;
+reg sys_pause_eff = 0;
+always @(posedge clk_sys) begin
+    if (!sys_pause) begin
+        sys_pause_arm <= 0;
+        sys_pause_eff <= 0;
+    end else if (!sys_pause_eff) begin
+        if (!sys_pause_arm)      sys_pause_arm <= 1;
+        else if (pause_mem_idle) sys_pause_eff <= 1;
+        else                     sys_pause_arm <= 0;
+    end
+end
+wire sys_pause_gate = sys_pause_eff | sys_pause_arm;
 
 ///////////////////////////////////////////////
 // Genesis (gen) — expansion bus exported
@@ -3386,7 +3529,7 @@ gen gen
 (
 	.RESET_N(~reset && reset_delay_done),
 	.MCLK(clk_sys),
-	.PAUSE_EN(sys_pause),
+	.PAUSE_EN(sys_pause_gate),
 
 	.VA(GEN_VA),
 	.VDI(GEN_VDI),
@@ -3525,7 +3668,7 @@ MCD MCD
 	// keep gen/MCD/CART reset release aligned: reset_delay applied to all
 	.RST_N(~(reset | bios_download) && reset_delay_done),
 	.CLK(clk_sys),
-	.ENABLE(~sys_pause),
+	.ENABLE(~sys_pause_gate),
 	.MCD_RST_N(MCD_RST_N),
 	.PALSW(1'b0),
 
@@ -3957,7 +4100,7 @@ megacd_cdd_drive cdd_drive
 	.cdc_cdda_wr(CD_CDC_CDDA_WR),
 	.cdda_wr_ready(MCD_CDDA_WR_READY),
 
-	.sys_pause(sys_pause),
+	.sys_pause(sys_pause_gate),
 	.stall_pause(cdd_stall_pause),
 
 	.track_count(toc_count_sys),
@@ -4061,7 +4204,7 @@ CART CART
 (
 	.RST_N(~(reset | bios_download) && reset_delay_done),
 	.CLK(clk_sys),
-	.ENABLE(~sys_pause),
+	.ENABLE(~sys_pause_gate),
 
 	.ROM_MODE(1'b0),   // no cartridge inserted: BIOS boots from expansion
 	.RAM_ID(8'd255),   // no RAM cart in M1

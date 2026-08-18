@@ -584,8 +584,20 @@ end
 // begun. Was 2^22 (~78ms): Silpheed on hardware still occasionally hit its
 // own read timeout through the wider pre-pause window; a false trigger
 // costs a sub-frame freeze, so the threshold errs aggressive.
+// STALL_REVERT_R3: define to fall back to the round-1/2 detector (78ms,
+// latency==0 only). Was shipped as an interim while the 0.3.5 freeze
+// lockup was root-caused; the causes were the freeze tearing in-flight
+// handshakes -- fixed by the pause-entry gate (megacd_top sys_pause_eff)
+// and the delivery-FSM mid-flight hold below -- so the aggressive
+// round-3 detector is back on.
+//`define STALL_REVERT_R3
+`ifdef STALL_REVERT_R3
+localparam [22:0] STALL_PAUSE_AT = 23'h400000;   // 2^22 clk ~= 78ms
+reg [22:0] stall_cnt = 0;
+`else
 localparam [20:0] STALL_PAUSE_AT = 21'h100000;
 reg [20:0] stall_cnt = 0;
+`endif
 reg        dbg_stall_seen /*verilator public_flat_rd*/ = 0;  // sticky
 // Starvation shapes covered, matching the GPGX delivery paths:
 //   PLAY delivering (latency 0): the streaming path proper.
@@ -607,11 +619,18 @@ reg        dbg_stall_seen /*verilator public_flat_rd*/ = 0;  // sticky
 // toc_settled: the fetch engine will not fill while the track search walks
 // (fetch_wanted gates on it), so counting during that window could only
 // produce a pause no fetch can release.
+`ifdef STALL_REVERT_R3
+wire stall_cond = disc_present && toc_settled &&
+                  (latency == 8'd0) && (pending == 4'd0) && want_head &&
+                  ((drv_status == STAT_PLAY) ||
+                   (drv_status == STAT_PAUSE && !cur_audio));
+`else
 wire stall_cond = disc_present && toc_settled && (pending == 4'd0) &&
                   want_head &&
                   ((drv_status == STAT_PLAY) ||
                    (drv_status == STAT_PAUSE &&
                     ((latency != 8'd0) || !cur_audio)));
+`endif
 always @(posedge clk) begin
     if (reset | ~mcd_rst_n) begin
         stall_cnt   <= 0;
@@ -685,10 +704,21 @@ always @(posedge clk) begin
         dbg_badsync_seen <= 0;
     end else case (dlv_st)
     // !sys_pause: no delivery may START while the system is frozen (the CDC
-    // and DAC are not consuming). A delivery can never be in flight when the
-    // pause asserts: the pause requires want_head high for ~78ms, which holds
-    // this very gate closed for far longer than the longest delivery (~27ms,
-    // an audio sector against a full CDDA FIFO).
+    // and DAC are not consuming), and states 1-2 below HOLD while frozen so
+    // a delivery already in flight freezes with its consumer. The original
+    // start-only gate assumed a delivery can never be in flight at pause
+    // onset ("the pause requires want_head high for ~78ms") -- true for the
+    // round-1 starvation detector, FALSE for seek-latency-window pauses and
+    // the co-sim force-pause hammer: a pause landing mid-sector pumped the
+    // remaining words into the clock-gated CDC (which missed them), and the
+    // sector's dlv_advance pulse fired into the frozen tick block (lost ->
+    // the same sector re-delivered on resume = 2352 duplicate words). Either
+    // way the CDC word stream desyncs PERMANENTLY: decode interrupts stop,
+    // the sub waits forever, the main polls the sub forever -- the quiet
+    // black-screen lockup (tb_full FORCE_PAUSE seed 0xACE1, game progression
+    // dead after the 1.33e9 data load). Holding mid-flight makes drive and
+    // CDC freeze coherently; dlv_advance can then only pulse while its
+    // consumer runs.
     2'd0: if (dlv_owed != 0 && (head[31] || !want_head) && !sys_pause) begin
         dlv_w  <= 0;
         dlv_slot <= head_file[1:0];
@@ -700,14 +730,15 @@ always @(posedge clk) begin
         dlv_badsync <= 0;
         dlv_st <= 2'd1;
     end
-    2'd1: begin // present address, wait RAM latency
+    2'd1: if (!sys_pause) begin // present address, wait RAM latency
         cd_buf_addr <= {dlv_slot, dlv_w[10:1]};
         dlv_ph <= 0;
         dlv_st <= 2'd2;
     end
     2'd2: begin // latch word, pulse wr 8 high / 8 low
-        if (dlv_ph == 2 && dlv_aud && !cdda_wr_ready) begin
-            // stall until the CDDA FIFO can take another word
+        if (sys_pause || (dlv_ph == 2 && dlv_aud && !cdda_wr_ready)) begin
+            // frozen mid-delivery, or stalled until the CDDA FIFO can take
+            // another word: hold this phase exactly where it is
         end else begin
             dlv_ph <= dlv_ph + 1'b1;
             if (dlv_ph == 1) cdc_data <= dlv_pgap ? 16'h0000 :

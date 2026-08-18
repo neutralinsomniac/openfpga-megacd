@@ -206,6 +206,17 @@
         "writeonly": true,
         "defaultval": 1,
         "value": 1
+      },
+      {
+        "name": "Debug Overlay",
+        "id": 90,
+        "type": "check",
+        "enabled": true,
+        "persist": false,
+        "address": "0x00000110",
+        "writeonly": true,
+        "defaultval": 0,
+        "value": 1
       }
     ],
     "messages": []

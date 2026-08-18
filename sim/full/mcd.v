@@ -253,7 +253,7 @@ module MCD(CLK, RST_N, ENABLE, PALSW, EXT_VA, EXT_VDI, EXT_AS_N, EXT_RNW, EXT_LD
   wire asic_fd_wr;
   wire bram_n;
   wire [7:0] cdc_do;
-  wire cdc_dten_n;
+  wire cdc_dten_n /* verilator public_flat_rd */;
   wire [7:0] cdc_hdo;
   wire cdc_hrd_n;
   wire cdc_int_n;
@@ -263,7 +263,7 @@ module MCD(CLK, RST_N, ENABLE, PALSW, EXT_VA, EXT_VDI, EXT_AS_N, EXT_RNW, EXT_LD
   wire [7:0] cdc_ram_di;
   wire [15:0] cdc_ram_do;
   wire cdc_ram_we;
-  wire cdc_wait_n;
+  wire cdc_wait_n /* verilator public_flat_rd */;
   wire clwe_n;
   wire coe_n;
   wire eres_n;
@@ -671,9 +671,9 @@ module asic_Brtl(clk, rst_n, enable, s68k_a, s68k_di, s68k_as_n, s68k_rnw, s68k_
   input [7:0] cdc_hdi;
   wire [7:0] cdc_hdi;
   input cdc_dten_n;
-  wire cdc_dten_n;
+  wire cdc_dten_n /* verilator public_flat_rd */;
   input cdc_wait_n;
-  wire cdc_wait_n;
+  wire cdc_wait_n /* verilator public_flat_rd */;
   input [15:0] cd_di;
   wire [15:0] cd_di;
   input cd_sc_wr;
@@ -3388,8 +3388,8 @@ module asic_Brtl(clk, rst_n, enable, s68k_a, s68k_di, s68k_as_n, s68k_rnw, s68k_
   wire cdc_hrd;
   wire cdd_rec_old;
   wire cdd_stat_received;
-  wire [39:0] cddc;
-  wire [39:0] cdds;
+  wire [39:0] cddc /* verilator public_flat_rd */;
+  wire [39:0] cdds /* verilator public_flat_rd */;
   wire [7:0] cfm;
   wire [7:0] cfs;
   wire clk_12m_f;
@@ -3400,8 +3400,8 @@ module asic_Brtl(clk, rst_n, enable, s68k_a, s68k_di, s68k_as_n, s68k_rnw, s68k_
   wire [2:0] dbgx_ds_d;
   wire [7:0] dbgx_dwell;
   wire [15:0] dbgx_presc;
-  wire [2:0] dd;
-  wire [17:0] dma_addr;
+  wire [2:0] dd /* verilator public_flat_rd */;
+  wire [17:0] dma_addr /* verilator public_flat_rd */;
   wire dma_addr_set;
   wire dma_byte;
   wire [15:0] dma_dat;
@@ -3415,8 +3415,8 @@ module asic_Brtl(clk, rst_n, enable, s68k_a, s68k_di, s68k_as_n, s68k_rnw, s68k_
   wire [2:0] dot;
   wire [2:0] ds;
   wire [1:0] ds_enc;
-  wire dsr;
-  wire edt;
+  wire dsr /* verilator public_flat_rd */;
+  wire edt /* verilator public_flat_rd */;
   wire en;
   wire gen_s68k_halt;
   wire [113:0] gfx;
@@ -3522,7 +3522,7 @@ module asic_Brtl(clk, rst_n, enable, s68k_a, s68k_di, s68k_as_n, s68k_rnw, s68k_
   wire sres;
   wire [5:0] sta;
   wire sts;
-  wire sub_cpu_cdc_read;
+  wire sub_cpu_cdc_read /* verilator public_flat_rd */;
   wire sub_rst_exec;
   wire [11:0] sw;
   wire sw_clr;

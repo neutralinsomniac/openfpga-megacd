@@ -25,6 +25,18 @@ static int      g_dlv_file = -1;            // bin the last delivered word came 
 static bool     slot_val[4] = {false,false,false,false};
 static long     lat_ctr = -1;
 static long     LAT_NORMAL = 40;            // ~normal fetch latency (cycles)
+// stallhammer: per-fetch randomized host latency (SD jitter model)
+static bool     g_lat_rand = false;
+static uint32_t g_rng = 0xC0FFEE;
+static uint32_t rng32(){ g_rng^=g_rng<<13; g_rng^=g_rng>>17; g_rng^=g_rng<<5; return g_rng; }
+static long rand_lat(){
+    // 70% healthy SD (2-4ms), 30% slow spike straddling and exceeding the
+    // 19.5ms pause threshold (15-60ms): freeze phase varies per draw, so
+    // thousands of hops explore the engage/release race space the
+    // deterministic full co-sim cannot reach.
+    if (rng32()%10 < 7) return 100000 + (long)(rng32()%120000);
+    return 800000 + (long)(rng32()%2400000);
+}
 static long     spike_at_fetch = -1;        // fetch index to stall
 static long     spike_len = 0;
 static long     fetch_idx = 0;
@@ -100,7 +112,8 @@ static void tick(){
 
     // fetch handshake
     if (req && !req_d){                        // new request
-        lat_ctr = (fetch_idx == spike_at_fetch) ? spike_len : LAT_NORMAL;
+        lat_ctr = (fetch_idx == spike_at_fetch) ? spike_len
+                : g_lat_rand ? rand_lat() : LAT_NORMAL;
         // record placement
         uint32_t off = dut->cd_req_offset, s = dut->cd_req_slot;
         if (off % 2352 != 0) err("cd_req_offset not sector-aligned");
@@ -1067,10 +1080,105 @@ static int stallpause_test(){
     return fail?1:0;
 }
 
+// stallhammer: the Shining Force CD battle workload, randomized. Battles hop
+// CDDA Play targets between audio-track bins every few seconds (no data
+// reads); since the seek-latency-window stall coverage (0.3.5), any hop whose
+// host round trips exceed ~19.5ms freeze-cycles the whole machine mid-seek.
+// This drives thousands of such hops with per-fetch latency jitter straddling
+// the threshold, plus impatient mid-latency re-seeks, with the sub modeled
+// frozen during pauses (no commands land while stall_pause is up). Invariants:
+// every freeze releases (bounded hold), every hop reaches its target and
+// streams, no badsync. The full co-sim is deterministic and slow (2 hops in
+// 3h); this explores the engage/release phase space directly.
+static bool g_hammer_fast = false;   // --hammer-fast: cd_fast_seek=1 variant
+static int stallhammer_test(long niter){
+    mock_valid_sync = true;
+    loopback_pause = true;
+    g_lat_rand = true;
+    dut->reset=1; dut->mcd_rst_n=0; dut->cdd_send=0; dut->cdd_comm=0;
+    dut->img_size = 30000u*2352u; dut->track_count=4; dut->cdda_wr_ready=1;
+    dut->cd_fast_seek=g_hammer_fast; dut->disc_loading=0; dut->cd_ack_74a=0;
+    toc_set(1,false,0,0,/*file*/0,/*delta*/0,    /*disc*/0);      // data
+    toc_set(2,true, 0,0,/*file*/1,/*delta*/10000,/*disc*/10000);  // audio
+    toc_set(3,true, 0,0,/*file*/2,/*delta*/20000,/*disc*/20000);  // audio
+    toc_set(4,true, 0,0,/*file*/3,/*delta*/25000,/*disc*/25000);  // audio
+    for(int i=0;i<20;i++) tick();
+    dut->reset=0; dut->mcd_rst_n=1;
+    for(int i=0;i<20;i++) tick();
+
+    const long BEAT = 715909;
+    const long HOP_TIMEOUT = 90000000;   // ~1.7s >> latency + worst spike runs
+    const long PAUSE_LIMIT = 30000000;   // no single freeze may hold > ~560ms
+    long freezes=0, max_hold=0, reseeks=0;
+    for(long it=0; it<niter && !fail; it++){
+        long tgt;
+        switch(rng32()%8){               // battle-ish mix: mostly audio hops
+            case 0:  tgt =  2000 + (long)(rng32()%4000); break;   // data load
+            case 1: case 2: case 3:
+                     tgt = 10500 + (long)(rng32()%8000); break;   // track 2
+            case 4: case 5:
+                     tgt = 20200 + (long)(rng32()%4000); break;   // track 3
+            default: tgt = 25200 + (long)(rng32()%4000); break;   // track 4
+        }
+        pulse_cmd(mk_seek(tgt));
+        long resk_at = (rng32()%5==0) ? 2000000 + (long)(rng32()%7000000) : -1;
+        long resk_tgt = 10500 + (long)(rng32()%18000);
+        long cur_tgt = tgt;
+        vluint64_t t0=tk, pause_on=0;
+        long adv=0, head_d=-1, poll_ctr=0;
+        bool ok=false;
+        while((long)(tk-t0) < HOP_TIMEOUT && !fail){
+            tick(); dacfifo_tick();
+            if(dut->stall_pause){ if(!pause_on){ pause_on=tk; freezes++; } }
+            else if(pause_on){ long h=(long)(tk-pause_on);
+                               if(h>max_hold) max_hold=h; pause_on=0; }
+            if(pause_on && (long)(tk-pause_on) > PAUSE_LIMIT){
+                err("stall_pause held past limit -- release failure"); break; }
+            // the frozen sub sends nothing; when running, poll each beat and
+            // fire the scheduled impatient re-seek
+            if(!dut->stall_pause){
+                if(++poll_ctr >= BEAT){ poll_ctr=0; pulse_cmd(0x0ULL); }
+                if(resk_at>=0 && (long)(tk-t0) >= resk_at){
+                    resk_at=-1; reseeks++; cur_tgt=resk_tgt;
+                    pulse_cmd(mk_seek(resk_tgt));
+                }
+            }
+            long hd = (long)(dut->dbg_state & 0xFFFFF);
+            int drv = (int)((dut->dbg_state>>28)&0xF);
+            if(drv==1 && head_d>=0 && hd!=head_d
+               && hd>=cur_tgt && hd<=cur_tgt+64){
+                if(++adv>=3 && resk_at<0){ ok=true; break; } }
+            if(hd!=head_d) head_d=hd;
+        }
+        if(!ok && !fail){
+            printf("hop %ld: TIMEOUT tgt=%ld head=%ld drv=%d req=%d bufv=%d "
+                   "pause=%d lat_ctr=%ld fetch=%ld\n",
+                   it, cur_tgt, (long)(dut->dbg_state&0xFFFFF),
+                   (int)((dut->dbg_state>>28)&0xF), (int)((dut->dbg_state>>23)&1),
+                   (int)((dut->dbg_state>>21)&3), (int)dut->stall_pause,
+                   lat_ctr, fetch_idx);
+            err("hop never reached target / streaming");
+        }
+        if((it%50)==0)
+            printf("  hammer: %ld/%ld hops, freezes=%ld max_hold=%ldk, reseeks=%ld\n",
+                   it, niter, freezes, max_hold/1000, reseeks);
+    }
+    unsigned bs = (unsigned)((dut->dbg_integ>>24)&0xFF);
+    printf("--- stallhammer results ---\n");
+    printf("hops=%ld freezes=%ld max_hold=%ld clk (%.1fms) reseeks=%ld badsync=%u\n",
+           niter, freezes, max_hold, max_hold/53693.0, reseeks, bs);
+    if(bs) err("badsync during hammer");
+    if(!freezes) err("hammer never froze -- latency model broken?");
+    printf(fail ? "\n==== STALLHAMMER FAILED ====\n"
+                : "\n==== STALLHAMMER PASSED ====\n");
+    return fail?1:0;
+}
+
 int main(int argc, char** argv){
     Verilated::commandArgs(argc,argv);
     dut = new Vmegacd_cdd_drive;
-    bool cdda_mode=false, swap_mode=false, reseek_mode=false, pause_mode=false, scan_mode=false, binswap_mode=false, integ_mode=false, gap_mode=false, jingle_mode=false, stallpause_mode=false;
+    bool cdda_mode=false, swap_mode=false, reseek_mode=false, pause_mode=false, scan_mode=false, binswap_mode=false, integ_mode=false, gap_mode=false, jingle_mode=false, stallpause_mode=false, hammer_mode=false;
+    long hammer_n=400;
     const char* content_bin=nullptr;
     for(int i=1;i<argc;i++){
         // --lat N: SUSTAINED per-fetch host latency in clk, modelling real SD
@@ -1093,6 +1201,10 @@ int main(int argc, char** argv){
         if(!strcmp(argv[i],"--jingle")) jingle_mode=true;
         if(!strcmp(argv[i],"--stallpause")) stallpause_mode=true;
         if(!strcmp(argv[i],"--stallpause-parked")){ stallpause_mode=true; g_sp_parked=true; }
+        if(!strcmp(argv[i],"--stallhammer")) hammer_mode=true;
+        if(!strcmp(argv[i],"--hammer-n")&&i+1<argc) hammer_n=atol(argv[++i]);
+        if(!strcmp(argv[i],"--hammer-seed")&&i+1<argc) g_rng=(uint32_t)strtoul(argv[++i],0,0);
+        if(!strcmp(argv[i],"--hammer-fast")) g_hammer_fast=true;
         if(!strcmp(argv[i],"--content")&&i+1<argc) content_bin=argv[++i];
     }
     if(cdda_mode){ int r=cdda_test(); delete dut; return r; }
@@ -1105,6 +1217,7 @@ int main(int argc, char** argv){
     if(gap_mode){ int r=gap_test(); delete dut; return r; }
     if(jingle_mode){ int r=jingle_test(); delete dut; return r; }
     if(stallpause_mode){ int r=stallpause_test(); delete dut; return r; }
+    if(hammer_mode){ int r=stallhammer_test(hammer_n); delete dut; return r; }
     if(content_bin){ int r=content_test(content_bin); delete dut; return r; }
 
     // reset
