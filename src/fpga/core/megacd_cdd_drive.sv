@@ -641,10 +641,35 @@ always @(posedge clk) begin
         stall_pause <= 0;
     end else if (stall_cnt != STALL_PAUSE_AT) begin
         stall_cnt <= stall_cnt + 1'b1;
+`ifdef STALL_REVERT_R3
     end else begin
         stall_pause <= 1;
         dbg_stall_seen <= 1;
     end
+`else
+    end else if (latency <= 8'd1) begin
+        // Freeze only once the seek's own latency budget can no longer hide
+        // the gap. During the countdown the game observes nothing missing --
+        // the whole window is dead time it expects -- so a fetch (openfile +
+        // read on a cross-bin hop, ~30ms) that lands inside it needs no
+        // freeze at all. Freezing at threshold REGARDLESS of remaining
+        // budget made every music-track change on a multi-bin disc a
+        // visible ~10ms machine stutter (Sonic CD, hw report 2026-08-20).
+        // The counter still ARMS during the window (round 3's fix), so a
+        // real outage freezes the machine within a few clk of the budget
+        // running out: the game still only ever sees a nominal-length seek.
+        //
+        // <= 1, NOT == 0: the tick that decrements latency to 0 must never
+        // run starved. A starved tick pulses the CDC null decoder tick,
+        // which advances WA/PT with no data -- one phantom sector that
+        // breaks a streaming driver's framing (Silpheed stuck in its retry
+        // loop after a USB-plug outage, hw report 2026-08-20). Freezing one
+        // tick early holds the countdown at 1; it finishes after release,
+        // when the fetch has landed and the tick can deliver real data.
+        stall_pause <= 1;
+        dbg_stall_seen <= 1;
+    end
+`endif
 end
 
 ///////////////////////////////////////////////

@@ -966,10 +966,14 @@ static int stallpause_test(){
                t_off?"":"never ", t_off?(long long)(t_off-t0):-1,
                drv, (unsigned)((dut->dbg_integ>>24)&0xFF));
         if(!t_on)  err("stall_pause never asserted for a starved parked sector");
-        // 12-beat latency ~= 8.6M: the pause must fire INSIDE the latency
-        // window (~ threshold after the seek applies), not after it elapses
-        if(t_on && (long long)(t_on-t0) > 8000000)
-                   err("pause did not engage during the seek-latency window");
+        // 12-beat latency ~= 8.6M. The counter ARMS during the window, and
+        // the pause asserts when the countdown expires with the fetch still
+        // missing -- within ~1 beat after 8.6M, never 19.5ms later (the old
+        // round-2 hole), and never mid-window (the round-3 behavior, which
+        // made every fetch >19.5ms a visible machine stutter even when the
+        // latency budget would have hidden it).
+        if(t_on && (long long)(t_on-t0) > 10200000)
+                   err("pause did not engage at latency expiry (armed)");
         if(!t_off) err("stall_pause never released after the fetch landed");
         if(drv!=4) err("drive fell out of PAUSE");
         if(((dut->dbg_integ>>24)&0xFF)!=0) err("badsync in parked stall");
