@@ -10,11 +10,11 @@
 //     a pending flag; the next 75Hz tick charges the latency, parks lba on
 //     the target, and sets the internal status to the pending PLAY/PAUSE.
 //   - The decoder is fed on EVERY tick. PLAY delivers the sector at lba and
-//     advances; every other state (latency countdown, pause, stop, TOC, END,
-//     scan) re-delivers the sector under the head without advancing (data
-//     track), or null-ticks the CDC (DECI + WA/PT advance, no data) for
-//     audio/negative positions. GPGX's comments credit MCD-verificator CDC
-//     Init and Flags Test #30 for exactly this.
+//     advances; the latency countdown null-ticks the CDC (DECI + WA/PT
+//     advance, no data) like upstream; every other state (pause, stop, TOC,
+//     END, scan) re-delivers the sector under the head without advancing
+//     (data track), or null-ticks for audio/negative positions. GPGX's
+//     comments credit MCD-verificator CDC Init and Flags Test #30 for this.
 //   - Latency base is 2 + 10*cd_latency (i.e. 12 accurate / 2 fast) for BOTH
 //     Play and Seek, plus |dlba|*120/270000 when accurate. Re-issued seeks
 //     add nothing: lba is already parked on the target, so |dlba| = 0.
@@ -27,10 +27,13 @@
 //     REPORTING 9 at reset (see git history of this file for the disasm).
 //
 // Documented divergences from upstream (all deliberate):
-//   - Data-track re-delivery during latency/pause streams the REAL sector,
-//     so the CDC latches the real header; GPGX writes HEAD=00:00:00 for
-//     those ticks. Real hardware re-reads the parked sector, so ours is the
-//     more faithful of the two.
+//   - Data-track re-delivery during PAUSE (and stop/TOC/scan) streams the
+//     REAL sector, so the CDC latches the real header; GPGX writes
+//     HEAD=00:00:00 for those ticks. Real hardware re-reads the parked
+//     sector, so ours is the more faithful of the two. NOT during seek
+//     latency: there the head is already parked on the TARGET, and a valid
+//     header lets the BIOS loader start before PLAY (Sonic CD bank loads,
+//     Wheel of Fortune intro) -- latency null-ticks like upstream.
 //   - SCAN walks linearly through inter-track gaps at +/-30 sectors/tick;
 //     GPGX jumps straight to the next track's INDEX 01. A 2s gap costs us 5
 //     extra ticks; the host stops the scan on the position reports either way.
@@ -659,13 +662,14 @@ always @(posedge clk) begin
         // real outage freezes the machine within a few clk of the budget
         // running out: the game still only ever sees a nominal-length seek.
         //
-        // <= 1, NOT == 0: the tick that decrements latency to 0 must never
-        // run starved. A starved tick pulses the CDC null decoder tick,
-        // which advances WA/PT with no data -- one phantom sector that
-        // breaks a streaming driver's framing (Silpheed stuck in its retry
-        // loop after a USB-plug outage, hw report 2026-08-20). Freezing one
-        // tick early holds the countdown at 1; it finishes after release,
-        // when the fetch has landed and the tick can deliver real data.
+        // <= 1, NOT == 0: freeze while the countdown still sits at 1, so
+        // the first PLAY tick after it can never run starved (Silpheed
+        // stuck in its retry loop after a USB-plug outage, hw report
+        // 2026-08-20). When written, this guarded the 1->0 tick itself,
+        // which then re-delivered the banked sector or null-ticked when
+        // starved -- an inconsistency that is gone now that every latency
+        // tick null-ticks (owe_this_tick); the early freeze is kept as the
+        // hardware-validated margin for the first data tick.
         stall_pause <= 1;
         dbg_stall_seen <= 1;
     end
@@ -1304,10 +1308,22 @@ always @(posedge clk) begin
 end
 
 // does this tick owe the delivery FSM a sector? PLAY streams and advances;
-// every other state (and any latency) re-delivers the banked sector under
-// the head (dlv_hold_req). Audio PLAY streams to the DAC.
+// every other state re-delivers the banked sector under the head
+// (dlv_hold_req). Audio PLAY streams to the DAC.
+//
+// Latency owes NOTHING: those ticks get only the CDC null tick, exactly
+// GPGX's cdc_decoder_update(0) (see the tick block). twwrputy dropped the
+// tick block's latency re-delivery but left this term owing one, so every
+// latency tick still streamed the parked TARGET sector -- valid header,
+// DECI, WA/PT advance -- right behind the null tick. The BIOS ROMREADN
+// loader saw the target's predecessor during the countdown, armed WRRQ ~13
+// ticks early, and the host transfers that followed ran out of step with
+// its queue. Wheel of Fortune's Sony Imagesoft intro streams in seek+play
+// chunks and broke on the third one (tile garbage, then a dead game); GPGX
+// patched to re-deliver during latency reproduces it, re-delivery during
+// PAUSE alone does not.
 wire owe_this_tick =
-    (latency != 0)              ? tick_data_ok :
+    (latency != 0)              ? 1'b0 :
     (drv_status == STAT_PLAY)   ? (disc_present &&
                                    !(!head[31] && head >= leadout_lba)) :
                                   tick_data_ok;
