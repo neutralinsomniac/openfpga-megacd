@@ -37,6 +37,10 @@ entity CDC is
 		RAM_DI		: in std_logic_vector(7 downto 0);
 		RAM_DO		: out std_logic_vector(15 downto 0);
 		RAM_WE		: out std_logic;
+		-- toggles on every DTTRG write that starts a transfer (DOUTEN set),
+		-- so the gate array can drop the word it fetched for the previous
+		-- transfer (see the DTTRG branch of the transfer process)
+		DTTRG_T		: out std_logic;
 		-- decode-path instrumentation for the hardware overlay:
 		--   [31:28] {DECEN, WRRQ, DECI, DTEI}  (DECI/DTEI active low)
 		--   [27:24] {DOUTEN, DTEN, DTBSY, 0} -- host-transfer enable/state
@@ -154,6 +158,7 @@ architecture rtl of CDC is
 		TS_SEND
 	);
 	signal TS : TransferState_t;
+	signal DTTRG_TR : std_logic;
 	signal TRANS_RUN : std_logic;
 	signal FIFO_DATA0 : std_logic_vector(8 downto 0);
 --	signal FIFO_DATA1 : std_logic_vector(8 downto 0);
@@ -533,6 +538,7 @@ begin
 			IFSTAT(DTBSY) <= '1';
 			DTEN_N <= '1';
 			WAIT_N <= '0';
+			DTTRG_TR <= '0';
 			FIFO_DATA0 <= (others => '0');
 --			FIFO_DATA1 <= (others => '0');
 --			FIFO_WR_POS <= '0';
@@ -585,6 +591,31 @@ begin
 --						FIFO_RD_POS <= '0';
 						FIFO_DATA0(8) <= '0';
 --						FIFO_DATA1(8) <= '0';
+
+						-- DTTRG STARTS A NEW TRANSFER, it does not continue
+						-- the old one (GPGX cdc.c DTTRG: !DTBSY/!DTEN, EDT and
+						-- DSR cleared, cdc_dma_init from the fresh DAC/DBC).
+						-- A transfer the host abandoned is still mid-flight
+						-- here: the FSM already fetched the next byte from the
+						-- OLD DAC into FIFO_DATA0 and sits in TS_SEND_WAIT
+						-- with DTEN asserted, and the gate array holds a word
+						-- of it with DSR set. Left alone, the new transfer
+						-- hands the host those stale bytes first and its own
+						-- data shifted behind them. The BIOS does exactly
+						-- this: CDCREAD triggers the transfer, a caller that
+						-- dislikes the header CDCACKs without reading, and
+						-- the next CDCREAD re-triggers. Wheel of Fortune's
+						-- streamer rejects the pre-roll sector before its
+						-- target that way, and its target transfer arrived
+						-- skewed (header garbage) -> stream timeout -> read
+						-- restart, every chunk (sim, 2026-11-04). Restart the
+						-- FSM from TS_IDLE so the first byte comes from the
+						-- new DAC, and tell the gate array to drop its word.
+						TS <= TS_IDLE;
+						IFSTAT(DTEN) <= '1';
+						DTEN_N <= '1';
+						WAIT_N <= '1';
+						DTTRG_TR <= not DTTRG_TR;
 					end if;
 --				elsif REG_WR = '1' and AR = x"7" then
 --					IFSTAT(DTEI) <= '1';
@@ -685,6 +716,7 @@ begin
 		end if;
 	end process;
 	
+	DTTRG_T <= DTTRG_TR;
 	HDO <= FIFO_DATA0(7 downto 0);-- when FIFO_RD_POS = '0' else FIFO_DATA1(7 downto 0);
 	
 	RAM_A_RD <= DAC;

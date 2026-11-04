@@ -74,6 +74,8 @@ entity ASIC is
 		CDC_HRD_N		: out std_logic;
 		CDC_DTEN_N		: in std_logic;
 		CDC_WAIT_N		: in std_logic;
+		-- toggles on each CDC DTTRG that starts a transfer (CDC.vhd)
+		CDC_DTTRG_T		: in std_logic := '0';
 		
 		CD_DI				: in std_logic_vector(15 downto 0);
 		CD_SC_WR			: in std_logic;
@@ -249,6 +251,7 @@ architecture rtl of ASIC is
 	signal DD 							: std_logic_vector(2 downto 0);
 	signal EDT 							: std_logic;
 	signal DSR 							: std_logic;
+	signal DTTRG_SEEN					: std_logic;
 	signal HD 							: std_logic_vector(15 downto 0);
 	signal DMAA 						: std_logic_vector(18 downto 3);
 	signal HIB 							: std_logic_vector(15 downto 0);
@@ -428,6 +431,7 @@ begin
 			DMA_BYTE <= '0';
 			DMA_RUN <= '0';
 			CDC_HRD <= '0';
+			DTTRG_SEEN <= '0';
 		elsif rising_edge(CLK) then
 			if EN = '1' then
 				if DMA_ADDR_SET = '1' then
@@ -533,6 +537,26 @@ begin
 						
 					when others => null;
 				end case;
+
+				-- A CDC DTTRG starts a new transfer: drop the word fetched
+				-- for the previous one (GPGX cdc.c DTTRG clears EDT and DSR
+				-- and re-inits the destination). Without this, a transfer
+				-- the sub abandoned (CDCREAD, then CDCACK without reading
+				-- $FF8008) leaves DSR set on a stale word, and the next
+				-- transfer's CDCTRN reads that word first and everything
+				-- after it shifted (see CDC.vhd's DTTRG branch). Last
+				-- assignment in the process, so it wins over the FSM above.
+				-- DMA destinations finish their own in-flight word: their
+				-- engines run off DS = DS_WRITE and return on their own.
+				if CDC_DTTRG_T /= DTTRG_SEEN then
+					DTTRG_SEEN <= CDC_DTTRG_T;
+					DS <= DS_IDLE;
+					DSR <= '0';
+					EDT <= '0';
+					DMA_BYTE <= '0';
+					DMA_RUN <= '0';
+					CDC_HRD <= '0';
+				end if;
 			end if;
 		end if;
 	end process;
