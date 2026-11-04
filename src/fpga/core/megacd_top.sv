@@ -2656,6 +2656,25 @@ wire gw_rd  = ~GEN_RAM_CE_N & ~GEN_OE_N;
 
 localparam GWC_CHECK = 2'd1, GWC_MISS = 2'd2;
 
+// Miss latency vs the 68000's zero-wait window. Real work RAM never inserts
+// a wait state; here a miss used to raise DTACK one clk_sys AFTER the
+// FX68K's S4 DTACK sample (co-sim: sample edge at AS+11 clk_sys, miss DTACK
+// at AS+11), so every miss cost a whole CPU clock. Lunar - Eternal Blue's
+// module switch is a main/sub race decided by a few us (main: FF80B2 bclr
+// CFM1 .. FF010C bset DMNA, ~60 mostly-missing work-RAM accesses; sub:
+// 301AC .. 1D680 bset RET, which does NOT wait for DMNA). Real hardware wins
+// it by ~4-6us; with a wait per miss the co-sim won it by 0.2-1.2us and the
+// Pocket lost it -> both CPUs deadlocked (title START / cutscene hang).
+// Two clocks come off the miss path:
+//  - the port-1 fill starts in the CHECK cycle (gwc_miss_now), not a cycle
+//    later via the registered gwc_fill_pend;
+//  - the cache completes on the raw port-1 completion of ITS read
+//    (p1_fill_cpl, same edge p1_dout registers) instead of the next-cycle
+//    p1_ram_done pulse, which also fired for draining WRITES (a posted write
+//    finishing during a later read miss would have been taken as its data).
+wire gwc_hit_q    = gwc_q[18] & (gwc_q[17:16] == gwc_a[14:13]);
+wire gwc_miss_now = (gwc_st == GWC_CHECK) & ~gwc_hit_q;
+
 always @(posedge clk_sys) begin
 	if (~gw_acc) gwc_hold <= 0;
 	if (reset | bios_download) begin
@@ -2688,20 +2707,22 @@ always @(posedge clk_sys) begin
 			end
 		end
 		GWC_CHECK: begin
-			if (gwc_q[18] && gwc_q[17:16] == gwc_a[14:13]) begin
+			if (gwc_hit_q) begin
 				gwc_dout <= gwc_q[15:0];
 				gwc_busy <= 0;
 				gwc_hold <= 1;
 				gwc_st   <= 0;
 			end else begin
-				gwc_fill_pend <= 1;        // ask port 1 to fetch it
+				// port 1 normally starts this fill now (gwc_miss_now);
+				// fill_pend carries it if port 1 is still busy
+				gwc_fill_pend <= 1;
 				gwc_st        <= GWC_MISS;
 			end
 		end
-		GWC_MISS: if (p1_ram_done) begin
+		GWC_MISS: if (p1_fill_cpl) begin
 			gwc_fill_pend <= 0;
-			gwc_dout <= p1_dout;
-			gwc[gwc_a[12:0]] <= {1'b1, gwc_a[14:13], p1_dout};
+			gwc_dout <= GEN_MEM_DO;
+			gwc[gwc_a[12:0]] <= {1'b1, gwc_a[14:13], GEN_MEM_DO};
 			gwc_busy <= 0;
 			gwc_hold <= 1;
 			gwc_st   <= 0;
@@ -2738,16 +2759,16 @@ reg  [15:0] p1_dout /* verilator public_flat_rd */;
 wire p1_ram_acc = ~GEN_RAM_CE_N & (~GEN_OE_N | ~GEN_WRL_N | ~GEN_WRH_N);
 wire p1_wr_acc  = ~GEN_RAM_CE_N & (~GEN_WRL_N | ~GEN_WRH_N);
 reg  gw_wr_ack = 0;
-reg  p1_ram_done = 0;
 wire p1_rom_acc = ~GEN_ROM_CE_N & ~GEN_OE_N;
+reg  p1_old_b1 /* verilator public_flat_rd */ = 0;
+// a gen-RAM READ (cache fill) completes this cycle: GEN_MEM_DO is its data
+wire p1_fill_cpl = p1_act & ~p1_owner & p1_rd & p1_started & p1_old_b1 & ~GEN_MEM_BUSY;
 
 always @(posedge clk_sys) begin
-	reg old_b1;
-	old_b1 <= GEN_MEM_BUSY;
+	p1_old_b1 <= GEN_MEM_BUSY;
 	p1_rom_done <= 0;  // one-cycle completion pulse to the ROM cache
 	if (~p1_ram_acc) p1_ram_hold <= 0;
 	if (~p1_wr_acc)  gw_wr_ack <= 0;
-	p1_ram_done <= 0;
 	if (~bc_miss_req) p1_rom_hold <= 0;
 	if (reset | bios_download) begin
 		p1_act <= 0; p1_started <= 0;
@@ -2761,7 +2782,7 @@ always @(posedge clk_sys) begin
 		// cache: a >28clk drain overlapping the 68K's next access previously
 		// false-accepted it — stale read data / lost writes at high SDRAM
 		// latency).
-		if ((p1_wr_acc & ~gw_wr_ack | gwc_fill_pend) & ~p1_ram_hold) begin
+		if ((p1_wr_acc & ~gw_wr_ack | gwc_fill_pend | gwc_miss_now) & ~p1_ram_hold) begin
 			p1_act  <= 1; p1_started <= 0; p1_owner <= 0;
 			p1_addr <= {9'b010000000, GEN_VA[15:1]};
 			p1_din  <= GEN_VDO;
@@ -2777,9 +2798,13 @@ always @(posedge clk_sys) begin
 		end
 	end else begin
 		if (GEN_MEM_BUSY) p1_started <= 1;
-		if (p1_started & old_b1 & ~GEN_MEM_BUSY) begin
+		if (p1_started & p1_old_b1 & ~GEN_MEM_BUSY) begin
 			p1_dout <= GEN_MEM_DO;
-			if (!p1_owner) begin p1_ram_busy <= 0; p1_ram_hold <= 1; p1_ram_done <= 1; end
+			// hold (no re-issue until the strobes drop) only after a READ
+			// fill: a write is already guarded by gw_wr_ack, and a posted
+			// write that drains into the NEXT access's read miss must not
+			// block that miss's fill
+			if (!p1_owner) begin p1_ram_busy <= 0; p1_ram_hold <= p1_rd; end
 			else          begin p1_rom_done <= 1; p1_rom_hold <= 1; end
 			p1_act <= 0; p1_rd <= 0; p1_wrl <= 0; p1_wrh <= 0;
 		end
