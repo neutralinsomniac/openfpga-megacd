@@ -27,6 +27,13 @@ proc
 write_verilog -noattr mcd.v
 " > /dev/null
 
+# keep the named nets the tb reads by name: yosys emits them as plain wires,
+# which verilator is free to inline away (tb_full.cpp then fails to compile
+# on asic__DOT__dsr etc.). These annotations used to be hand-added to mcd.v
+# and were lost on every reconvert.
+sed -E -i 's/^(  wire (\[[0-9]+:0\] )?(cdc_dten_n|cdc_wait_n|cddc|cdds|dd|dma_addr|dsr|edt|sub_cpu_cdc_read));$/\1 \/* verilator public_flat_rd *\/;/' mcd.v
+echo "    public_flat_rd nets: $(grep -c 'verilator public_flat_rd' mcd.v)"
+
 echo "=== 2/2 re-point tb probes at the new net names"
 python3 - <<'PY'
 import re

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <algorithm>
 #include <vector>
 #include <string>
 #include <dirent.h>
@@ -722,7 +723,34 @@ int main(int argc,char**argv){
                 }
             }
         }
+        // FIXLAT=1 (checkpoint bridge): emulate the WoF owe_this_tick fix
+        // ("latency owes no delivery") on a model built from the PRE-fix RTL,
+        // so a checkpoint saved by a pre-fix savable build (whose verilated
+        // layout a post-fix build cannot load -- DFG temps renumber) can be
+        // replayed under the fixed behaviour. On the core edge that runs a
+        // 75Hz tick with latency != 0, the old RTL adds the latency owe to
+        // dlv_owed; undo exactly that increment, nothing else.
+        int fl_pre_owed=-1, fl_pre_adv=0;
+        { static int fl=-1; if(fl<0) fl = getenv("FIXLAT")!=nullptr;
+          if(fl){ auto* R = dut->rootp;
+              if(R->core_top__DOT__cdd_drive__DOT__wdog == 715909 &&
+                 R->core_top__DOT__cdd_drive__DOT__latency != 0){
+                  fl_pre_owed = R->core_top__DOT__cdd_drive__DOT__dlv_owed;
+                  fl_pre_adv  = R->core_top__DOT__cdd_drive__DOT__dlv_advance;
+              } } }
         dut->eval(); t++;
+        if(fl_pre_owed>=0 && dut->rootp->core_top__DOT__cdd_drive__DOT__wdog != 715909){
+            // the tick edge ran: expected = old - completion (fixed RTL)
+            auto* R = dut->rootp;
+            int exp = fl_pre_owed - ((fl_pre_adv && fl_pre_owed) ? 1 : 0);
+            int got = R->core_top__DOT__cdd_drive__DOT__dlv_owed;
+            if(got == exp + 1){
+                R->core_top__DOT__cdd_drive__DOT__dlv_owed = exp;
+                static long fln=0;
+                if(fln++ < 64) printf("FIXLAT [%ld] undid latency owe (owed %d->%d lat=%u)\n",
+                                      c, got, exp, R->core_top__DOT__cdd_drive__DOT__latency);
+            }
+        }
 
         // ---- reset-with-disc-mounted investigation ----
         // RESET_AT=<cycle>: issue the APF "Reset Core" bridge write ($70)
@@ -746,15 +774,15 @@ int main(int argc,char**argv){
           static long ncfm=0, ncfs=0;
           if(!cti){ cti=true; const char* e=getenv("COMMTRACE"); ct = e && *e=='1'; }
           if(ct){
-              int cfm = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1489_/*sig:cfm*/;
-              int cfs = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1486_/*sig:cfs*/;
-              int sres= dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1449_/*sig:sres*/;
-              int sbrq= dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1451_/*sig:sbrq*/;
+              int cfm = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1500_/*sig:cfm*/;
+              int cfs = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1498_/*sig:cfs*/;
+              int sres= dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1458_/*sig:sres*/;
+              int sbrq= dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1460_/*sig:sbrq*/;
               // INT_PEND(2) = int_pend[1] = _1543_; IEN(2) = ien[1] of _1471_.
               // With the IEN gate removed from the latch, INT_PEND(2) staying
               // 0 means the MAIN CPU never requests INT2 at all.
-              int ip2 = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1572_/*sig:int_pend2*/ & 1;
-              int ie2 = (dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1500_/*sig:ien*/ >> 1) & 1;
+              int ip2 = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1583_/*sig:int_pend2*/ & 1;
+              int ie2 = (dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1511_/*sig:ien*/ >> 1) & 1;
               static int lip2=-1, lie2=-1; static long nip2=0;
               if(ip2!=lip2 && ip2) nip2++;
               if(cfm!=lcfm) ncfm++;
@@ -963,6 +991,166 @@ int main(int argc,char**argv){
 
         uint32_t mpc = dut->rootp->core_top__DOT__dbg_m68k_a & 0xFFFFFF;
         uint32_t spc = dut->rootp->core_top__DOT__dbg_s68k_a & 0xFFFFFF;
+
+        // SUBPROF=c0,c1[,seg]: sub-CPU profile inside [c0,c1). Every cycle
+        // credits the real fx68k PC (excUnit PcH:PcL, the prefetch PC) so
+        // the histogram is time-weighted; dumped + reset every `seg` cycles
+        // (default 50M). Also logs the per-sector CDC dialogue as events:
+        // TRG (sub DTTRG count), DEC (decoder tick, with header MSF), EDT
+        // rise (host transfer done) and sub IPL changes (which interrupt).
+        {
+            static bool spi=false; static long sp0=-1, sp1=-1, spseg=50000000, spnext=0;
+            if(!spi){ spi=true; const char* e=getenv("SUBPROF");
+                if(e){ sscanf(e,"%ld,%ld,%ld",&sp0,&sp1,&spseg); spnext=sp0+spseg; } }
+            if(sp0>=0 && c>=sp0 && c<sp1){
+                auto* rr = dut->rootp;
+                static std::vector<std::pair<uint32_t,long>> dummy;
+                static long* hist = nullptr; if(!hist){ hist = new long[1<<20](); }
+                uint32_t pc = ((uint32_t)rr->core_top__DOT__MCD__DOT__s68k__DOT__p68k__DOT__excUnit__DOT__PcH<<16)
+                            | rr->core_top__DOT__MCD__DOT__s68k__DOT__p68k__DOT__excUnit__DOT__PcL;
+                hist[(pc>>1)&0xFFFFF]++;
+                static int ltrg=-1, ldec=-1, ledt=-1, lipl=-1; static long n08=0;
+                unsigned dv = (unsigned)rr->core_top__DOT__dbg_dec;
+                int trg=(dv>>4)&0xF, dcn=dv&0xF;
+                int edt=rr->core_top__DOT__MCD__DOT__asic__DOT__edt;
+                int ipl=rr->core_top__DOT__MCD__DOT__s68k__DOT__p68k__DOT__iIpl;
+                static uint32_t pa=0; if(spc==0xFF8008 && pa!=0xFF8008) n08++; pa=spc;
+                if(trg!=ltrg && ltrg>=0) printf("SP %ld TRG %X pc=%06X\n",c,trg,pc);
+                if(dcn!=ldec && ldec>=0) printf("SP %ld DEC %X hdr=%02X:%02X head=%u\n",c,dcn,(dv>>16)&0xFF,(dv>>8)&0xFF,
+                        (unsigned)(rr->core_top__DOT__cdd_drive__DOT__head & 0xFFFFF));
+                if(edt!=ledt && ledt>=0) printf("SP %ld EDT %d n08=%ld pc=%06X\n",c,edt,n08,pc);
+                if(ipl!=lipl && lipl>=0) printf("SP %ld IPL %d pc=%06X\n",c,ipl,pc);
+                ltrg=trg; ldec=dcn; ledt=edt; lipl=ipl;
+                if(c+1>=spnext || c+1>=sp1){
+                    std::vector<std::pair<long,uint32_t>> v;
+                    long tot=0;
+                    for(uint32_t i=0;i<(1u<<20);i++) if(hist[i]){ v.push_back({hist[i],i<<1}); tot+=hist[i]; }
+                    std::sort(v.begin(),v.end(),[](auto&a,auto&b){return a.first>b.first;});
+                    printf("SPHIST [%ld] seg_end tot=%ld\n",c,tot);
+                    for(size_t i=0;i<v.size() && i<120;i++)
+                        printf("SPH %06X %6.3f%%\n",v[i].second,100.0*v[i].first/tot);
+                    memset(hist,0,sizeof(long)*(1<<20));
+                    spnext+=spseg; fflush(stdout);
+                }
+            }
+        }
+
+        // STRMTRACE=c0,c1: Wheel of Fortune sub-module CD streamer ($9FB4,
+        // run from the level-2 user handler $9182) + BIOS CDC entry points.
+        // Events are first program fetches of block-entry addresses (bus
+        // address edge with FC=program), with D0/D1 and the streamer state
+        // read straight out of PRG RAM ($140F6 expected LBA, $140FA left,
+        // $14102 ring size, $14104 -> {rd,wr} idx, $14108 timeout, $1410A
+        // reading flag). DECI/DTEI from dbg_dec[29:28] (active low).
+        {
+            static bool sti=false; static long st0=-1, st1=-1;
+            if(!sti){ sti=true; const char* e=getenv("STRMTRACE");
+                if(e) sscanf(e,"%ld,%ld",&st0,&st1); }
+            if(st0>=0 && c>=st0 && c<st1){
+                auto* rr = dut->rootp;
+                static uint32_t pa=0xFFFFFFFF;
+                int fc = rr->core_top__DOT__MCD__DOT__s68k__DOT__p68k__DOT__rFC & 7;
+                auto prg16 = [&](uint32_t a)->uint32_t { return rr->core_top__DOT__sdram__DOT__mem[0x800000 + ((a&0x7FFFF)>>1)] & 0xFFFF; };
+                auto prg32 = [&](uint32_t a)->uint32_t { return (prg16(a)<<16) | prg16(a+2); };
+                auto D = [&](int i)->uint32_t { return ((uint32_t)rr->core_top__DOT__MCD__DOT__s68k__DOT__p68k__DOT__excUnit__DOT__regs68H[i]<<16)
+                                                 | rr->core_top__DOT__MCD__DOT__s68k__DOT__p68k__DOT__excUnit__DOT__regs68L[i]; };
+                unsigned dv = (unsigned)rr->core_top__DOT__dbg_dec;
+                static int ldeci=-1, ldtei=-1;
+                int deci=(dv>>29)&1, dtei=(dv>>28)&1;
+                if(deci!=ldeci && ldeci>=0) printf("ST %ld DECI %d hdr=%02X:%02X head=%u\n",c,deci,(dv>>16)&0xFF,(dv>>8)&0xFF,
+                        (unsigned)(rr->core_top__DOT__cdd_drive__DOT__head & 0xFFFFF));
+                // CDCMAP=1: on DECI assertion, find where in the 16KB CDC
+                // buffer each recent sector header actually sits (BCD
+                // mm ss ff 01 for head-3..head), and the last decoder write
+                // word address -- answers "does the block the BIOS queued
+                // (its captured PT) hold the sector its captured HEAD says?"
+                { static int cm=-1; if(cm<0) cm = getenv("CDCMAP")!=nullptr;
+                  if(cm && deci==0 && ldeci==1){
+                    auto& M = rr->core_top__DOT__MCD__DOT__cdc_ram__DOT__mem;
+                    int hd = (int)(rr->core_top__DOT__cdd_drive__DOT__head & 0xFFFFF);
+                    printf("ST %ld CMAP wr_last=%04X", c,
+                           (unsigned)rr->core_top__DOT__MCD__DOT____Vcellinp__cdc_ram__address_b*2);
+                    for(int l=hd-4; l<=hd; l++){
+                        int a=l+150, mm=a/75/60, ss=(a/75)%60, ff=a%75;
+                        uint8_t h[4]={ (uint8_t)((mm/10)<<4|mm%10), (uint8_t)((ss/10)<<4|ss%10),
+                                       (uint8_t)((ff/10)<<4|ff%10), 1 };
+                        printf(" %d@",l); int n=0;
+                        for(int o=0;o<16384;o++){
+                            if(M[o]==h[0]&&M[(o+1)&0x3FFF]==h[1]&&M[(o+2)&0x3FFF]==h[2]&&M[(o+3)&0x3FFF]==h[3]){
+                                printf("%s%04X",n?",":"",o); n++; }
+                            else if(M[o]==h[1]&&M[(o+1)&0x3FFF]==h[0]&&M[(o+2)&0x3FFF]==h[3]&&M[(o+3)&0x3FFF]==h[2]){
+                                printf("%sS%04X",n?",":"",o); n++; }
+                        }
+                        if(!n) printf("-");
+                    }
+                    printf("\n");
+                  } }
+                if(dtei!=ldtei && ldtei>=0) printf("ST %ld DTEI %d\n",c,dtei);
+                ldeci=deci; ldtei=dtei;
+                if(spc!=pa && (fc&3)==2){
+                    const char* tag=nullptr; int regs=0;
+                    switch(spc){
+                    case 0x009182: tag="INT2"; break;
+                    case 0x009FB4: tag="STRM"; regs=2; break;
+                    case 0x00A030: tag="RDHDR"; regs=1; break;
+                    case 0x00A06A: tag="TRNHDR"; regs=1; break;
+                    case 0x00A07E: tag="OK"; regs=2; break;
+                    case 0x00A0AE: tag="BAD"; regs=1; break;
+                    case 0x00A0B8: tag="FAIL"; regs=1; break;
+                    case 0x00A0C2: tag="RESTART"; regs=2; break;
+                    case 0x00A0E6: tag="STOP"; regs=2; break;
+                    case 0x00A110: tag="RET"; regs=2; break;
+                    case 0x00181C: tag="bCDCSTAT"; break;
+                    case 0x001832: tag="bSTAT_ok"; break;
+                    case 0x001836: tag="bSTAT_empty"; break;
+                    case 0x001846: tag="bCDCREAD"; break;
+                    case 0x0018FC: tag="bCDCTRN"; break;
+                    case 0x001916: tag="bTRN_dsr"; break;
+                    case 0x00197A: tag="bTRN_FAIL"; regs=1; break;
+                    case 0x0019A8: tag="bCDCACK"; break;
+                    case 0x000634: tag="L5"; break;
+                    case 0x000646: tag="L5rte"; break;
+                    default: break;
+                    }
+                    if(tag){
+                        printf("ST %ld %s",c,tag);
+                        if(regs>=1) printf(" d0=%08X d1=%08X d2=%08X d3=%08X",D(0),D(1),D(2),D(3));
+                        if(regs>=2){ uint32_t p=prg32(0x14104);
+                            printf(" exp=%u left=%u ring=%u rd=%u wr=%u to=%u flag=%02X",
+                                   prg32(0x140F6), prg32(0x140FA), prg16(0x14102),
+                                   prg16(p), prg16(p+2), prg16(0x14108), prg16(0x1410A)>>8); }
+                        printf(" deci=%d dtei=%d\n",deci,dtei);
+                    }
+                    // BIOS CDC capture: L5 copies R1 (IFSTAT), R4-R9 (HEAD0-3,
+                    // PTL, PTH), R12-R15 (STAT0-3) to $5A38.. (a5-relative);
+                    // CDCREAD's entry (a0 after the dequeue at $1876) holds
+                    // {HEAD0-3, PTL, PTH, ...} -> DAC = PT (byte-swapped word)
+                    if(spc==0x000646 || spc==0x001876){
+                        uint32_t a5 = D(13), b = a5 + 0x5A38;
+                        auto prg8 = [&](uint32_t a)->uint32_t { uint32_t w=prg16(a&~1u); return (a&1)? (w&0xFF) : (w>>8); };
+                        if(spc==0x000646)
+                            printf("ST %ld L5CAP a5=%X ifstat=%02X head=%02X:%02X:%02X:%02X pt=%02X%02X stat=%08X q=%u/%u\n",
+                                   c, a5, prg8(b), prg8(b+2),prg8(b+3),prg8(b+4),prg8(b+5),
+                                   prg8(b+7),prg8(b+6), prg32(b+8),
+                                   prg16(a5+0x5A44+4), prg16(a5+0x5A44+6));
+                        else { uint32_t a0 = D(8);
+                            printf("ST %ld READENT a0=%X head=%02X:%02X:%02X:%02X pt=%02X%02X tail=%02X%02X\n",
+                                   c, a0, prg8(a0),prg8(a0+1),prg8(a0+2),prg8(a0+3),
+                                   prg8(a0+5),prg8(a0+4), prg8(a0+6),prg8(a0+7)); }
+                    }
+                    // gate-array host-transfer state where a stale transfer
+                    // would show: CDCREAD dequeue (before its DTTRG), CDCTRN
+                    // entry, CDCACK entry
+                    if(spc==0x001876 || spc==0x0018FC || spc==0x0019A8)
+                        printf("ST %ld GA@%04X dd=%u dsr=%u edt=%u dten_n=%u\n", c, spc,
+                               (unsigned)rr->core_top__DOT__MCD__DOT__asic__DOT__dd,
+                               (unsigned)rr->core_top__DOT__MCD__DOT__asic__DOT__dsr,
+                               (unsigned)rr->core_top__DOT__MCD__DOT__asic__DOT__edt,
+                               (unsigned)rr->core_top__DOT__MCD__DOT__asic__DOT__cdc_dten_n);
+                }
+                pa=spc;
+            }
+        }
 
         // ---- S08TRACE=1: PCM-stream service pacing, one line per 75Hz-ish
         // window. Counts sub-CPU accesses to $FF8008 (CDC host data: the
@@ -1571,14 +1759,14 @@ int main(int argc,char**argv){
           if((c%2000000)==0 && c)
               printf("MCDRST [%ld] high=%.1f%% edges=%ld now=%d sbrq=%d\n",
                      c, 100.0*rst_hi/2000000.0, edges, rn,
-                     dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1451_/*sig:sbrq*/), rst_hi=0; }
+                     dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1460_/*sig:sbrq*/), rst_hi=0; }
         // SBRQ is the main's bus request for the sub. ASIC.vhd:2631/2638 make it
         // halt the sub 68000 outright (GEN_S68K_HALT <= SBRQ), and it RESETS TO
         // '1' -- so the sub is born halted and only runs once the main writes
         // $A12001 with bit1 clear. If this never falls, the sub can be fully out
         // of reset and still never fetch an instruction.
         { static int sb_prev=-1; static long sb_edges=0;
-          int sb = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1451_/*sig:sbrq*/;
+          int sb = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1460_/*sig:sbrq*/;
           if(sb!=sb_prev){
               if(sb_edges<12)
                   printf("[%ld] SBRQ %d -> %d (main=%06X sub=%06X)\n",c,sb_prev,sb,mpc,spc);
@@ -1711,8 +1899,8 @@ int main(int argc,char**argv){
             if(g1_n) printf("P1 [%ld] n=%ld serv=%.1f gap=%.1f\n",c,g1_n,(double)g1_serv/g1_n,(double)g1_gap/g1_n);
             vb_sum=0; vb_n=0; vb_max=0; g1_serv=0; g1_gap=0; g1_n=0; }
           static int r0_p=0,r1_p=0,d0_p=0,d1_p=0; static long swp[4]={0,0,0,0};
-          { int r0=r->core_top__DOT__MCD__DOT__asic__DOT___1458_/*sig:ret0*/, r1=r->core_top__DOT__MCD__DOT__asic__DOT___1460_/*sig:ret1*/;
-            int d0=r->core_top__DOT__MCD__DOT__asic__DOT___1456_/*sig:dmna0*/, d1=r->core_top__DOT__MCD__DOT__asic__DOT___1457_/*sig:dmna1*/;
+          { int r0=r->core_top__DOT__MCD__DOT__asic__DOT___1467_/*sig:ret0*/, r1=r->core_top__DOT__MCD__DOT__asic__DOT___1469_/*sig:ret1*/;
+            int d0=r->core_top__DOT__MCD__DOT__asic__DOT___1465_/*sig:dmna0*/, d1=r->core_top__DOT__MCD__DOT__asic__DOT___1466_/*sig:dmna1*/;
             if(r0!=r0_p) swp[0]++; if(r1!=r1_p) swp[1]++;
             if(d0!=d0_p) swp[2]++; if(d1!=d1_p) swp[3]++;
             r0_p=r0; r1_p=r1; d0_p=d0; d1_p=d1; }
