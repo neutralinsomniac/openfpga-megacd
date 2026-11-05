@@ -40,7 +40,7 @@ import re
 mcd = open('mcd.v').read()
 tb  = open('tb_full.cpp').read()
 # ASIC-internal probes the tb reads, by their VHDL signal name
-want = ['cfm','cfs','sres','sbrq','ret0','ret1','dmna0','dmna1']
+want = ['cfm','cfs','sres','sbrq','ret0','ret1','dmna0','dmna1','mode']
 new = {}
 for sig in want:
     m = re.search(r'assign %s = (_\d+_);' % sig, mcd)

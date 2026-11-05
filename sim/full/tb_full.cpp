@@ -770,27 +770,91 @@ int main(int argc,char**argv){
         // NB: these are yosys-mangled net names from mcd.v (cfs=_1459_,
         // cfm=_1461_, sres=_1421_, sbrq=_1423_); re-converting mcd.v will
         // renumber them -- re-derive from the "assign cfs = _NNNN_;" lines.
+        // COMMTRACE=c0,c1 limits it to a cycle window (the Lunar Eternal Blue
+        // title runs a 4-phase CFM/CFS handshake several times per frame, so
+        // a whole-run trace is enormous); every line then also carries each
+        // CPU's last PROGRAM fetch address (FC=program), i.e. which code
+        // made or is waiting on the transition.
         { static bool cti=false, ct=false; static int lcfm=-1,lcfs=-1,lsres=-1,lsbrq=-1;
-          static long ncfm=0, ncfs=0;
-          if(!cti){ cti=true; const char* e=getenv("COMMTRACE"); ct = e && *e=='1'; }
+          static long ncfm=0, ncfs=0, ctw0=0, ctw1=-1;
+          static uint32_t lmpf=0, lspf=0;
+          if(!cti){ cti=true; const char* e=getenv("COMMTRACE");
+                    if(e && strchr(e,',')){ ct=true; sscanf(e,"%ld,%ld",&ctw0,&ctw1); }
+                    else ct = e && *e=='1'; }
           if(ct){
+              if((dut->rootp->core_top__DOT__gen__DOT__M68K__DOT__rFC & 3)==2)
+                  lmpf = dut->rootp->core_top__DOT__dbg_m68k_a & 0xFFFFFF;
+              if((dut->rootp->core_top__DOT__MCD__DOT__s68k__DOT__p68k__DOT__rFC & 3)==2)
+                  lspf = dut->rootp->core_top__DOT__dbg_s68k_a & 0xFFFFFF;
+          }
+          if(ct && c>=ctw0 && (ctw1<0 || c<ctw1)){
+              // LEBRACE=1: Lunar - Eternal Blue module-switch race (main
+              // FF80B2 bclr CFM1 .. FF010C bset DMNA vs sub 301AC .. 1D680
+              // bset RET). PC watchpoints on both paths, then (from the
+              // main's first FF80BA fetch) a clk_sys timeline of ~4us and a
+              // per-bus-cycle main trace of ~60us.
+              static int lebrace = getenv("LEBRACE") ? 1 : 0;
+              if(lebrace){ static uint32_t pm=0, ps=0;
+                if(lmpf!=pm){ if(lmpf==0xFF80B2||lmpf==0xFF80BA||lmpf==0xFF80D6||lmpf==0xFF010C||lmpf==0xFF0114||lmpf==0xFF00CA)
+                                printf("[%ld] MPC %06X spc=%06X\n", c, lmpf, lspf); pm=lmpf; }
+                if(lspf!=ps){ if(lspf==0x0301B4||lspf==0x0301BA||lspf==0x0301C8||lspf==0x01D66E||lspf==0x01D676||lspf==0x01D680||lspf==0x01D688)
+                                printf("[%ld] SPC %06X mpc=%06X\n", c, lspf, lmpf); ps=lspf; } }
+              // main bus-cycle trace for 60us after the main first fetches FF80BA
+              if(lebrace){ static long trig=-1; auto* rr=dut->rootp;
+                if(trig<0 && lmpf==0xFF80BA) { trig=c; printf("[%ld] MBTRACE start\n", c); }
+                // clk_sys-level timeline of the first ~4us (hit vs miss anatomy)
+                if(trig>=0 && c-trig < 860){
+                  static unsigned long lk=~0UL;
+                  unsigned long k = ((unsigned long)(rr->core_top__DOT__gen__DOT__mstate&15))
+                    | ((unsigned long)rr->core_top__DOT__gen__DOT__M68K__DOT__busControl__DOT__rAS<<4)
+                    | ((unsigned long)(rr->core_top__DOT__gen__DOT__M68K__DOT__busControl__DOT__busPhase&31)<<5)
+                    | ((unsigned long)rr->core_top__DOT__gen__DOT__M68K_CLKENp<<10)
+                    | ((unsigned long)rr->core_top__DOT__gen__DOT__M68K_CLKENn<<11)
+                    | ((unsigned long)(rr->core_top__DOT__gwc_st&3)<<12)
+                    | ((unsigned long)rr->core_top__DOT__gwc_busy<<14)
+                    | ((unsigned long)rr->core_top__DOT__gwc_fill_pend<<15)
+                    | ((unsigned long)rr->core_top__DOT__p1_act<<16)
+                    | ((unsigned long)rr->core_top__DOT__GEN_MEM_BUSY<<17)
+                    | ((unsigned long)rr->core_top__DOT__p1_old_b1<<18)
+                    | ((unsigned long)rr->core_top__DOT__gen__DOT__M68K_MBUS_DTACK_N<<19)
+                    | ((unsigned long)rr->core_top__DOT__GEN_RAM_CE_N<<20)
+                    | ((unsigned long)rr->core_top__DOT__GEN_OE_N<<21);
+                  if(k!=lk){ printf("TL %4ld ms=%2lu AS=%lu ph=%2lu ckp=%lu ckn=%lu gst=%lu gbusy=%lu fill=%lu p1=%lu mbusy=%lu oldb1=%lu dtackn=%lu ce_n=%lu oe_n=%lu a=%06X\n",
+                       (c-trig), k&15,(k>>4)&1,(k>>5)&31,(k>>10)&1,(k>>11)&1,(k>>12)&3,(k>>14)&1,(k>>15)&1,(k>>16)&1,(k>>17)&1,(k>>18)&1,(k>>19)&1,(k>>20)&1,(k>>21)&1, rr->core_top__DOT__dbg_m68k_a & 0xFFFFFF); lk=k; } }
+                if(trig>=0 && c-trig < 12900){
+                  static int prev=-1; static long clks=0, c0=0, cend=0; static int via=0; static uint32_t a0=0; static int rw0=0;
+                  int ms = rr->core_top__DOT__gen__DOT__mstate & 15;
+                  if(prev==0 && ms!=0){ clks=0; via=ms; c0=c; a0=rr->core_top__DOT__dbg_m68k_a & 0xFFFFFF; rw0=rr->core_top__DOT__gen__DOT__MBUS_RNW; }
+                  if(ms!=0){ if(ms!=14 && ms!=1) via=ms; if(rr->core_top__DOT__gen__DOT__M68K_CLKENp) clks++; }
+                  if(prev!=0 && ms==0){ printf("MB +%7.2fus gap=%5.2fus st=%2d a=%06X %s clk=%ld\n", (c0-trig)/214.77, (c0-cend)/214.77, via, a0, rw0?"R":"W", clks); cend=c; }
+                  prev=ms; } }
               int cfm = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1500_/*sig:cfm*/;
               int cfs = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1498_/*sig:cfs*/;
               int sres= dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1458_/*sig:sres*/;
-              int sbrq= dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1460_/*sig:sbrq*/;
+              int sbrq= dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1461_/*sig:sbrq*/;
               // INT_PEND(2) = int_pend[1] = _1543_; IEN(2) = ien[1] of _1471_.
               // With the IEN gate removed from the latch, INT_PEND(2) staying
               // 0 means the MAIN CPU never requests INT2 at all.
-              int ip2 = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1583_/*sig:int_pend2*/ & 1;
+              int ip2 = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1584_/*sig:int_pend2*/ & 1;
               int ie2 = (dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1511_/*sig:ien*/ >> 1) & 1;
               static int lip2=-1, lie2=-1; static long nip2=0;
               if(ip2!=lip2 && ip2) nip2++;
               if(cfm!=lcfm) ncfm++;
               if(cfs!=lcfs) ncfs++;
+              // memory-mode bits (2M: main reads DMNA0/RET0) for the Lunar EB
+              // FF010C-DMNA vs 1D680-RET race
+              int mr0 = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1467_/*sig:ret0*/;
+              int md0 = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1465_/*sig:dmna0*/;
+              int mmo = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1464_/*sig:mode*/;
+              static int lmm=-1; int mm = (mmo<<2)|(md0<<1)|mr0;
+              if(mm!=lmm){
+                  printf("[%ld] MM mode=%d dmna0=%d ret0=%d mpc=%06X spc=%06X\n", c, mmo, md0, mr0, lmpf, lspf); fflush(stdout);
+                  lmm=mm;
+              }
               if(cfm!=lcfm||cfs!=lcfs||sres!=lsres||sbrq!=lsbrq||ip2!=lip2||ie2!=lie2){
                   printf("[%ld] CFM=%02X CFS=%02X SRES=%d SBRQ=%d IPEND2=%d IEN2=%d"
-                         " (chg m=%ld s=%ld int2req=%ld)\n",
-                         c, cfm, cfs, sres, sbrq, ip2, ie2, ncfm, ncfs, nip2); fflush(stdout);
+                         " mpc=%06X spc=%06X (chg m=%ld s=%ld int2req=%ld)\n",
+                         c, cfm, cfs, sres, sbrq, ip2, ie2, lmpf, lspf, ncfm, ncfs, nip2); fflush(stdout);
                   lcfm=cfm; lcfs=cfs; lsres=sres; lsbrq=sbrq; lip2=ip2; lie2=ie2;
               }
           } }
@@ -1759,14 +1823,14 @@ int main(int argc,char**argv){
           if((c%2000000)==0 && c)
               printf("MCDRST [%ld] high=%.1f%% edges=%ld now=%d sbrq=%d\n",
                      c, 100.0*rst_hi/2000000.0, edges, rn,
-                     dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1460_/*sig:sbrq*/), rst_hi=0; }
+                     dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1461_/*sig:sbrq*/), rst_hi=0; }
         // SBRQ is the main's bus request for the sub. ASIC.vhd:2631/2638 make it
         // halt the sub 68000 outright (GEN_S68K_HALT <= SBRQ), and it RESETS TO
         // '1' -- so the sub is born halted and only runs once the main writes
         // $A12001 with bit1 clear. If this never falls, the sub can be fully out
         // of reset and still never fetch an instruction.
         { static int sb_prev=-1; static long sb_edges=0;
-          int sb = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1460_/*sig:sbrq*/;
+          int sb = dut->rootp->core_top__DOT__MCD__DOT__asic__DOT___1461_/*sig:sbrq*/;
           if(sb!=sb_prev){
               if(sb_edges<12)
                   printf("[%ld] SBRQ %d -> %d (main=%06X sub=%06X)\n",c,sb_prev,sb,mpc,spc);
