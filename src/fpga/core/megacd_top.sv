@@ -2211,6 +2211,31 @@ wire [9:0] dbg_band = dbg_y - ((dbg_y >= 10'd150) ? 10'd150 :
 wire [2:0] dbg_frow = dbg_band[3:1];
 wire [3:0] dbg_grow = dbg_glyph[((3'd5 - dbg_frow)*4) +: 4];
 
+// Hang snapshot for the hardware overlay (Lunar EB title/cutscene freeze):
+// each CPU's most recent instruction-fetch address and the comm flags,
+// latched together once a second so a photo of a frozen screen says where
+// both CPUs are parked. A polling loop shows up as one of its own
+// addresses (plus up to two prefetch words); take two photos a few
+// seconds apart to see the loop's extent.
+reg [23:0] hs_mpc_live = 0, hs_spc_live = 0;
+reg [23:0] hs_mpc = 0, hs_spc = 0;
+reg [15:0] hs_comm = 0;
+reg [25:0] hs_tick = 0;
+always @(posedge clk_sys) begin
+    if (dbg_m68k_pf) hs_mpc_live <= dbg_m68k_a;
+    if (dbg_s68k_pf) hs_spc_live <= dbg_s68k_a;
+    hs_tick <= hs_tick + 1'b1;
+    if (hs_tick == 26'd53693174) begin
+        hs_tick <= 0;
+        hs_mpc  <= hs_mpc_live;
+        hs_spc  <= hs_spc_live;
+        hs_comm <= dbg_comm;
+    end
+end
+
+wire [23:0] hs_row = (dbg_y[5:3] == 3'd2) ? hs_mpc :
+                     (dbg_y[5:3] == 3'd3) ? hs_spc : {hs_comm, 8'h00};
+
 reg         field;
 wire        field_s;
 
@@ -2288,6 +2313,23 @@ always @(posedge current_pix_clk) begin
                                         {8{diag_008a_s[1]}},
                                         {8{diag_008a_s[2]}}};
             endcase
+        end
+
+        // Hang snapshot rows (see hs_* above), MSB on the left, one 8x8
+        // cell per bit, nibbles alternating white/yellow so a photo reads
+        // straight off as hex (lit = 1, dim = 0):
+        //   y 16-23  main CPU fetch PC  [23:0]
+        //   y 24-31  sub  CPU fetch PC  [23:0]
+        //   y 32-39  CFM [7:0] | CFS [7:0]   (16 cells)
+        if (cs_debug_overlay && dbg_y >= 10'd16 && dbg_y < 10'd40 &&
+            dbg_x < 10'd192) begin
+            if (dbg_x[2:0] == 3'd7 || dbg_y[2:0] == 3'd7 ||
+                (dbg_y[5:3] == 3'd4 && dbg_x >= 10'd128))
+                video_rgb_reg <= 24'h000000;
+            else if (hs_row[5'd23 - dbg_x[7:3]])
+                video_rgb_reg <= dbg_x[5] ? 24'hFFFF00 : 24'hFFFFFF;
+            else
+                video_rgb_reg <= dbg_x[5] ? 24'h383800 : 24'h383838;
         end
 
         // bring-up debug overlay, gated behind the "Debug Overlay" core
@@ -3652,10 +3694,12 @@ gen gen
 	.GG_AVAILABLE(),
 
 	.DBG_M68K_A(dbg_m68k_a),
-	.DBG_MBUS_A()
+	.DBG_MBUS_A(),
+	.DBG_M68K_PF(dbg_m68k_pf)
 );
 
 wire [23:0] dbg_m68k_a /* verilator public_flat_rd */;
+wire        dbg_m68k_pf;   // main CPU instruction fetch (dbg_m68k_a is a PC)
 
 // Expansion-bus read-data / DTACK tie: exactly one slave answers per cycle
 assign GEN_VDI = !GEN_RAM_CE_N ? GEN_MEM_DO_R :
@@ -3769,6 +3813,7 @@ MCD MCD
 	.GG_AVAILABLE(),
 
 	.DBG_S68K_A(dbg_s68k_a),
+	.DBG_S68K_PF(dbg_s68k_pf),
 	.DBG_S68K_IPL_N(dbg_s68k_ipl_n),
 	.DBG_INT_PEND(dbg_int_pend),
 	.DBG_INT_ACK(dbg_int_ack),
@@ -3794,6 +3839,7 @@ wire [31:0] dbg_dec /* verilator public_flat_rd */;  // CDC decode path (CDC.vhd
 ///////////////////////////////////////////////
 
 wire [23:0] dbg_s68k_a /* verilator public_flat_rd */;
+wire        dbg_s68k_pf;   // sub CPU instruction fetch (dbg_s68k_a is a PC)
 reg  [23:0] dbg_s68k_a_d;
 reg  [9:0]  dbg_sub_cnt = 0;
 reg         dbg_sub_alive = 0;   // sub-CPU address bus is moving

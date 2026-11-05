@@ -141,7 +141,10 @@ module gen
 	output        GG_AVAILABLE,
 
 	output [23:0] DBG_M68K_A,
-	output [23:0] DBG_MBUS_A
+	output [23:0] DBG_MBUS_A,
+	// main-CPU instruction fetch in progress (AS low, FC = program space):
+	// DBG_M68K_A is then a PC, for the hardware hang-snapshot overlay
+	output        DBG_M68K_PF
 );
 
 reg reset;
@@ -960,6 +963,7 @@ assign OE_N = ~MBUS_RNW;
 
 assign DBG_MBUS_A = {MBUS_A,1'b0};
 assign DBG_M68K_A = {M68K_A,1'b0};
+assign DBG_M68K_PF = ~M68K_AS_N & M68K_FC[1] & ~M68K_FC[0];
 
 
 //--------------------------------------------------------------

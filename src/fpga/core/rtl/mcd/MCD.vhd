@@ -84,6 +84,9 @@ entity MCD is
 		GG_AVAILABLE   : out std_logic;
 		
 		DBG_S68K_A		: out std_logic_vector(23 downto 0);
+		-- sub-CPU instruction fetch in progress (AS low, FC = program
+		-- space): DBG_S68K_A is then a PC, for the hang-snapshot overlay
+		DBG_S68K_PF		: out std_logic;
 		DBG_S68K_IPL_N	: out std_logic_vector(2 downto 0);
 		DBG_INT_PEND	: out std_logic_vector(6 downto 1);
 		DBG_INT_ACK		: out std_logic_vector(6 downto 1);
@@ -448,6 +451,7 @@ begin
 	);
 	
 	DBG_S68K_A <= S68K_A & "0";
+	DBG_S68K_PF <= '1' when S68K_AS_N = '0' and S68K_FC(1 downto 0) = "10" else '0';
 	DBG_S68K_IPL_N <= S68K_IPL_N;
 
 end rtl;
